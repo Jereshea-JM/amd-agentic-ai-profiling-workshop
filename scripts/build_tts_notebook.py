@@ -39,6 +39,20 @@ def orig(idx):
     return ORIG["cells"][idx]["source"]
 
 
+# Some cells are taken from the EXECUTED workshop notebook instead of the
+# upstream one, when the executed variant is the prompt that actually has a
+# genuine captured output. Keeping the prompt and its real output tied to the
+# same source of truth means they cannot drift apart.
+EXEC_SNAPSHOT = os.path.join(HERE, "tts_exec_source.ipynb")
+with open(EXEC_SNAPSHOT) as f:
+    ORIG_EXEC = json.load(f)
+
+
+def orig_exec(idx):
+    """Return a cell source from the executed workshop notebook, unchanged."""
+    return ORIG_EXEC["cells"][idx]["source"]
+
+
 # ---- cell builders ----------------------------------------------------------
 _cells = []
 
@@ -296,7 +310,13 @@ The command below asks the agent to read the generated `input_text.txt` and spea
 it.
 """
 )
-code(orig(9))
+# Edge TTS baseline. We use the EXPLICIT prompt variant (read_file, then
+# text_to_speech on the full text) rather than the terser upstream wording.
+# Reason: it is the prompt that was actually executed on the workshop machine,
+# so tts_exec_new.ipynb can carry a genuine captured output for this cell
+# instead of an invented one. It is also less ambiguous for the agent, which
+# is the behaviour we want to demonstrate at this step.
+code(orig_exec(9))
 
 # ---- 7. Step 2: Profiling ---------------------------------------------------
 md(
