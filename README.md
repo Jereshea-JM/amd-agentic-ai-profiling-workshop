@@ -66,6 +66,7 @@ The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mo
 | `utils/requirements.txt` | Python dependencies for the notebook and dashboard. |
 | `utils/clear_cache.sh` | Clears the GPU kernel cache for cold-run benchmarks. |
 | `custom_tools/kokoro_tts_tool.py` | The custom `kokoro_tts` tool added to Hermes. |
+| `utils/Dockerfile`, `utils/docker-entrypoint.sh` | Build and run the all-in-one workshop container. See [utils/DOCKER.md](utils/DOCKER.md). |
 | `assets/` | Diagrams, dashboard screenshots, and reference outputs. |
 | `scripts/` | Generators that rebuild the diagrams and the notebook. |
 
@@ -91,6 +92,31 @@ amd-smi
 ---
 
 ## Quick start
+
+The fastest path is the prebuilt Docker image, which bundles every service so
+there is nothing to install. If you prefer to run on the host directly, skip to
+[Manual setup](#manual-setup).
+
+### Option A: Docker (recommended)
+
+```bash
+docker run -d --name amd-agentic-ai-profiling \
+  --device=/dev/kfd --device=/dev/dri \
+  --security-opt seccomp=unconfined --group-add video \
+  --ipc=host --shm-size 16G \
+  -p 8888:8888 -p 8501:8501 -p 5004:5004 \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  shailensobhee1/amd-agentic-ai-profiling:mi300x
+```
+
+Watch it start with `docker logs -f amd-agentic-ai-profiling`. When it prints
+`All services are ready`, open `http://<host>:8888/lab/tree/tts.ipynb`.
+
+The first start downloads about 60 GB of model weights, so mount the Hugging
+Face cache as shown to pay that cost only once. Full details, flags and
+troubleshooting are in [utils/DOCKER.md](utils/DOCKER.md).
+
+### Manual setup
 
 ### 1. Clone the repository
 
