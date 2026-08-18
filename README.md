@@ -58,13 +58,16 @@ The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mo
 | Path | What it is |
 | :--- | :--- |
 | `tts.ipynb` | **The workshop notebook.** Start here. |
-| `helper.sh` | One-shot launcher for the full backend (agent, telemetry, dashboard, Kokoro server). |
-| `kokoro_server.py` | The local Kokoro TTS server (FastAPI + Uvicorn), including the batched inference path. |
+| `tts_exec_new.ipynb` | The same notebook with all cells already executed, so you can read the expected outputs without a GPU. |
+| `utils/helper.sh` | One-shot launcher for the full backend (agent, telemetry, dashboard, Kokoro server). |
+| `utils/kokoro_server.py` | The local Kokoro TTS server (FastAPI + Uvicorn), including the batched inference path. |
+| `utils/hermes_profiler.py` | The Streamlit telemetry dashboard. |
+| `utils/hermes_advanced_profiling.patch` | Extends hermes-otel to record CPU/GPU usage per span. |
+| `utils/requirements.txt` | Python dependencies for the notebook and dashboard. |
+| `utils/clear_cache.sh` | Clears the GPU kernel cache for cold-run benchmarks. |
 | `custom_tools/kokoro_tts_tool.py` | The custom `kokoro_tts` tool added to Hermes. |
-| `hermes_profiler.py`, `hermes_advanced_profiling.patch` | The patched hermes-otel telemetry that records CPU/GPU usage per span. |
-| `requirements.txt` | Python dependencies for the notebook and dashboard. |
 | `assets/` | Diagrams, dashboard screenshots, and reference outputs. |
-| `clear_cache.sh` | Clears the GPU kernel cache for cold-run benchmarks. |
+| `scripts/` | Generators that rebuild the diagrams and the notebook. |
 
 ---
 
@@ -83,7 +86,7 @@ Verify your GPUs are visible before you start:
 amd-smi
 ```
 
-> **Model note.** The agent is powered by **Muse-Glimmer-30B**, served with vLLM on the MI300X. On the first run, `helper.sh` overlays the vLLM code from [PR #51655](https://github.com/vllm-project/vllm/pull/51655) onto AMD's `vllm/vllm-openai-rocm:nightly` image and commits it locally as `vllm-muse-glimmer:rocm`. This build happens automatically and only once.
+> **Model note.** The agent is powered by **Muse-Glimmer-30B**, served with vLLM on the MI300X. On the first run, `utils/helper.sh` overlays the vLLM code from [PR #51655](https://github.com/vllm-project/vllm/pull/51655) onto AMD's `vllm/vllm-openai-rocm:nightly` image and commits it locally as `vllm-muse-glimmer:rocm`. This build happens automatically and only once.
 
 ---
 
@@ -108,7 +111,7 @@ source env/bin/activate
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r utils/requirements.txt
 ```
 
 ### 4. Start the backend (leave this terminal open)
@@ -116,7 +119,7 @@ python -m pip install -r requirements.txt
 In a **separate terminal**, launch the full stack. This one script starts the agent model, the patched telemetry, MLflow, the Kokoro TTS server, and the dashboard.
 
 ```bash
-bash helper.sh
+bash utils/helper.sh
 ```
 
 > Leave that terminal running for the whole workshop. It keeps the services alive; closing it shuts the backend down. When it finishes starting, it prints the service URLs you will use in the notebook.
@@ -147,7 +150,7 @@ echo '{"theme": "JupyterLab Dark"}' > ~/.jupyter/lab/user-settings/@jupyterlab/a
 
 ---
 
-## What `helper.sh` starts
+## What `utils/helper.sh` starts
 
 <p align="center">
   <img src="assets/diagrams/02_architecture.png" alt="Architecture: the Hermes Agent runtime calls the Kokoro TTS server on the MI300X; hermes-otel instruments the run and records to MLflow; the Streamlit dashboard reads MLflow to show one clear view" width="94%">
@@ -166,7 +169,7 @@ echo '{"theme": "JupyterLab Dark"}' > ~/.jupyter/lab/user-settings/@jupyterlab/a
 
 ## Service reference
 
-After `helper.sh` is running, these are reachable on the host (replace `<server-ip>` with your machine's address):
+After `utils/helper.sh` is running, these are reachable on the host (replace `<server-ip>` with your machine's address):
 
 | Interface | URL |
 | :--- | :--- |
@@ -180,10 +183,10 @@ After `helper.sh` is running, these are reachable on the host (replace `<server-
 
 | Symptom | Fix |
 | :--- | :--- |
-| `which hermes` prints nothing in the notebook | `helper.sh` has not finished starting, or the notebook was launched from a different environment. Wait for the backend, then relaunch Jupyter from the same shell. |
+| `which hermes` prints nothing in the notebook | `utils/helper.sh` has not finished starting, or the notebook was launched from a different environment. Wait for the backend, then relaunch Jupyter from the same shell. |
 | Dashboard shows no runs | Click **Fetch**. Runs appear newest first; select the top one. |
 | First Kokoro run is slow | Cold-run GPU kernel compilation. Subsequent runs reuse the cached kernels and are much faster. |
-| A port is already in use | `helper.sh` frees its ports on start, but a stale process may linger. Stop it, then rerun. |
+| A port is already in use | `utils/helper.sh` frees its ports on start, but a stale process may linger. Stop it, then rerun. |
 
 ---
 

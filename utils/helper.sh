@@ -7,7 +7,16 @@ HERMES_WORKSPACE_DIR="$HOME/.hermes/workspace"
 mkdir -p "$HERMES_WORKSPACE_DIR"
 export TMPDIR="$HOME/tmp"
 mkdir -p "$TMPDIR"
-WORKSPACE_DIR=$(pwd)
+
+# Path anchoring: this script lives in utils/, so resolve its own siblings
+# (clear_cache.sh, kokoro_server.py, hermes_profiler.py, the profiling patch)
+# relative to the script itself. WORKSPACE_DIR stays the REPO ROOT because that
+# is where the notebook, the env/ venv, input_text.txt and outputs/ live, and it
+# is what the agent's terminal.cwd is pointed at. This makes the script safe to
+# invoke from anywhere, for example `bash utils/helper.sh` from the repo root.
+UTILS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd "$UTILS_DIR/.." && pwd)"
+cd "$WORKSPACE_DIR"
 
 export PATH="$HOME/.local/bin:$PATH"
 export HF_HOME="$HOME/.cache/huggingface"
@@ -23,14 +32,14 @@ VLLM_DEVICE_METRICS_EXPORTER_PORT=5050
 SYSTEM_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || ip route get 8.8.8.8 | awk '{print $7; exit}')
 
 # Clear caches before starting.
-bash clear_cache.sh
+bash "$UTILS_DIR/clear_cache.sh"
 
 HERMES_MODEL="meta-models/Muse-Glimmer-30B"
 
 # Local Kokoro TTS server (sequential + batched inference modes).
 KOKORO_PORT=8092
 KOKORO_ENV="$WORKSPACE_DIR/env"
-KOKORO_SERVER="$WORKSPACE_DIR/kokoro_server.py"
+KOKORO_SERVER="$UTILS_DIR/kokoro_server.py"
 
 # ===========================================================================
 # Helpers and lifecycle management
@@ -308,7 +317,7 @@ git checkout hermes-otel-v0.10.0
 
 # Apply the advanced profiling patch once while inside the plugin directory
 echo "[INFO] Applying advanced profiling patch..."
-PATCH_FILE="$WORKSPACE_DIR/hermes_advanced_profiling.patch"
+PATCH_FILE="$UTILS_DIR/hermes_advanced_profiling.patch"
 
 if [ ! -f "$PATCH_FILE" ]; then
     echo "[ERROR] Patch file not found at $PATCH_FILE; profiling not installed."
@@ -415,7 +424,7 @@ fi
 # ===========================================================================
 # Runs for the whole session; --server.address 0.0.0.0 makes it reachable from
 # other machines.
-DASHBOARD_APP="$WORKSPACE_DIR/hermes_profiler.py"
+DASHBOARD_APP="$UTILS_DIR/hermes_profiler.py"
 if [ -f "$DASHBOARD_APP" ]; then
     echo "[INFO] Launching telemetry dashboard on port 8501..."
     streamlit run "$DASHBOARD_APP" \

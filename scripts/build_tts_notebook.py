@@ -182,7 +182,7 @@ amd-smi
 
 **vLLM ROCm image.** The agent's model is served with vLLM, using AMD's prebuilt
 `vllm/vllm-openai-rocm:nightly` image as the base. Muse-Glimmer-30B support is not
-yet in a released vLLM, so on the first run `helper.sh` overlays the vLLM code from
+yet in a released vLLM, so on the first run `utils/helper.sh` overlays the vLLM code from
 [pull request #51655](https://github.com/vllm-project/vllm/pull/51655) (a
 Python-only change that adds Muse-Glimmer) onto the nightly image and commits the
 result as a local image, `vllm-muse-glimmer:rocm`, which then serves the model.
@@ -203,7 +203,7 @@ md(
 A single script starts everything for you. Open a **separate terminal** and run:
 
 ```bash
-bash helper.sh
+bash utils/helper.sh
 ```
 
 Leave that terminal open for the whole tutorial. The script starts the services and
@@ -214,17 +214,17 @@ then stays alive to keep them running. If you close it, the backend shuts down.
 """
 )
 
-# ---- 3. What helper.sh does -------------------------------------------------
+# ---- 3. What utils/helper.sh does -------------------------------------------------
 md(
-"""## What `helper.sh` starts
+"""## What `utils/helper.sh` starts
 
-You do not need to configure anything by hand. `helper.sh` launches the full
+You do not need to configure anything by hand. `utils/helper.sh` launches the full
 backend so you can focus entirely on profiling instead of installation.
 """
 )
 
 img("02_architecture.png",
-    "Architecture of the backend that helper.sh starts: the Hermes Agent runtime "
+    "Architecture of the backend that utils/helper.sh starts: the Hermes Agent runtime "
     "(vLLM, Muse-Glimmer-30B) calls the Kokoro TTS server on the MI300X; "
     "hermes-otel instruments the run and records to the MLflow tracking server; "
     "the Streamlit telemetry dashboard reads MLflow and the Kokoro server to show "
@@ -264,7 +264,7 @@ this notebook's environment. The cell below prints the path to the Hermes binary
 then `Hermes is ready.`
 
 > **If nothing prints,** the notebook cannot find Hermes on its `PATH`. Make sure
-> `helper.sh` has finished starting up, and that the notebook was launched from the
+> `utils/helper.sh` has finished starting up, and that the notebook was launched from the
 > same environment.
 """
 )
@@ -312,7 +312,7 @@ md(
 [hermes-otel] Registered 13 hooks
 ```
 
-This appears because `helper.sh` connects the stock-plus-patched hermes-otel plugin
+This appears because `utils/helper.sh` connects the stock-plus-patched hermes-otel plugin
 directly to the MLflow server, so all profiled telemetry is recorded in MLflow.
 
 1. To browse the detailed log, open your local MLflow interface (typically at
@@ -422,7 +422,7 @@ md(
 ## Step 4 &middot; Local TTS with Kokoro
 
 **Kokoro** is a text-to-speech model that runs entirely on the local machine. Here
-it is served by the Kokoro TTS server that `helper.sh` started for you on an **AMD
+it is served by the Kokoro TTS server that `utils/helper.sh` started for you on an **AMD
 Instinct&trade; MI300X GPU**.
 
 The server is a lightweight FastAPI + Uvicorn wrapper around the Kokoro model. The
@@ -453,7 +453,7 @@ strengths, and `kokoro_tts` is exactly that: a local text-to-speech tool.
 | `output_path` | Where to save the WAV (defaults to `~/.hermes/audio_cache/`). |
 
 The tool is defined in `custom_tools/kokoro_tts_tool.py` and backed by
-`kokoro_server.py`. Let's run it on our input and profile how it performs.
+`utils/kokoro_server.py`. Let's run it on our input and profile how it performs.
 """
 )
 code(orig(17))
@@ -532,7 +532,7 @@ single GPU forward pass instead of one at a time:
   reducing wasted padding.
 - **Correct batched processing.** Padding and attention masks keep each sentence
   independent, and the final audio is trimmed back to its true length. See
-  `kokoro_server.py` for the source.
+  `utils/kokoro_server.py` for the source.
 
 ### What you should see in the dashboard
 
@@ -759,7 +759,7 @@ For a specific input using Kokoro:
 - **Subsequent runs.** From the second run onward, compiled kernels are reused from
   the cache, giving faster execution and lower latency.
 - **Clearing the cache.** For Python-based executions, the kernel cache can be
-  cleared with `clear_cache.sh`. In this workshop, however, Kokoro runs as a
+  cleared with `utils/clear_cache.sh`. In this workshop, however, Kokoro runs as a
   persistent server, so clearing the cache means stopping the server, deleting the
   cache, and restarting before benchmarking again.
 
