@@ -1,0 +1,6 @@
+jupyterlab==4.5.7
+numpy==2.4.6
+streamlit>=1.30
+mlflow==3.13.0
+plotly>=5.18
+pandas>=2.0
