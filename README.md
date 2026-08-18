@@ -202,4 +202,6 @@ The generator reuses the workshop's backend-driving code cells verbatim, so edit
 
 ## Credits
 
+**Authors:** Shailen Sobhee, Sabira Shaik, Jereshea John Mary
+
 Built for AMD developer enablement on AMD Instinct&trade; GPUs. Powered by [Hermes Agent](https://hermes-agent.nousresearch.com) (Nous Research), [MLflow](https://mlflow.org), and [Kokoro TTS](https://github.com/hexgrad/kokoro).
