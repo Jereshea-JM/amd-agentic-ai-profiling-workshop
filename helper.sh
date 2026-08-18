@@ -289,6 +289,9 @@ hermes config set model.default "$HERMES_MODEL"
 hermes config set compression.enabled false
 hermes config set model.max_tokens 8192
 hermes config set terminal.cwd "$WORKSPACE_DIR"
+hermes config set tool_output.max_bytes 150000
+hermes config set tool_output.max_lines 5000
+hermes config set tool_output.max_line_length 5000
 
 # ===========================================================================
 # Hermes OpenTelemetry Plugin & Patch Setup
@@ -363,17 +366,6 @@ HERMES_CPU_DEBUG=0
 EOF
 
 echo "HERMES_PROFILING_OUTPUT_DIR=${WORKSPACE_DIR}/outputs" >> "$HOME/.hermes/.env"
-
-# Deploy the custom Kokoro TTS tool into the Hermes tools directory.
-echo "[INFO] Deploying custom Kokoro TTS tool..."
-HERMES_TOOLS_DIR="$HOME/.hermes/hermes-agent/tools"
-mkdir -p "$HERMES_TOOLS_DIR"
-if [ -f "$WORKSPACE_DIR/custom_tools/kokoro_tts_tool.py" ]; then
-    cp "$WORKSPACE_DIR/custom_tools/kokoro_tts_tool.py" "$HERMES_TOOLS_DIR/"
-    echo "[OK] Copied kokoro_tts_tool.py -> $HERMES_TOOLS_DIR"
-else
-    echo "[WARN] custom_tools/kokoro_tts_tool.py not found."
-fi
 
 # ===========================================================================
 # Kokoro TTS server
