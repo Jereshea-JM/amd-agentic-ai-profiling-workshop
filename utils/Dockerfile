@@ -200,13 +200,34 @@ RUN printf '%s\n' \
     "    endpoint: http://127.0.0.1:${MLFLOW_PORT}/v1/traces" \
     '    protocol: http/protobuf' \
     '    timeout: 10' \
+    '    headers:' \
+    '      x-mlflow-experiment-id: "0"' \
     > /root/.hermes/plugins/hermes_otel/config.yaml
 
+# MLflow 3.x OTLP ingestion rejects spans that carry no experiment header with
+# HTTP 422, and the exporter only reports that on stderr, so the sole visible
+# symptom is an empty Traces tab. The header above is what makes traces land.
+
+# Every var helper.sh appends to ~/.hermes/.env must be mirrored here. Omitting
+# HERMES_TOOL_PROFILING silently disables the CPU/GPU poller: no timeline CSVs
+# are written and every MLflow run ends up with zero artifacts, while still
+# logging vLLM metrics, so the run looks healthy.
 RUN printf '%s\n' \
     "MLFLOW_TRACKING_URI=http://127.0.0.1:${MLFLOW_PORT}" \
     "HERMES_PROFILING_OUTPUT_DIR=${WORKSHOP_DIR}/outputs" \
-    "HERMES_GPU_EXPORTER_URL=http://localhost:5050/metrics" \
+    "HERMES_GPU_EXPORTER_URL=http://172.17.0.1:5050/metrics" \
     "KOKORO_SERVER_URL=http://localhost:${KOKORO_PORT}" \
+    'MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false' \
+    'MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL=1' \
+    'MLFLOW_EXPERIMENT_NAME=Default' \
+    'MLFLOW_RUN_NAME=Hermes_Profiling' \
+    'MLFLOW_KEEP_RUN_ACTIVE=false' \
+    'MLFLOW_LOGGING_LEVEL=ERROR' \
+    'MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT=1' \
+    'MLFLOW_DISABLE_TELEMETRY=true' \
+    'HERMES_TOOL_PROFILING=1' \
+    'HERMES_PROFILING_DEBUG=0' \
+    'HERMES_CPU_DEBUG=0' \
     >> /root/.hermes/.env
 
 # -----------------------------------------------------------------------------
@@ -214,6 +235,12 @@ RUN printf '%s\n' \
 # -----------------------------------------------------------------------------
 COPY utils/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Parity guard. The bare-host installer and this Dockerfile configure the same
+# agent twice and drift silently, so assert the telemetry wiring at build time
+# rather than discovering a dead dashboard on a live GPU host.
+COPY utils/img-check.sh /usr/local/bin/img-check.sh
+RUN chmod +x /usr/local/bin/img-check.sh && /usr/local/bin/img-check.sh
 
 EXPOSE 8888 8501 5004 8001 8092
 

@@ -170,7 +170,11 @@ start_services() {
 
     # --- 4. Telemetry dashboard ---------------------------------------------
     log "Starting telemetry dashboard on port ${DASHBOARD_PORT}..."
-    ( cd "${WORKSHOP_DIR}" && streamlit run "${UTILS_DIR}/hermes_profiler.py" \
+    # Streamlit resolves .streamlit/config.toml from the PROCESS CWD, not from
+    # the script's directory. The config lives in utils/, so launching from
+    # WORKSHOP_DIR silently drops the AMD theme (primaryColor falls back to
+    # unset). Run from UTILS_DIR and point the app's own paths at WORKSHOP_DIR.
+    ( cd "${UTILS_DIR}" && streamlit run "${UTILS_DIR}/hermes_profiler.py" \
         --server.address 0.0.0.0 \
         --server.port "${DASHBOARD_PORT}" \
         --server.headless true > "${LOG_DIR}/dashboard.log" 2>&1 ) &

@@ -44,7 +44,21 @@ Also baked in: the Hermes Agent (preconfigured to use the local vLLM), the
 
 ## Quick start
 
+The workshop needs two containers: the AMD GPU metrics exporter, and the
+workshop image itself. Start the exporter first.
+
 ```bash
+# 1. GPU metrics exporter. The telemetry dashboard's GPU series comes from here,
+#    so without it gpu_timeline.csv is written with an all-zero GPU column and
+#    the dashboard shows a flat 0% line with no error anywhere.
+#    Note the port map: the exporter listens on 5000 inside the container.
+docker run -d --name device-metrics-exporter \
+  --device=/dev/kfd --device=/dev/dri \
+  --security-opt seccomp=unconfined --group-add video \
+  -p 5050:5000 \
+  rocm/device-metrics-exporter:v1.5.0
+
+# 2. The workshop container.
 docker run -d --name amd-agentic-ai-profiling \
   --device=/dev/kfd --device=/dev/dri \
   --security-opt seccomp=unconfined --group-add video \
@@ -53,6 +67,18 @@ docker run -d --name amd-agentic-ai-profiling \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   shailensobhee1/amd-agentic-ai-profiling:mi300x
 ```
+
+Verify the exporter is actually serving before you rely on the GPU charts:
+
+```bash
+curl -s http://localhost:5050/metrics | grep -m1 gpu_gfx_activity
+```
+
+On an MI300X **VF** (SR-IOV) `gpu_gfx_activity` is coarse and reads either 0 or
+100 with no intermediate values, so a square-wave GPU curve is expected and
+real. To confirm the signal is live rather than stuck, poll it while idle: it
+must read 0. The `power_w` column is continuous and is the better evidence of
+actual load.
 
 Then watch it come up:
 
