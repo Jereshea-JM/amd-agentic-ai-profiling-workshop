@@ -1,0 +1,39 @@
+# Streamlit theme for the Hermes Telemetry Dashboard.
+#
+# AMD look and feel. Colors match scripts/build_diagrams.py so the dashboard,
+# the README diagrams, and the notebook charts all read as one design system.
+#
+#   AMD Red   #ED1C24   primary accent
+#   Ink       #1A1A1A   body text
+#   Panel     #F4F5F7   secondary surface
+#   Line      #D9DCE1   hairlines
+#
+# Streamlit reads this automatically when the app is launched from a directory
+# containing .streamlit/, or from the app's own directory.
+
+[theme]
+base = "light"
+
+# AMD brand red drives every interactive accent: focus rings, slider handles,
+# the active tab underline, and primary buttons.
+primaryColor = "#ED1C24"
+
+backgroundColor = "#FFFFFF"
+
+# Sidebar and st.container(border=True) surfaces.
+secondaryBackgroundColor = "#F4F5F7"
+
+textColor = "#1A1A1A"
+
+# Native system stack: no web-font download, no licensing question, renders
+# consistently on the workshop laptops and on the MI300X host.
+font = "sans serif"
+
+[server]
+# The workshop runs this inside a container and behind port forwards, so the
+# usage-stats ping and CORS/XSRF handshakes only add failure modes.
+headless = true
+gatherUsageStats = false
+
+[browser]
+gatherUsageStats = false

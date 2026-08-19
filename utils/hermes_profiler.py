@@ -45,32 +45,333 @@ import mlflow
 from mlflow.tracking import MlflowClient
 
 
-st.set_page_config(page_title="Hermes Dashboard", layout="wide")
+st.set_page_config(
+    page_title="AMD Hermes Telemetry",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# Single place for app-wide styling, so typography and spacing stay uniform. Uses
-# a native system font stack (no web fonts / network calls / licensing) for a
-# clean, professional look that renders consistently across platforms. Targeting
-# the top-level containers lets the font inherit down to all text without
-# overriding component icon fonts.
-st.markdown(
+# ---------------------------------------------------------------------------
+# AMD design system
+# ---------------------------------------------------------------------------
+# One palette drives the CSS below AND every Plotly figure, so the chrome and the
+# charts cannot drift apart. These are the same values as
+# scripts/build_diagrams.py, which keeps the dashboard, the README diagrams and
+# the notebook charts reading as a single design language.
+
+AMD_RED = "#ED1C24"      # brand accent
+AMD_RED_DK = "#B3141A"   # gradient end / hover
+INK = "#1A1A1A"          # primary text
+SUBINK = "#5B6270"       # secondary text
+BLUE = "#2E6DB4"         # CPU series
+ORANGE = "#F08418"       # tool spans
+TEAL = "#1EAAB4"         # local / Kokoro
+PANEL = "#F4F5F7"        # secondary surface
+LINE = "#D9DCE1"         # hairlines
+WHITE = "#FFFFFF"
+GREEN = "#2E8B57"        # healthy / success
+
+# Shared Plotly styling. Applying one dict to every figure is what makes the
+# charts look designed rather than default.
+PLOTLY_LAYOUT = dict(
+    font=dict(
+        family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, '
+               "Helvetica, Arial, sans-serif",
+        size=12,
+        color=INK,
+    ),
+    paper_bgcolor=WHITE,
+    plot_bgcolor=WHITE,
+    margin=dict(l=56, r=28, t=48, b=44),
+    hoverlabel=dict(
+        bgcolor=WHITE,
+        bordercolor=LINE,
+        font=dict(size=12, color=INK),
+    ),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.02,
+        xanchor="right", x=1,
+        bgcolor="rgba(0,0,0,0)",
+        borderwidth=0,
+        font=dict(size=11, color=SUBINK),
+    ),
+    xaxis=dict(
+        gridcolor=LINE, griddash="dot", zeroline=False,
+        linecolor=LINE, ticks="outside", tickcolor=LINE,
+        tickfont=dict(size=11, color=SUBINK),
+    ),
+    yaxis=dict(
+        gridcolor=LINE, griddash="dot", zeroline=False,
+        linecolor=LINE, ticks="outside", tickcolor=LINE,
+        tickfont=dict(size=11, color=SUBINK),
+    ),
+)
+
+
+def style_figure(fig, height=None, axes=True):
+    """Apply the AMD chart style to a Plotly figure, in place.
+
+    Called on every figure the app builds so no chart escapes the design system.
+    Per-figure settings (titles, ranges, secondary axes) survive because
+    update_layout merges rather than replaces.
+
+    axes=False for make_subplots figures: a top-level xaxis/yaxis dict would only
+    reach row 1, so those get their axis styling through update_xaxes/update_yaxes
+    which correctly fans out to every subplot.
     """
+    layout = dict(PLOTLY_LAYOUT)
+    axis_style = dict(gridcolor=LINE, griddash="dot", zeroline=False,
+                      linecolor=LINE, ticks="outside", tickcolor=LINE,
+                      tickfont=dict(size=11, color=SUBINK))
+    if not axes:
+        layout.pop("xaxis", None)
+        layout.pop("yaxis", None)
+    fig.update_layout(**layout)
+    if not axes:
+        fig.update_xaxes(**axis_style)
+        fig.update_yaxes(**axis_style)
+    if height:
+        fig.update_layout(height=height)
+    # Titles read as panel headings rather than chart furniture. Style the title
+    # only when the figure actually HAS one: passing a title dict with no `text`
+    # makes Plotly render the literal string "undefined" on untitled figures
+    # (this bit the span waterfall).
+    existing = getattr(fig.layout.title, "text", None)
+    if existing:
+        fig.update_layout(
+            title=dict(text=existing, font=dict(size=14, color=INK),
+                       x=0.01, xanchor="left", y=0.97),
+        )
+    return fig
+
+
+# Single app-wide style block. Streamlit ships no class hooks, so these target
+# stable data-testid attributes. Anything cosmetic lives here rather than being
+# sprinkled through the UI code.
+st.markdown(
+    f"""
     <style>
+      :root {{
+        --amd-red: {AMD_RED};
+        --amd-red-dk: {AMD_RED_DK};
+        --ink: {INK};
+        --subink: {SUBINK};
+        --panel: {PANEL};
+        --line: {LINE};
+      }}
+
       html, body,
-      [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+      [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {{
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                        Helvetica, Arial, sans-serif;
-      }
-      /* Consistent heading weight/tracking across the page. */
-      h1, h2, h3, h4 { font-weight: 600; letter-spacing: -0.01em; }
-      h1 { font-size: 1.9rem; }
-      /* KPI cards: value sized to match its label so each card reads uniformly
-         and never overflows its border. */
-      [data-testid="stMetricValue"] { font-size: 0.9rem; font-weight: 600; }
-      [data-testid="stMetricLabel"] { font-weight: 500; }
+          color: var(--ink);
+      }}
+
+      /* Reclaim the large default top padding: the branded header should be the
+         first thing on screen, not whitespace. */
+      [data-testid="stAppViewContainer"] > .main .block-container {{
+          padding-top: 2.1rem;
+          padding-bottom: 3rem;
+          max-width: 1500px;
+      }}
+
+      h1, h2, h3, h4 {{ font-weight: 600; letter-spacing: -0.015em; }}
+      h1 {{ font-size: 1.9rem; }}
+
+      /* ---------- Branded header ---------- */
+      .amd-hero {{
+          background: linear-gradient(100deg, #14171C 0%, #23272E 58%, #2C1A1C 100%);
+          border-radius: 14px;
+          padding: 1.15rem 1.5rem 1.2rem 1.5rem;
+          margin-bottom: 1.15rem;
+          position: relative;
+          overflow: hidden;
+          box-shadow: 0 6px 22px rgba(11, 16, 32, 0.20);
+      }}
+      /* Brand-red edge, the single strongest AMD cue on the page. */
+      .amd-hero::before {{
+          content: "";
+          position: absolute; left: 0; top: 0; bottom: 0;
+          width: 5px;
+          background: linear-gradient(180deg, var(--amd-red) 0%, var(--amd-red-dk) 100%);
+      }}
+      .amd-hero-title {{
+          color: #FFFFFF;
+          font-size: 1.62rem;
+          font-weight: 650;
+          letter-spacing: -0.02em;
+          margin: 0 0 0.22rem 0;
+          line-height: 1.2;
+      }}
+      .amd-hero-title .accent {{ color: var(--amd-red); }}
+      .amd-hero-sub {{
+          color: #AEB6C2;
+          font-size: 0.9rem;
+          margin: 0;
+          max-width: 76ch;
+          line-height: 1.5;
+      }}
+      .amd-chip-row {{ margin-top: 0.75rem; }}
+      .amd-chip {{
+          display: inline-block;
+          background: rgba(255,255,255,0.07);
+          border: 1px solid rgba(255,255,255,0.14);
+          color: #E6E9EE;
+          font-size: 0.735rem;
+          font-weight: 500;
+          letter-spacing: 0.02em;
+          padding: 0.2rem 0.62rem;
+          border-radius: 999px;
+          margin-right: 0.4rem;
+      }}
+      .amd-chip.live {{
+          border-color: rgba(46,139,87,0.55);
+          color: #8FE0AE;
+      }}
+      .amd-chip .dot {{
+          display: inline-block; width: 6px; height: 6px;
+          border-radius: 50%; background: {GREEN};
+          margin-right: 0.38rem; vertical-align: middle;
+      }}
+
+      /* ---------- KPI cards ---------- */
+      /* Bordered containers double as KPI cards; the red top rule ties them to
+         the header and gives the row a deliberate dashboard rhythm. */
+      [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]) {{
+          background: #FFFFFF;
+          border: 1px solid var(--line);
+          border-radius: 12px;
+          padding: 0.15rem 0.25rem;
+          box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+          position: relative;
+          overflow: hidden;
+          transition: box-shadow 140ms ease, transform 140ms ease;
+      }}
+      [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"])::after {{
+          content: "";
+          position: absolute; left: 0; right: 0; top: 0; height: 3px;
+          background: linear-gradient(90deg, var(--amd-red) 0%, {ORANGE} 100%);
+          opacity: 0.9;
+      }}
+      [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stMetric"]):hover {{
+          box-shadow: 0 6px 18px rgba(16,24,40,0.09);
+          transform: translateY(-1px);
+      }}
+      [data-testid="stMetricValue"] {{
+          font-size: 1.02rem; font-weight: 650; color: var(--ink);
+      }}
+      [data-testid="stMetricLabel"] {{
+          font-weight: 500; color: var(--subink);
+          text-transform: uppercase; letter-spacing: 0.045em; font-size: 0.72rem;
+      }}
+
+      /* ---------- Tabs ---------- */
+      [data-testid="stTabs"] [data-baseweb="tab-list"] {{
+          gap: 0.35rem;
+          border-bottom: 1px solid var(--line);
+      }}
+      [data-testid="stTabs"] [data-baseweb="tab"] {{
+          height: 42px;
+          padding: 0 1.05rem;
+          font-weight: 550;
+          color: var(--subink);
+          border-radius: 8px 8px 0 0;
+      }}
+      [data-testid="stTabs"] [data-baseweb="tab"]:hover {{
+          background: var(--panel); color: var(--ink);
+      }}
+      [data-testid="stTabs"] [aria-selected="true"] {{ color: var(--amd-red); }}
+      [data-testid="stTabs"] [data-baseweb="tab-highlight"] {{
+          background: var(--amd-red); height: 3px;
+      }}
+
+      /* ---------- Sidebar ---------- */
+      [data-testid="stSidebar"] {{
+          background: linear-gradient(180deg, #FFFFFF 0%, var(--panel) 100%);
+          border-right: 1px solid var(--line);
+      }}
+      [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{
+          font-size: 0.83rem;
+          text-transform: uppercase;
+          letter-spacing: 0.075em;
+          color: var(--subink);
+          font-weight: 600;
+      }}
+      /* Inputs: square off the pill shape and light up in brand red on focus. */
+      [data-testid="stSidebar"] input,
+      [data-testid="stSidebar"] [data-baseweb="select"] > div {{
+          border-radius: 8px !important;
+          border-color: var(--line) !important;
+      }}
+      [data-testid="stSidebar"] input:focus {{
+          border-color: var(--amd-red) !important;
+          box-shadow: 0 0 0 2px rgba(237,28,36,0.14) !important;
+      }}
+
+      /* ---------- Buttons ---------- */
+      .stButton > button {{
+          border-radius: 8px;
+          font-weight: 560;
+          border: 1px solid var(--line);
+          transition: all 130ms ease;
+      }}
+      .stButton > button:hover {{
+          border-color: var(--amd-red);
+          color: var(--amd-red);
+      }}
+      .stButton > button[kind="primary"] {{
+          background: linear-gradient(92deg, var(--amd-red) 0%, var(--amd-red-dk) 100%);
+          border: none; color: #FFFFFF;
+          box-shadow: 0 2px 8px rgba(237,28,36,0.26);
+      }}
+      .stButton > button[kind="primary"]:hover {{
+          box-shadow: 0 4px 14px rgba(237,28,36,0.36);
+          transform: translateY(-1px); color: #FFFFFF;
+      }}
+
+      /* ---------- Section rule ---------- */
+      /* Small branded heading used above chart blocks. */
+      .amd-sec {{
+          display: flex; align-items: center; gap: 0.55rem;
+          font-size: 0.79rem; font-weight: 650;
+          text-transform: uppercase; letter-spacing: 0.075em;
+          color: var(--subink);
+          margin: 0.35rem 0 0.7rem 0;
+      }}
+      .amd-sec::before {{
+          content: ""; width: 3px; height: 15px; border-radius: 2px;
+          background: var(--amd-red);
+      }}
+      .amd-sec::after {{
+          content: ""; flex: 1; height: 1px; background: var(--line);
+      }}
+
+      /* Charts sit on a hairline card so they read as panels, not loose ink. */
+      [data-testid="stPlotlyChart"] {{
+          border: 1px solid var(--line);
+          border-radius: 12px;
+          padding: 0.45rem 0.3rem 0.2rem 0.3rem;
+          background: #FFFFFF;
+          box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+      }}
+
+      [data-testid="stDataFrame"] {{
+          border: 1px solid var(--line); border-radius: 10px;
+      }}
+
+      /* Streamlit's default footer/menu add noise to a projected demo. */
+      #MainMenu, footer {{ visibility: hidden; }}
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+def section(label: str):
+    """Render a small branded section heading above a chart or table."""
+    st.markdown(f'<div class="amd-sec">{label}</div>', unsafe_allow_html=True)
 
 ARTIFACT_DIR = "profiling"
 
@@ -79,10 +380,22 @@ ARTIFACT_DIR = "profiling"
 # purge.
 PROFILING_CACHE_DIR = os.path.join(os.path.expanduser("~"), "profiling_cache")
 
-# Sidebar logo. Resolved relative to this file so it loads regardless of the
-# working directory Streamlit is launched from. Drop the image at this path (or
-# point LOGO_PATH at any absolute path) to change it.
-LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets","images", "amd_logo.png")
+# Sidebar logo. The file lives at the REPO ROOT (assets/images/), while this
+# module sits in utils/, so a path built only from __file__ + "assets" misses it
+# and the logo silently never renders. Check the repo root first, then a
+# sibling assets/ dir, so the app works whether it is launched from the repo or
+# from a flattened copy (the Docker image puts utils/ and assets/ side by side).
+# Override with HERMES_DASHBOARD_LOGO to point at any absolute path.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LOGO_CANDIDATES = [
+    os.environ.get("HERMES_DASHBOARD_LOGO", ""),
+    os.path.join(_HERE, os.pardir, "assets", "images", "amd_logo.png"),
+    os.path.join(_HERE, "assets", "images", "amd_logo.png"),
+]
+LOGO_PATH = next(
+    (os.path.normpath(p) for p in _LOGO_CANDIDATES if p and os.path.exists(p)),
+    os.path.normpath(_LOGO_CANDIDATES[1]),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +580,21 @@ def fetch_session_traces(tracking_uri: str, session_id: str, experiment_id: str 
         # the experiment's traces and filter client-side on that exact metadata
         # field - never on prompt text, so analysis runs (different session in
         # their own metadata) are correctly excluded.
-        traces = mlflow.search_traces(max_results=2000)
+        # mlflow.search_traces() with no locations searches only the ACTIVE
+        # experiment, which defaults to "Default" and is empty here, so the call
+        # silently returned nothing and the Turns / Total Latency KPIs sat at
+        # n/a even though the run and its traces existed. experiment_id is
+        # already resolved by the caller, so scope the search to it explicitly.
+        if experiment_id:
+            try:
+                traces = mlflow.search_traces(
+                    experiment_ids=[str(experiment_id)], max_results=2000)
+            except TypeError:
+                # Newer MLflow renamed experiment_ids to locations.
+                traces = mlflow.search_traces(
+                    locations=[str(experiment_id)], max_results=2000)
+        else:
+            traces = mlflow.search_traces(max_results=2000)
     except Exception as e:
         return pd.DataFrame(), f"MLflow tracing not available: {e}"
 
@@ -406,7 +733,9 @@ def parse_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["timestamp"])
 
 
-_SPAN_COLORS = ("rgba(31,119,180,0.20)", "rgba(255,127,14,0.20)")  # blue / orange fills
+# Alternating tool-span fills, AMD blue / orange at low alpha so the CPU and
+# GPU traces stay readable through them.
+_SPAN_COLORS = ("rgba(46,109,180,0.13)", "rgba(240,132,24,0.15)")
 
 def _add_tool_spans(fig, tool_df, label_tools=True):
     """Fill each tool's [start, start+duration_s] window as a solid box.
@@ -439,7 +768,7 @@ def _add_tool_spans(fig, tool_df, label_tools=True):
             fig.add_annotation(
                 x=start, y=1.0, yref="paper", text=name,
                 showarrow=False, textangle=90, xanchor="left", yanchor="top",
-                font=dict(size=9, color="dimgray"),
+                font=dict(size=9, color=SUBINK),
             )
         idx += 1
 
@@ -456,7 +785,7 @@ def build_figure(cpu_df, gpu_df, tool_df) -> go.Figure:
     if not cpu_df.empty and "cpu_pct" in cpu_df.columns:
         fig.add_trace(go.Scatter(
             x=cpu_df["timestamp"], y=cpu_df["cpu_pct"],
-            name="CPU % (Hermes + Children)", mode="lines", line=dict(color="royalblue", width=1.4),
+            name="CPU % (Hermes + Children)", mode="lines", line=dict(color=BLUE, width=1.8),
             yaxis="y1",
             hovertemplate="CPU %{y:.1f}%<br>%{x|%H:%M:%S.%L}<extra></extra>",
         ))
@@ -464,7 +793,7 @@ def build_figure(cpu_df, gpu_df, tool_df) -> go.Figure:
     if not gpu_df.empty and "gfx_busy_pct" in gpu_df.columns:
         fig.add_trace(go.Scatter(
             x=gpu_df["timestamp"], y=gpu_df["gfx_busy_pct"],
-            name="GPU %", mode="lines", line=dict(color="firebrick", width=1.4),
+            name="GPU %", mode="lines", line=dict(color=AMD_RED, width=1.8),
             yaxis="y1",
             hovertemplate="GPU %{y:.1f}%<br>%{x|%H:%M:%S.%L}<extra></extra>",
         ))
@@ -477,9 +806,8 @@ def build_figure(cpu_df, gpu_df, tool_df) -> go.Figure:
         yaxis=dict(title="Utilization %", range=[0, 102]),
         hovermode="x unified",
         height=600,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-    return fig
+    return style_figure(fig)
 
 
 def build_single_figure(df, value_col, label, color, y_range=None, tool_df=None,
@@ -506,9 +834,8 @@ def build_single_figure(df, value_col, label, color, y_range=None, tool_df=None,
         yaxis=yaxis,
         hovermode="x unified",
         height=420,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-    return fig
+    return style_figure(fig)
 
 
 def show_left_table(df, height=None):
@@ -781,11 +1108,13 @@ def _order_spans(spans):
     return ordered
 
 
+# Waterfall bar colors, keyed to the AMD palette: model work in blue, tool work
+# in orange, retrieval/chain in teal, parsing in brand red.
 _SPAN_TYPE_COLORS = {
-    "LLM": "#4C78A8", "CHAT_MODEL": "#4C78A8", "AGENT": "#4C78A8",
-    "TOOL": "#F58518",
-    "CHAIN": "#54A24B", "RETRIEVER": "#54A24B",
-    "PARSER": "#B279A2", "RERANKER": "#B279A2",
+    "LLM": BLUE, "CHAT_MODEL": BLUE, "AGENT": BLUE,
+    "TOOL": ORANGE,
+    "CHAIN": TEAL, "RETRIEVER": TEAL,
+    "PARSER": AMD_RED, "RERANKER": AMD_RED,
 }
 _SPAN_DEFAULT_COLOR = "#8899A6"
 
@@ -811,7 +1140,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     ordered = sorted(traces or [], key=_key)
 
     ys, bases, widths, texts, ticktext, colors, hovers = [], [], [], [], [], [], []
-    turn_marks = []  # (turn_label, first_span_start_dt) — one per turn, for dividers
+    turn_marks = []  # (turn_label, first_span_start_dt), one per turn, for dividers
     y = 0
     for tr in ordered:
         turn = _turn_of_trace(tr)
@@ -849,7 +1178,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
 
     if not ys:
         fig.update_layout(height=200, title="No spans found across this session's traces.")
-        return fig
+        return style_figure(fig, axes=False)
 
     fig.add_trace(go.Bar(
         x=widths, base=bases, y=ys, orientation="h",
@@ -860,13 +1189,13 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     if not cpu_df.empty and "cpu_pct" in cpu_df.columns and "ts_abs" in cpu_df.columns:
         fig.add_trace(go.Scatter(
             x=cpu_df["ts_abs"], y=cpu_df["cpu_pct"],
-            name="CPU %", mode="lines", line=dict(color="royalblue", width=1.4),
+            name="CPU %", mode="lines", line=dict(color=BLUE, width=1.8),
             hovertemplate="CPU %{y:.1f}%<br>%{x|%H:%M:%S.%L}<extra></extra>",
         ), row=2, col=1)
     if not gpu_df.empty and "gfx_busy_pct" in gpu_df.columns and "ts_abs" in gpu_df.columns:
         fig.add_trace(go.Scatter(
             x=gpu_df["ts_abs"], y=gpu_df["gfx_busy_pct"],
-            name="GPU %", mode="lines", line=dict(color="firebrick", width=1.4),
+            name="GPU %", mode="lines", line=dict(color=AMD_RED, width=1.8),
             hovertemplate="GPU %{y:.1f}%<br>%{x|%H:%M:%S.%L}<extra></extra>",
         ), row=2, col=1)
 
@@ -878,7 +1207,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     # regardless of the host's timezone. Older CSVs without that column fall back
     # to the local-time string and may be offset on a non-UTC host.
     if tool_df is not None and not tool_df.empty and "ts_abs" in tool_df.columns:
-        _tcolors = ("rgba(31,119,180,0.20)", "rgba(255,127,14,0.20)")
+        _tcolors = _SPAN_COLORS
         j = 0
         for _, r in tool_df.iterrows():
             ts = r.get("ts_abs")
@@ -899,7 +1228,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
                 x=ts, y=100, row=2, col=1,
                 text=str(r.get("tool_name", "tool")),
                 showarrow=False, textangle=90, xanchor="left", yanchor="top",
-                font=dict(size=9, color="dimgray"),
+                font=dict(size=9, color=SUBINK),
             )
             j += 1
 
@@ -912,7 +1241,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
                 line=dict(color="rgba(120,120,120,0.45)", width=1, dash="dot"),
                 annotation_text=(f"Turn {turn}" if turn is not None else "Turn"),
                 annotation_position="top",
-                annotation_font=dict(size=10, color="dimgray"),
+                annotation_font=dict(size=10, color=SUBINK),
             )
         except Exception:
             pass
@@ -933,21 +1262,45 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     # timeline. shared_xaxes matches the range; type=date must be set on both.
     fig.update_xaxes(type="date", row=1, col=1)
     fig.update_xaxes(title_text="Wall-clock time", type="date", row=2, col=1)
-    return fig
+    return style_figure(fig, axes=False)
 
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
-st.title("Hermes Telemetry Dashboard")
-st.caption("Explore a Hermes session's telemetry: CPU/GPU utilization with tool spans, the session's traces, and tool-usage analysis.")
+# A bare hostname like "0" (common inside a container) is noise, so the chip
+# only appears when the host name carries real information.
+_host = socket.gethostname()
+host_chip = (
+    f'<span class="amd-chip">{_host}</span>' if len(_host) > 2 else ""
+)
+
+st.markdown(
+    f"""
+    <div class="amd-hero">
+      <div class="amd-hero-title">Hermes <span class="accent">Telemetry</span> Dashboard</div>
+      <p class="amd-hero-sub">
+        Agentic AI profiling on AMD Instinct. Correlate CPU and GPU utilization with
+        tool-execution spans, inspect per-turn traces, and analyze tool usage for a
+        recorded Hermes session.
+      </p>
+      <div class="amd-chip-row">
+        <span class="amd-chip live"><span class="dot"></span>MLflow telemetry</span>
+        <span class="amd-chip">AMD Instinct MI300X</span>
+        <span class="amd-chip">ROCm</span>
+        {host_chip}
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     # AMD branding + telemetry header. Machine name is the host running Streamlit.
     if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=120)
-    st.markdown("### ⚡ Agent Telemetry")
+        st.image(LOGO_PATH, width=132)
+    st.markdown("### Agent Telemetry")
     st.caption(f"{socket.gethostname()} | Hermes Orchestration")
     st.divider()
 
@@ -959,7 +1312,9 @@ with st.sidebar:
     # handled first in code so a fetch updates the list before the selectbox below
     # reads it (same run, no extra rerun). columns render left→right regardless of
     # code order, so the button still sits to the right of the box.
-    c_sel, c_btn = st.columns([3, 1], vertical_alignment="bottom")
+    # 3:1 clipped the Fetch label to "Fetc" in the narrow sidebar; 2:1 plus
+    # width="stretch" on the button keeps the word intact.
+    c_sel, c_btn = st.columns([2, 1], vertical_alignment="bottom")
     with c_btn:
         do_fetch = st.button(
             "Fetch", width="stretch",
@@ -992,7 +1347,7 @@ with st.sidebar:
     if not _sids:
         st.caption("Click **Fetch** to list session IDs, or just type one in above.")
 
-    load = st.button("Load / Reload", type="primary",
+    load = st.button("Load / Reload", type="primary", width="stretch",
                      help="Fetch this session's latest run. Click again after "
                           "running more queries to pull the new data.")
 
@@ -1113,15 +1468,15 @@ st.success(f"Found run `{info['run_id']}` in experiment `{info['experiment']}`."
 m1, m2, m3 = st.columns(3)
 with m1:
     with st.container(border=True):
-        st.metric("🆔 Session ID", sess_id)
+        st.metric("Session ID", sess_id)
 with m2:
     with st.container(border=True):
-        st.metric("🔁 Turns", turn_count or "—")
+        st.metric("Turns", turn_count or "n/a")
 with m3:
     with st.container(border=True):
         st.metric(
-            "⏱️ Total Latency (all turns)",
-            format_latency_ms(total_latency_ms) if turn_count else "—",
+            "Total Latency",
+            format_latency_ms(total_latency_ms) if turn_count else "n/a",
         )
 
 art_uri = info["artifact_uri"] or ""
@@ -1199,14 +1554,14 @@ with tab_separate:
     def _render_graphs():
         st.subheader("CPU utilization")
         st.plotly_chart(
-            build_single_figure(cpu_df, "cpu_pct", "CPU %", "royalblue", tool_df=tool_df,
+            build_single_figure(cpu_df, "cpu_pct", "CPU %", BLUE, tool_df=tool_df,
                                  y_range=[0, 102],
                                  y_title="CPU % (hermes + children)"),
             width="stretch",
         )
         st.subheader("GPU utilization")
         st.plotly_chart(
-            build_single_figure(gpu_df, "gfx_busy_pct", "GPU %", "firebrick",
+            build_single_figure(gpu_df, "gfx_busy_pct", "GPU %", AMD_RED,
                                  y_range=[0, 102], tool_df=tool_df),
             width="stretch",
         )
