@@ -156,7 +156,8 @@ bash utils/helper.sh
 jupyter lab --ip=0.0.0.0 --port=8888 --no-browser
 ```
 
-Open **`tts.ipynb`** and work through it top to bottom.
+Open **`tts.ipynb`** and work through it top to bottom. Everything from here on
+happens inside the notebook.
 
 <details>
 <summary><b>Optional: force JupyterLab dark theme</b></summary>
@@ -167,9 +168,7 @@ The Hermes environment is designed with a dark theme. To match it:
 
 ```bash
 mkdir -p ./env/share/jupyter/lab/settings
-mkdir -p ~/.jupyter/lab/user-settings/@jupyterlab/apputils-extension
 echo '{"@jupyterlab/apputils-extension:themes": {"theme": "JupyterLab Dark"}}' > ./env/share/jupyter/lab/settings/overrides.json
-echo '{"theme": "JupyterLab Dark"}' > ~/.jupyter/lab/user-settings/@jupyterlab/apputils-extension/themes.jupyterlab-settings
 ```
 
 </details>
