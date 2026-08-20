@@ -272,117 +272,20 @@ fi
 # Hermes toolchain and MLflow integration
 # ===========================================================================
 echo "[INFO] Installing MLflow and OpenTelemetry dependencies..."
-
-# Bootstrap a usable Python toolchain BEFORE anything tries to pip install.
-#
-# Several AMD Dev Cloud ROCm images (verified on rocm714-vllm-0.27.1-omni,
-# Ubuntu 24.04, Python 3.12.3) ship with NO pip and NO ensurepip for the system
-# interpreter, and they mark it PEP 668 externally-managed. Every `python3 -m
-# pip` below then dies with "No module named pip". That failure used to surface
-# far downstream as "[FATAL] MLflow server failed to start properly", whose log
-# said only "No module named mlflow", which points at the wrong problem
-# entirely.
-ensure_python_toolchain() {
-    local need_pip=0 need_venv=0
-    python3 -m pip --version  >/dev/null 2>&1 || need_pip=1
-    python3 -m venv --help    >/dev/null 2>&1 || need_venv=1
-
-    if [ "$need_pip" -eq 0 ] && [ "$need_venv" -eq 0 ]; then
-        echo "[OK] Python toolchain present ($(python3 -m pip --version 2>&1 | head -1))."
-        return 0
-    fi
-
-    echo "[INFO] Bootstrapping Python toolchain (pip=$need_pip venv=$need_venv)..."
-    # Run apt as root when we are not already root, and only if sudo exists.
-    local as_root=""
-    if [ "$(id -u)" -ne 0 ]; then
-        command -v sudo >/dev/null 2>&1 && as_root="sudo"
-    fi
-    if command -v apt-get >/dev/null 2>&1; then
-        $as_root apt-get update -qq >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive $as_root apt-get install -y -qq \
-            python3-pip python3-venv >/dev/null 2>&1 || true
-    fi
-
-    # Fall back to the official bootstrap when the distro packages are absent.
-    if ! python3 -m pip --version >/dev/null 2>&1; then
-        curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
-            && python3 /tmp/get-pip.py --break-system-packages >/dev/null 2>&1 || true
-        rm -f /tmp/get-pip.py
-    fi
-
-    if python3 -m pip --version >/dev/null 2>&1; then
-        echo "[OK] pip available: $(python3 -m pip --version 2>&1 | head -1)"
-    else
-        echo "[FATAL] Could not bootstrap pip for $(command -v python3)."
-        echo "        Install python3-pip and python3-venv, then re-run this script."
-        exit 1
-    fi
-
-    if ! python3 -m venv --help >/dev/null 2>&1; then
-        echo "[FATAL] python3 venv module unavailable; install python3-venv and re-run."
-        exit 1
-    fi
-}
-
-ensure_python_toolchain
-
-# PEP 668 marks the system interpreter externally-managed on Ubuntu 24.04, so a
-# plain `pip install` is refused. These are throwaway workshop boxes and the
-# script already owns the system Python, so opt out explicitly rather than
-# letting the install fail.
-PIP_SYS_FLAGS=""
-if python3 -c "import sys,sysconfig,os; \
-sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('stdlib'), \
-'EXTERNALLY-MANAGED')) else 1)" 2>/dev/null; then
-    PIP_SYS_FLAGS="--break-system-packages"
-    echo "[INFO] Interpreter is PEP 668 externally-managed; using --break-system-packages."
-fi
-
-# Distro-installed Python packages carry no RECORD file, so when pip needs to
-# upgrade one to satisfy a dependency it cannot uninstall it and aborts the
-# WHOLE transaction:
-#
-#   ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
-#          Hint: The package was installed by debian.
-#
-# Verified on rocm714-vllm-0.27.1-omni: mlflow 3.13.0 pulls a newer
-# typing_extensions than the apt-shipped 4.10.0. --ignore-installed on just the
-# offending names lets pip shadow them in site-packages without trying to
-# remove the apt copy. Scoped deliberately: a blanket --ignore-installed would
-# redownload the entire dependency tree.
-PIP_SHADOW_DEBIAN="--ignore-installed typing_extensions"
-
 # opentelemetry-exporter-otlp-proto-http is required: the hermes-otel plugin
 # ships traces to MLflow over the OTLP/HTTP protobuf endpoint. Without it the
 # plugin loads and prints its banner but exports nothing, so the dashboard sits
 # empty with no error. Added in upstream tts-aug18.
-python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN \
-  mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
+python3 -m pip install -q mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
   opentelemetry-exporter-otlp-proto-http==1.42.1
-
-# Fail HERE with an accurate message rather than 200 lines later as a confusing
-# "MLflow server failed to start" whose log only says "No module named mlflow".
-# Check the OTLP exporter too: without it the plugin exports nothing silently.
-if ! python3 -c "import mlflow" 2>/dev/null; then
-    echo "[FATAL] mlflow did not install into $(command -v python3)."
-    echo "        Re-run without -q to see the error:"
-    echo "        python3 -m pip install $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN mlflow==3.13.0"
-    exit 1
-fi
-if ! python3 -c "from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter" 2>/dev/null; then
-    echo "[FATAL] The OTLP/HTTP span exporter is not importable."
-    echo "        Traces would be silently dropped, so stopping here."
-    exit 1
-fi
-echo "[OK] MLflow $(python3 -c 'import mlflow; print(mlflow.__version__)') and the OTLP exporter are installed."
 
 echo "[INFO] Launching MLflow server on port 5004..."
 python3 -m mlflow server \
-  --host 0.0.0.0 \
-  --port 5004 \
-  --backend-store-uri sqlite:///mlflow.db \
-  --allowed-hosts "*" > mlflow_server.log 2>&1 &
+    --backend-store-uri sqlite:///mlflow.db \
+    --host 0.0.0.0 \
+    --port 5004 \
+    --serve-artifacts \
+    --artifacts-destination ./mlflow_artifacts > mlflow_server.log 2>&1 &
 
 MLFLOW_PID=$!
 echo "[INFO] MLflow server started (PID $MLFLOW_PID)."
@@ -438,7 +341,7 @@ hermes config set model.provider custom
 hermes config set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
 hermes config set model.default "$HERMES_MODEL"
 hermes config set compression.enabled false
-hermes config set model.max_tokens 8192
+hermes config set model.max_tokens 16384
 hermes config set terminal.cwd "$WORKSPACE_DIR"
 hermes config set tool_output.max_bytes 150000
 hermes config set tool_output.max_lines 5000
@@ -504,18 +407,9 @@ else
     echo "[WARN] Patch did not apply cleanly (wrong plugin version or conflict)."
 fi
 
-# Install the plugin package in editable mode using standard python/pip.
-# Same PEP 668 opt-out as the MLflow install above; PIP_SYS_FLAGS is empty on
-# interpreters that are not externally-managed.
+# Install the plugin package in editable mode using standard python/pip
 echo "[INFO] Installing plugin package in editable mode..."
-python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN -e .
-
-# An editable install that silently no-ops leaves the agent running with no
-# telemetry plugin and no error, so assert the package actually imports.
-if ! python3 -c "import hermes_otel" 2>/dev/null; then
-    echo "[WARN] hermes_otel is not importable from $(command -v python3) after the editable install."
-    echo "       Telemetry may not be exported. Check the pip output above."
-fi
+python3 -m pip install -e .
 
 cd "$WORKSPACE_DIR"
 
@@ -612,69 +506,6 @@ echo "[INFO] Installing kokoro, soundfile, fastapi, uvicorn, streamlit..."
 # new shapes; create it before the server starts.
 mkdir -p "$HOME/.config/miopen/miopen-lockfiles"
 
-# ---------------------------------------------------------------------------
-# MIOpen JIT headers
-# ---------------------------------------------------------------------------
-# Kokoro's text encoder runs an LSTM, and MIOpen compiles that kernel at RUNTIME
-# with HIPRTC. That compile needs ROCm HEADERS on disk, not just the runtime
-# libraries. Several AMD Dev Cloud ROCm images ship the libraries but omit the
-# header trees, and the failure is deeply misleading:
-#
-#   RuntimeError: miopenStatusUnknownError        (inside _VF.lstm)
-#
-# with no mention of a missing file. Everything else passes, verified on this
-# image: torch.cuda.is_available() True, a 512x512 matmul fine, and a plain
-# torch.nn.LSTM on GPU fine. Only the JIT-compiled kernel fails, so it looks
-# like a Kokoro bug rather than a missing header.
-#
-# The ROCm docker images already on these hosts carry the full header tree, so
-# extract from one instead of needing an apt repo (Dev Cloud images have no
-# ROCm apt source configured, making `apt-get install rocrand-dev` a silent
-# no-op). A stopped container is enough; no GPU and no run required.
-ensure_miopen_jit_headers() {
-    if [ -f /opt/rocm/include/rocrand/rocrand_xorwow.h ] \
-       && [ -f /opt/rocm/include/hip/hip_runtime.h ]; then
-        echo "[OK] MIOpen JIT headers present."
-        return 0
-    fi
-
-    echo "[INFO] MIOpen JIT headers missing; extracting from a local ROCm image..."
-    local src=""
-    for cand in "$IMAGE_NAME" "$BASE_IMAGE" "rocm:latest"; do
-        [ -n "$cand" ] || continue
-        if sudo docker image inspect "$cand" >/dev/null 2>&1; then
-            src="$cand"
-            break
-        fi
-    done
-
-    if [ -z "$src" ]; then
-        echo "[WARN] No local ROCm image to extract headers from."
-        echo "       Kokoro may fail with 'miopenStatusUnknownError' in _VF.lstm."
-        return 0
-    fi
-
-    local cid
-    cid="$(sudo docker create "$src" 2>/dev/null)" || {
-        echo "[WARN] Could not create a container from $src; skipping header extraction."
-        return 0
-    }
-    for hdr in rocrand hiprand hip hsa half rocblas; do
-        sudo docker cp "$cid:/opt/rocm/include/$hdr" /opt/rocm/include/ >/dev/null 2>&1 \
-            && echo "  extracted $hdr" || true
-    done
-    sudo docker rm -f "$cid" >/dev/null 2>&1 || true
-
-    if [ -f /opt/rocm/include/rocrand/rocrand_xorwow.h ] \
-       && [ -f /opt/rocm/include/hip/hip_runtime.h ]; then
-        echo "[OK] MIOpen JIT headers installed from $src."
-    else
-        echo "[WARN] Header extraction incomplete; Kokoro GPU synthesis may fail."
-    fi
-}
-
-ensure_miopen_jit_headers
-
 echo "[INFO] Launching Kokoro TTS server on port $KOKORO_PORT..."
 KOKORO_PORT=$KOKORO_PORT "$KOKORO_ENV/bin/python" "$KOKORO_SERVER" > "$WORKSPACE_DIR/kokoro_server.log" 2>&1 &
 KOKORO_PID=$!
@@ -706,34 +537,11 @@ fi
 # other machines.
 DASHBOARD_APP="$UTILS_DIR/hermes_profiler.py"
 if [ -f "$DASHBOARD_APP" ]; then
-    # Streamlit is installed INTO the Kokoro venv ($KOKORO_ENV), not system-wide,
-    # so a bare `streamlit` only resolves if that venv happens to be on PATH.
-    # On a clean host it is not, and the launch dies with
-    # "streamlit: command not found" inside the redirected log, surfacing 30
-    # seconds later as "[FATAL] Streamlit telemetry dashboard failed to start".
-    # Prefer the venv binary and fall back to whatever is on PATH.
-    STREAMLIT_BIN="$KOKORO_ENV/bin/streamlit"
-    if [ ! -x "$STREAMLIT_BIN" ]; then
-        STREAMLIT_BIN="$(command -v streamlit 2>/dev/null)"
-    fi
-    if [ -z "$STREAMLIT_BIN" ]; then
-        echo "[FATAL] streamlit not found in $KOKORO_ENV/bin or on PATH."
-        echo "        The venv install above should have provided it; check its output."
-        exit 1
-    fi
-    echo "[INFO] Launching telemetry dashboard on port 8501 using $STREAMLIT_BIN..."
-
-    # Streamlit resolves .streamlit/config.toml from the PROCESS CWD, not from
-    # the directory of the script passed to `run`. The AMD theme lives in
-    # $UTILS_DIR/.streamlit, so launch from there or the whole theme is silently
-    # dropped with nothing in any log.
-    (
-        cd "$UTILS_DIR" || exit 1
-        "$STREAMLIT_BIN" run "$DASHBOARD_APP" \
-            --server.address 0.0.0.0 \
-            --server.port 8501 \
-            --server.headless true > "$WORKSPACE_DIR/streamlit_dashboard.log" 2>&1
-    ) &
+    echo "[INFO] Launching telemetry dashboard on port 8501..."
+    streamlit run "$DASHBOARD_APP" \
+        --server.address 0.0.0.0 \
+        --server.port 8501 \
+        --server.headless true > streamlit_dashboard.log 2>&1 &
     STREAMLIT_PID=$!
     echo "[INFO] Dashboard started (PID $STREAMLIT_PID)."
 

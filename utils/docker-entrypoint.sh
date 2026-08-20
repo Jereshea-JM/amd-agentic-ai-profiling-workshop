@@ -130,6 +130,19 @@ start_services() {
         fi
     fi
 
+    # --- 0. AMD Device Metrics Exporter (embedded; GPU utilization source) ---
+    # Relocated under $HOME at build time . gpuagent,
+    # with libamd_smi preloaded, reads the GPU and exposes a socket; server then
+    # serves Prometheus metrics on :5000, which the profiling poller scrapes via
+    # HERMES_GPU_EXPORTER_URL. The 10s warm-up mirrors the vendor entrypoint.
+    log "Starting AMD Device Metrics Exporter on :5000..."
+    ( LD_PRELOAD="$HOME/amd-dme/lib/libamd_smi.so.26" "$HOME/amd-dme/bin/gpuagent" -s /var/run/gpuagent.sock &
+      sleep 10
+      exec "$HOME/amd-dme/bin/server" ) > "${LOG_DIR}/exporter.log" 2>&1 &
+    PIDS+=($!)
+    wait_for "http://localhost:5000/metrics" "Metrics exporter" 120 \
+             "${LOG_DIR}/exporter.log" 1
+
     # --- 1. vLLM -------------------------------------------------------------
     log "Starting vLLM (${HERMES_MODEL}) on port ${VLLM_HERMES_PORT}..."
     log "  First start downloads about 60 GB of weights; this takes a while."
@@ -152,12 +165,14 @@ start_services() {
 
     # --- 2. MLflow -----------------------------------------------------------
     log "Starting MLflow on port ${MLFLOW_PORT}..."
+
     mlflow server \
+        --backend-store-uri "sqlite:///${WORKSHOP_DIR}/mlflow.db" \
         --host 0.0.0.0 \
         --port "${MLFLOW_PORT}" \
-        --backend-store-uri "sqlite:///${WORKSHOP_DIR}/mlflow.db" \
-        --default-artifact-root "${WORKSHOP_DIR}/mlruns" \
-        > "${LOG_DIR}/mlflow.log" 2>&1 &
+        --serve-artifacts \
+        --artifacts-destination "${WORKSHOP_DIR}/mlflow_artifacts" > "${LOG_DIR}/mlflow.log" 2>&1 &
+    
     PIDS+=($!)
     wait_for "http://localhost:${MLFLOW_PORT}/health" "MLflow" 300 "${LOG_DIR}/mlflow.log"
 
