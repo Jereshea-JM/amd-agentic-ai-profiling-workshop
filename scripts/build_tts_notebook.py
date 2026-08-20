@@ -228,6 +228,41 @@ then stays alive to keep them running. If you close it, the backend shuts down.
 """
 )
 
+# Upstream tts-aug18 added two screenshots showing how to open a terminal from
+# JupyterLab, because attendees kept trying to run helper.sh in a notebook cell.
+# Upstream embedded them with `attachment:` references, which only resolve when
+# the notebook carries matching attachment blobs and silently render as broken
+# alt text otherwise. We inline them as base64 data URIs, the same convention as
+# every other image here, and tuck them in a <details> so the flow stays clean.
+md(
+"""<details>
+<summary><b>New to JupyterLab? How to open a terminal</b></summary>
+
+<br>
+
+<b>1.</b> In the JupyterLab tab bar, click the <b>+</b> button to open the Launcher.
+
+<p align="center">
+<img alt="JupyterLab with tts.ipynb open. The plus button in the tab bar, which
+opens the Launcher, is highlighted." src="data:image/png;base64,"""
++ _b64(os.path.join(ROOT, "assets", "images", "terminal_guide_1.png")) +
+"""" width="88%">
+</p>
+
+<b>2.</b> In the Launcher, under <b>Other</b>, click the <b>Terminal</b> tile. Then
+run <code>bash utils/helper.sh</code> in the terminal that opens.
+
+<p align="center">
+<img alt="The JupyterLab Launcher. Under the Other heading, the Terminal tile is
+highlighted." src="data:image/png;base64,"""
++ _b64(os.path.join(ROOT, "assets", "images", "terminal_guide_2.png")) +
+"""" width="88%">
+</p>
+
+</details>
+"""
+)
+
 # ---- 3. What utils/helper.sh does -------------------------------------------------
 md(
 """## What `utils/helper.sh` starts
@@ -274,15 +309,32 @@ md(
 """## Check your setup
 
 Before sending the agent any work, confirm the `hermes` command is available in
-this notebook's environment. The cell below prints the path to the Hermes binary,
-then `Hermes is ready.`
+this notebook's environment. The cell below prepends `~/.local/bin` to `PATH`,
+prints the path to the Hermes binary, then `Hermes is ready.`
 
-> **If nothing prints,** the notebook cannot find Hermes on its `PATH`. Make sure
-> `utils/helper.sh` has finished starting up, and that the notebook was launched from the
-> same environment.
+> **Why the `PATH` line?** The Hermes installer puts the binary in
+> `~/.local/bin`, which a JupyterLab kernel does not always inherit. Without
+> this, `!which hermes` finds nothing even though Hermes is correctly installed.
+
+> **If nothing prints,** the notebook still cannot find Hermes. Make sure
+> `utils/helper.sh` has finished starting up, and that the notebook was launched
+> from the same environment.
 """
 )
-code(orig(5))
+# NOTE: this code cell is NOT taken byte-identical from orig(5) any more. Upstream
+# tts-aug18 added the PATH fix-up above the `which` call because the kernel does
+# not inherit the login shell's PATH. That is a real functional fix, so it is
+# reproduced here rather than reused from the pristine snapshot.
+code(
+"""import os
+
+# The Hermes installer writes to ~/.local/bin, which the notebook kernel does
+# not necessarily have on its PATH. Add it so `hermes` resolves in every cell.
+os.environ["PATH"] += os.pathsep + os.path.expanduser("~/.local/bin")
+
+!which hermes && echo "Hermes is ready."
+"""
+)
 
 # ---- 5. Prepare input text --------------------------------------------------
 md(
@@ -347,11 +399,64 @@ md(
 """### Launching the profiling dashboard
 
 To make the MLflow data easier to read, we built a custom Streamlit dashboard on
-port `8501`. The cell below resolves your server address and gives you a direct
-link.
+port `8501`, started for you by `utils/helper.sh`. The cell below resolves your
+server address and gives you a direct link.
+
+> **Which link should you click?** Use the **`localhost`** link when the browser
+> runs on the same machine as the workshop (or when you forwarded the port with
+> `ssh -L 8501:localhost:8501`). Use the **server-IP** link when you are hitting a
+> remote machine directly and port `8501` is reachable from your network.
 """
 )
-code(orig(12))
+# Upstream tts-aug18 changed this cell's single link from localhost to
+# f"http://{system_ip}:8501/". That is right for an attendee on a remote MI300X
+# box, but it BREAKS the SSH-port-forward and container paths that our README
+# documents, where only localhost resolves. Rather than trade one broken case
+# for another, we print BOTH and say which is which. system_ip was already being
+# computed and then thrown away in the original cell.
+code(
+'''import socket
+from IPython.display import display, Markdown
+
+# The port the telemetry dashboard is running on (started by utils/helper.sh).
+DASHBOARD_PORT = 8501
+
+
+def get_host_ip():
+    """Best-effort outbound interface IP for this machine.
+
+    Opens a UDP socket toward a public address (no packets are actually sent)
+    purely to ask the OS which local interface it would route through.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+system_ip = get_host_ip()
+
+local_link = f"http://localhost:{DASHBOARD_PORT}/"
+display(Markdown(
+    f"**[Open the dashboard (same machine / SSH port-forward)]({local_link})**"
+))
+print(f"localhost URL : {local_link}")
+
+if system_ip:
+    remote_link = f"http://{system_ip}:{DASHBOARD_PORT}/"
+    display(Markdown(
+        f"**[Open the dashboard (remote machine, direct)]({remote_link})**"
+    ))
+    print(f"server-IP URL : {remote_link}")
+else:
+    print("server-IP URL : could not detect this machine's outbound IP; "
+          "use the localhost link or your known server address.")
+'''
+)
 
 # ---- 8. Step 3: Analyzing the logs -----------------------------------------
 md(
@@ -366,11 +471,12 @@ spent and which tool drove the latency. Here is how the pieces fit together:
   to MLflow with its timings and hardware metrics.
 - In the dashboard, click **Fetch** to load the recorded runs. The **most recent
   run appears at the top**, followed by older ones.
-- **Select** the run you want (usually the latest) and the dashboard draws a picture
-  of what happened, with no need to copy or type a session id.
+- **Select** the run you want (usually the latest), then click **Load / Reload**.
+  The dashboard draws a picture of what happened, with no need to copy or type a
+  session id.
 
 > **The loop is always the same:** run the agent, click **Fetch**, select the
-> latest run, and inspect.
+> latest run, click **Load / Reload**, and inspect.
 
 Once the run loads, explore what the dashboard shows for this execution:
 
@@ -408,7 +514,8 @@ OTLP trace JSONs and compiles them into a clean, human-readable summary.
 md(
 """### Edge TTS observations
 
-Look at the audio Edge produced and note a few things:
+In the telemetry dashboard, find the Hermes session id for the Edge TTS run you
+just did, then look at the audio Edge produced and note a few things:
 
 - **No local setup.** Edge is cloud-based. Hermes sends text to the service and
   receives audio back, which makes it a convenient baseline: nothing to install,
@@ -430,8 +537,9 @@ Look at the audio Edge produced and note a few things:
 > so it often improvises with extra steps (chunked file reads, `wc`/`head`/`cat`,
 > temporary copies, small Python snippets) while working around the limit.
 
-The length limit and the privacy consideration together are our reason to move to a
-local model next.
+The length limit, the stitching edge cases, the privacy consideration and the
+network round-trip on every request are together our reason to move to a local
+model next.
 """
 )
 
@@ -463,13 +571,69 @@ server and returns spoken audio as a **WAV** file (uncompressed, so it preserves
 original quality). Extending Hermes with your own tools and skills is one of its
 strengths, and `kokoro_tts` is exactly that: a local text-to-speech tool.
 
-**Parameters**
+The cell below installs the tool into Hermes. It must live **inside the Hermes
+`tools` package**, because the file does `from tools.registry import ...`. Copying
+it anywhere else (`~/.hermes/tools/`, for example) looks plausible but leaves the
+tool unimportable, and the agent then loops without ever calling it, with no error
+message to explain why. The cell locates the real package and verifies the tool
+registers, rather than assuming the copy worked.
+"""
+)
+# Ported from upstream tts-aug18, which added a %%bash cell that copies the tool
+# into $HOME/.hermes/hermes-agent/tools. That hard-coded path is wrong in the
+# container image, where Hermes installs to /usr/local/lib/hermes-agent (a trap
+# already documented in utils/Dockerfile). This version resolves the tools
+# package for both layouts and asserts registration instead of printing [OK] on
+# a bare `cp`.
+code(
+'''%%bash
+set -uo pipefail
+
+SRC="./custom_tools/kokoro_tts_tool.py"
+if [ ! -f "$SRC" ]; then
+    echo "[ERROR] $SRC not found. Run this from the repository root."
+    exit 1
+fi
+
+# Resolve the Hermes installation, whichever layout this machine uses:
+# a per-user install (~/.hermes/hermes-agent) or a system one (/usr/local).
+HERMES_ROOT=""
+for cand in "$HOME/.hermes/hermes-agent" /usr/local/lib/hermes-agent; do
+    if [ -d "$cand/tools" ]; then HERMES_ROOT="$cand"; break; fi
+done
+
+if [ -z "$HERMES_ROOT" ]; then
+    echo "[ERROR] Could not find the Hermes tools package."
+    echo "        Has utils/helper.sh finished installing Hermes?"
+    exit 1
+fi
+
+cp "$SRC" "$HERMES_ROOT/tools/"
+echo "[OK] Copied kokoro_tts_tool.py -> $HERMES_ROOT/tools/"
+
+# Prove the tool actually registers. A successful copy is not proof the agent
+# can call it.
+"$HERMES_ROOT/venv/bin/python" -c "
+import sys; sys.path.insert(0, '$HERMES_ROOT')
+from tools.registry import registry
+import tools.kokoro_tts_tool
+names = getattr(registry, 'tools', None) or getattr(registry, '_tools', {})
+assert 'kokoro_tts' in names, f'kokoro_tts NOT registered; found {sorted(names)}'
+print('[OK] kokoro_tts is registered and callable by the agent.')
+"
+'''
+)
+
+md(
+"""**Parameters of the `kokoro_tts` tool**
 
 | Parameter | Purpose |
 | :--- | :--- |
 | `text` | The full text to synthesize, in one call. |
 | `text_file` | Path to a UTF-8 file to synthesize. Preferred for long text, so the agent passes a path instead of inlining the whole passage. |
+| `mode` | The inference strategy, `sequential` or `batched`. `sequential` is the native Kokoro baseline; `batched` is the optimization we add in Step 5. This parameter is what lets us compare the two. Defaults to `sequential`. |
 | `voice` | Voice name (default `af_heart`). |
+| `batch_size` | Sentences per GPU forward pass when `mode` is `batched` (default `16`). Ignored in `sequential` mode. |
 | `output_path` | Where to save the WAV (defaults to `~/.hermes/audio_cache/`). |
 
 The tool is defined in `custom_tools/kokoro_tts_tool.py` and backed by
@@ -485,8 +649,8 @@ md(
 mode it processes the input **one sentence at a time** and saves the result as a WAV
 file.
 
-Load this run in the dashboard the same way as before: click **Fetch** and select
-the run at the top of the list. You should see:
+Load this run in the dashboard the same way as before: click **Fetch**, select
+the run at the top of the list, then click **Load / Reload**. You should see:
 
 - The **`kokoro_tts`** span occupies the largest part of the timeline, so it is the
   primary contributor to end-to-end latency.
@@ -536,9 +700,9 @@ compare.
 code(orig(22))
 
 md(
-"""Load this run in the dashboard the same way as before: click **Fetch** and select
-this run (it appears at the top). Then compare it side by side with the sequential
-run.
+"""Load this run in the dashboard the same way as before: click **Fetch**, select
+this run (it appears at the top), then click **Load / Reload**. Then compare it
+side by side with the sequential run.
 
 ### What changed under the hood
 
@@ -599,11 +763,13 @@ md(
 three approaches side by side, so the cloud-to-local move and the
 sequential-to-batched optimization show up in a single view.
 
-> **Use your own numbers.** Set `edge_time`, `seq_time`, and `batched_time` to the
-> **execution seconds** from your own runs (each tool's output line and the
-> profiling dashboard). The values below are placeholders. Note that for long text
-> Edge **truncates** its output, so its time is shown to give context for the cloud
-> baseline rather than as a like-for-like comparison.
+> **Use your own numbers.** `edge_time`, `seq_time` and `batched_time` are
+> pre-filled with the values measured on the MI300X workshop machine, so the chart
+> renders meaningfully before you run anything. Replace them with the **execution
+> seconds** from your own runs (each tool's output line and the profiling
+> dashboard). Note that for long text Edge **truncates** its output, so its time is
+> shown to give context for the cloud baseline rather than as a like-for-like
+> comparison.
 """
 )
 
@@ -614,10 +780,12 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 # --- Tool execution time (seconds) for each approach ---
-# Replace with the execution seconds from your own runs (tool output / dashboard).
-edge_time = 14       # Edge TTS (cloud) - note: truncates long text (~5 min cap)
-seq_time = 43.3      # Kokoro, sequential mode (local, unoptimized)
-batched_time = 4.4   # Kokoro, batched mode (local, optimized)
+# Defaults are the numbers measured on the MI300X workshop machine
+# (upstream tts-aug18). Replace them with the execution seconds from your OWN
+# runs, taken from each tool's output line and the profiling dashboard.
+edge_time = 11.43     # Edge TTS (cloud) - note: truncates long text (~5 min cap)
+seq_time = 50.34      # Kokoro, sequential mode (local, unoptimized)
+batched_time = 5.66   # Kokoro, batched mode (local, optimized)
 
 # --- AMD look and feel -------------------------------------------------------
 # Arial-metric font (Liberation Sans) so the chart matches the AMD web family,
@@ -709,16 +877,28 @@ md(
    batched speed-up more obvious.
 2. Re-run the two synthesis cells: `kokoro_tts` in the default (sequential) mode,
    then with `mode='batched'`.
-3. In the dashboard, click **Fetch** and select the latest run for each, then update
-   the Matplotlib cell with your own execution times to compare.
+3. In the dashboard, click **Fetch**, select the latest run for each and click
+   **Load / Reload**, then update the Matplotlib cell with your own execution
+   times to compare.
+
+> **Re-running the Edge baseline.** Once `kokoro_tts` is installed, the agent will
+> normally prefer it, so the Edge cell no longer measures Edge. To get a genuine
+> Edge run again, remove the custom tool first, then re-run the Step 1 cell:
+>
+> ```bash
+> rm -f ~/.hermes/hermes-agent/tools/kokoro_tts_tool.py       # per-user install
+> rm -f /usr/local/lib/hermes-agent/tools/kokoro_tts_tool.py  # container image
+> ```
+>
+> Re-run the *custom tool* install cell above to put it back.
 
 **Try it on your own use cases**
 
 Text-to-speech was only the example. Point the same workflow at *any* Hermes task, a
 research query, a coding task, a multi-tool workflow, and:
 
-- **Profile the run** in the dashboard (click **Fetch**, then select the run) to see
-  the CPU/GPU timeline and which tool dominated.
+- **Profile the run** in the dashboard (click **Fetch**, select the run, then
+  **Load / Reload**) to see the CPU/GPU timeline and which tool dominated.
 - **Inspect the MLflow traces** (the **Traces** view) to drill into each session,
   LLM call, and tool call and see exactly where the time went.
 - **Find the bottleneck, optimize it, and measure again**, the same loop you just

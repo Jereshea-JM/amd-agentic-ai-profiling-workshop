@@ -19,6 +19,30 @@ WORKSPACE_DIR="$(cd "$UTILS_DIR/.." && pwd)"
 cd "$WORKSPACE_DIR"
 
 export PATH="$HOME/.local/bin:$PATH"
+
+# Upstream tts-aug18 added `source ~/.bashrc` and an unconditional
+# `sudo chown -R $USER:$USER $HOME/.cache/` here. Both are ported, but guarded:
+#   * ~/.bashrc short-circuits on non-interactive shells on Debian/Ubuntu, and
+#     `set -u` inside a user's rc file would kill this script, so it is sourced
+#     defensively and only when it exists.
+#   * The chown fixes a real failure: on a fresh machine an earlier root-run
+#     step can leave $HOME/.cache root-owned, after which the HF download and
+#     the Playwright install both fail with EACCES. It is skipped when the cache
+#     is already owned correctly, so the common path costs nothing and the
+#     script still works where sudo is unavailable (for example in the
+#     container, which already runs as root).
+if [ -f "$HOME/.bashrc" ]; then
+    # shellcheck disable=SC1090
+    source "$HOME/.bashrc" || true
+fi
+
+mkdir -p "$HOME/.cache"
+if [ ! -O "$HOME/.cache" ] && command -v sudo >/dev/null 2>&1; then
+    echo "[INFO] Repairing ownership of $HOME/.cache ..."
+    sudo chown -R "$(id -un):$(id -gn)" "$HOME/.cache" || \
+        echo "[WARN] Could not chown $HOME/.cache; continuing."
+fi
+
 export HF_HOME="$HOME/.cache/huggingface"
 
 HERMES_GPU="0"   # Muse-Glimmer-30B runs on GPU 0
@@ -248,7 +272,12 @@ fi
 # Hermes toolchain and MLflow integration
 # ===========================================================================
 echo "[INFO] Installing MLflow and OpenTelemetry dependencies..."
-python3 -m pip install -q mlflow==3.13.0 opentelemetry-sdk==1.42.1
+# opentelemetry-exporter-otlp-proto-http is required: the hermes-otel plugin
+# ships traces to MLflow over the OTLP/HTTP protobuf endpoint. Without it the
+# plugin loads and prints its banner but exports nothing, so the dashboard sits
+# empty with no error. Added in upstream tts-aug18.
+python3 -m pip install -q mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
+  opentelemetry-exporter-otlp-proto-http==1.42.1
 
 echo "[INFO] Launching MLflow server on port 5004..."
 python3 -m mlflow server \
@@ -285,11 +314,26 @@ fi
 sudo chown -R $(whoami):$(whoami) "$HOME/.hermes"
 if ! command -v hermes &> /dev/null && [ ! -f "$HOME/.local/bin/hermes" ]; then
     echo "[INFO] Installing Hermes agent..."
+    # The Hermes installer needs npm for its Node-based TUI. On a bare image
+    # npm is absent and the install completes with a broken front end, so it is
+    # provisioned first. Ported from upstream tts-aug18, made conditional so a
+    # machine that already has npm (and the container image) does not pay for an
+    # apt round-trip, and a failure here does not abort the whole setup.
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "[INFO] npm not found; installing it for the Hermes front end..."
+        sudo apt-get update -qq && sudo apt-get install -y -qq npm \
+            || echo "[WARN] npm install failed; the Hermes TUI may be degraded."
+    fi
     curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup
     echo "[OK] Hermes agent installed."
 else
     echo "[INFO] Hermes agent already available. Skipping."
 fi
+
+# Second chown, after the installer has run: the install script can create
+# files under $HOME/.hermes as root when invoked through sudo, which then makes
+# every later `hermes config set` fail on permissions. Ported from tts-aug18.
+sudo chown -R $(whoami):$(whoami) "$HOME/.hermes"
 
 echo "[INFO] Applying local backend configuration..."
 hermes config set model.provider custom
@@ -301,6 +345,38 @@ hermes config set terminal.cwd "$WORKSPACE_DIR"
 hermes config set tool_output.max_bytes 150000
 hermes config set tool_output.max_lines 5000
 hermes config set tool_output.max_line_length 5000
+
+# ===========================================================================
+# Playwright and browser dependencies (browser-driving Hermes tools)
+# ===========================================================================
+# Ported from upstream tts-aug18. Two corrections were needed:
+#   * Upstream installs only the pip package and never runs `playwright
+#     install`, so the browser binary is missing and any browser tool fails at
+#     first use, after the script has already printed "installed successfully".
+#     The Chromium download is done here so the success message is earned.
+#   * Upstream reports [OK] unconditionally. Here the message is emitted only
+#     after a real post-install import check.
+HERMES_VENV_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+if [ -x "$HERMES_VENV_PY" ]; then
+    if "$HERMES_VENV_PY" -c "import playwright" >/dev/null 2>&1; then
+        echo "[OK] Playwright is already installed."
+    else
+        echo "[INFO] Installing Playwright..."
+        # A killed install leaves this lock behind and every later attempt
+        # blocks on it forever.
+        rm -rf "$HOME/.cache/ms-playwright/__dirlock"
+        "$HERMES_VENV_PY" -m pip install -q playwright \
+            && "$HERMES_VENV_PY" -m playwright install chromium \
+            || echo "[WARN] Playwright setup failed; browser tools unavailable."
+        if "$HERMES_VENV_PY" -c "import playwright" >/dev/null 2>&1; then
+            echo "[OK] Playwright installed."
+        else
+            echo "[WARN] Playwright still not importable after install."
+        fi
+    fi
+else
+    echo "[WARN] Hermes venv not found at $HERMES_VENV_PY; skipping Playwright."
+fi
 
 # ===========================================================================
 # Hermes OpenTelemetry Plugin & Patch Setup
@@ -353,7 +429,41 @@ EOF
 hermes plugins enable hermes_otel --allow-tool-override
 
 $HOME/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade
-$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 opentelemetry-exporter-otlp-proto-http==1.42.1 pyrsmi==1.1.0 amdsmi==7.0.2 mlflow==3.13.0 psutil requests cryptography
+# Dependencies for the patched hermes-otel plugin, inside the Hermes venv.
+# Upstream tts-aug18 trimmed pyrsmi, amdsmi and cryptography from this line and
+# the trim is correct: nothing in this repo imports them. The patched plugin
+# gets GPU numbers by scraping the AMD Device Metrics Exporter over HTTP
+# (`requests`), not through amdsmi/pyrsmi bindings, and its CPU numbers come
+# from `psutil`. Carrying the extra wheels only risked pip resolving a
+# conflicting transitive dependency into the Hermes venv.
+#
+# psutil is installed with --no-deps deliberately: it is a leaf dependency and
+# this keeps pip from touching anything else already resolved in the venv.
+$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q \
+  opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
+  opentelemetry-exporter-otlp-proto-http==1.42.1
+$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q --no-deps psutil
+$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q mlflow==3.13.0 requests
+
+# Prove the plugin's imports actually resolve, instead of trusting pip's exit
+# code. A missing exporter here is the failure that leaves the dashboard silently
+# empty later.
+$HOME/.hermes/hermes-agent/venv/bin/python - <<'PYCHECK'
+import sys
+missing = []
+for mod in ("opentelemetry.sdk",
+            "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+            "psutil", "requests", "mlflow"):
+    try:
+        __import__(mod)
+    except Exception as exc:            # noqa: BLE001
+        missing.append(f"{mod} ({exc.__class__.__name__})")
+if missing:
+    print("[WARN] Hermes venv is missing: " + ", ".join(missing))
+    print("[WARN] Telemetry will be incomplete or absent.")
+    sys.exit(0)
+print("[OK] Hermes venv telemetry dependencies import cleanly.")
+PYCHECK
 echo "[INFO] MLflow tracking available at http://${SYSTEM_IP}:5004/"
 
 cat << 'EOF' >> "$HOME/.hermes/.env"
