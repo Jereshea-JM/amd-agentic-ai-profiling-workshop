@@ -454,8 +454,60 @@ hermes config set tool_output.max_line_length 5000
 #     The Chromium download is done here so the success message is earned.
 #   * Upstream reports [OK] unconditionally. Here the message is emitted only
 #     after a real post-install import check.
-HERMES_VENV_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
-if [ -x "$HERMES_VENV_PY" ]; then
+# Locate the Hermes venv rather than assuming a path.
+#
+# The Hermes installer links the binary into /usr/local/bin and installs the
+# code to /usr/local/lib/hermes-agent, NOT $HOME/.hermes/hermes-agent. On a
+# root install (the workshop path) $HOME/.hermes/hermes-agent/venv does not
+# exist at all.
+#
+# Verified on a clean MI300X run of merged main on 2026-08-20: the hardcoded
+# path caused FIVE consecutive silent failures, all buried at log line ~2472
+# while setup still printed "[OK] Setup complete":
+#
+#   utils/helper.sh: line 538: /root/.hermes/hermes-agent/venv/bin/python: No such file or directory
+#   ... lines 549, 552, 553, 558 identical
+#
+# The consequence was invisible: mlflow, opentelemetry-sdk and the hermes_otel
+# plugin were never installed into the venv Hermes actually runs, so the agent
+# emitted no traces, MLflow held 0 runs and 0 traces, no profiling CSVs were
+# written, and the telemetry dashboard rendered empty with no error anywhere.
+#
+# Resolve the venv from the `hermes` launcher itself, which is authoritative,
+# and fall back to the known install locations.
+find_hermes_venv_py() {
+    local launcher py
+    launcher="$(command -v hermes 2>/dev/null || true)"
+    if [ -n "$launcher" ]; then
+        # The launcher execs an absolute interpreter path; read it back.
+        py="$(grep -oE '"/[^"]*/venv/bin/python"' "$launcher" 2>/dev/null \
+              | head -1 | tr -d '"')"
+        if [ -n "$py" ] && [ -x "$py" ]; then
+            echo "$py"
+            return 0
+        fi
+    fi
+    for cand in \
+        /usr/local/lib/hermes-agent/venv/bin/python \
+        "$HOME/.hermes/hermes-agent/venv/bin/python" \
+        /opt/hermes-agent/venv/bin/python; do
+        if [ -x "$cand" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+HERMES_VENV_PY="$(find_hermes_venv_py || true)"
+if [ -n "$HERMES_VENV_PY" ]; then
+    echo "[OK] Hermes venv: $HERMES_VENV_PY"
+else
+    echo "[WARN] Could not locate the Hermes venv."
+    echo "       Telemetry and Playwright steps will be skipped, and the"
+    echo "       profiling dashboard will have no data to display."
+fi
+if [ -n "$HERMES_VENV_PY" ] && [ -x "$HERMES_VENV_PY" ]; then
     if "$HERMES_VENV_PY" -c "import playwright" >/dev/null 2>&1; then
         echo "[OK] Playwright is already installed."
     else
@@ -535,7 +587,33 @@ EOF
 
 hermes plugins enable hermes_otel --allow-tool-override
 
-$HOME/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade
+# Everything below MUST go into the venv Hermes actually runs. Using a
+# hardcoded $HOME path here silently installed nothing on a root install and
+# left the dashboard empty. See find_hermes_venv_py above.
+if [ -z "$HERMES_VENV_PY" ] || [ ! -x "$HERMES_VENV_PY" ]; then
+    echo "[FATAL] Hermes venv not found, so telemetry cannot be installed."
+    echo "        The profiling dashboard would render empty with no error."
+    echo "        Install Hermes first, then re-run this script."
+    exit 1
+fi
+
+# The Hermes venv is created by `uv` and ships WITHOUT pip (verified on a clean
+# MI300X run 2026-08-20: pyvenv.cfg shows `uv = 0.12.5`, and every
+# `-m pip install` failed with "No module named pip"). Bootstrap it, and do NOT
+# swallow the result: if pip cannot be installed here, none of the telemetry
+# packages below land and the dashboard ends up empty with no visible error.
+if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
+    echo "[INFO] Hermes venv has no pip (uv-created); bootstrapping..."
+    "$HERMES_VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+fi
+if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
+    echo "[FATAL] Could not bootstrap pip inside the Hermes venv:"
+    echo "        $HERMES_VENV_PY"
+    echo "        Telemetry cannot be installed and the profiling dashboard"
+    echo "        would render empty. Refusing to continue."
+    exit 1
+fi
+echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)"
 # Dependencies for the patched hermes-otel plugin, inside the Hermes venv.
 # Upstream tts-aug18 trimmed pyrsmi, amdsmi and cryptography from this line and
 # the trim is correct: nothing in this repo imports them. The patched plugin
@@ -546,31 +624,49 @@ $HOME/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade
 #
 # psutil is installed with --no-deps deliberately: it is a leaf dependency and
 # this keeps pip from touching anything else already resolved in the venv.
-$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q \
+"$HERMES_VENV_PY" -m pip install -q \
   opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
   opentelemetry-exporter-otlp-proto-http==1.42.1
-$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q --no-deps psutil
-$HOME/.hermes/hermes-agent/venv/bin/python -m pip install -q mlflow==3.13.0 requests
+"$HERMES_VENV_PY" -m pip install -q --no-deps psutil
+"$HERMES_VENV_PY" -m pip install -q mlflow==3.13.0 requests
+
+# The plugin package itself must also be importable from the Hermes venv, not
+# just from the system interpreter, or the agent loads no telemetry backend.
+"$HERMES_VENV_PY" -m pip install -q $PIP_SHADOW_DEBIAN \
+  -e "$HOME/.hermes/plugins/hermes_otel" 2>/dev/null \
+  || "$HERMES_VENV_PY" -m pip install -q -e "$HOME/.hermes/plugins/hermes_otel"
 
 # Prove the plugin's imports actually resolve, instead of trusting pip's exit
 # code. A missing exporter here is the failure that leaves the dashboard silently
 # empty later.
-$HOME/.hermes/hermes-agent/venv/bin/python - <<'PYCHECK'
+"$HERMES_VENV_PY" - <<'PYCHECK'
 import sys
 missing = []
 for mod in ("opentelemetry.sdk",
             "opentelemetry.exporter.otlp.proto.http.trace_exporter",
-            "psutil", "requests", "mlflow"):
+            "psutil", "requests", "mlflow", "hermes_otel"):
     try:
         __import__(mod)
     except Exception as exc:            # noqa: BLE001
         missing.append(f"{mod} ({exc.__class__.__name__})")
 if missing:
-    print("[WARN] Hermes venv is missing: " + ", ".join(missing))
-    print("[WARN] Telemetry will be incomplete or absent.")
-    sys.exit(0)
+    # Deliberately FATAL, not a warning. This used to sys.exit(0), so the run
+    # continued to "[OK] Setup complete" while the agent emitted no traces at
+    # all and the dashboard sat empty with nothing in any log to explain it.
+    print("[FATAL] Hermes venv is missing: " + ", ".join(missing))
+    print("[FATAL] The agent would emit no telemetry and the profiling")
+    print("        dashboard would render empty. Refusing to continue.")
+    sys.exit(1)
 print("[OK] Hermes venv telemetry dependencies import cleanly.")
 PYCHECK
+# This script does NOT use `set -e`, so the heredoc's exit status must be
+# checked explicitly. Without this the exit 1 above is discarded and the run
+# continues to "[OK] Setup complete" with no telemetry, which is the exact
+# failure being fixed.
+if [ $? -ne 0 ]; then
+    echo "[FATAL] Aborting: Hermes telemetry dependencies are not installed."
+    exit 1
+fi
 echo "[INFO] MLflow tracking available at http://${SYSTEM_IP}:5004/"
 
 cat << 'EOF' >> "$HOME/.hermes/.env"
@@ -606,7 +702,42 @@ echo "[INFO] Installing PyTorch (ROCm 7.2)..."
 "$KOKORO_ENV/bin/pip" install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
 echo "[INFO] Installing kokoro, soundfile, fastapi, uvicorn, streamlit..."
 "$KOKORO_ENV/bin/pip" install kokoro soundfile fastapi uvicorn
-"$KOKORO_ENV/bin/pip" install 'streamlit>=1.30'
+
+# Install the dashboard's dependencies from utils/requirements.txt rather than
+# naming streamlit alone.
+#
+# Verified on a clean MI300X run 2026-08-20: installing only streamlit meant
+# plotly was never present, so utils/hermes_profiler.py died on
+# `import plotly.graph_objects` and the dashboard rendered a bare
+# ModuleNotFoundError traceback. Setup still printed "[OK] Streamlit dashboard
+# is up." because /_stcore/health returns 200 for a crashed app: the Streamlit
+# server is alive, the script inside it is not.
+if [ -f "$UTILS_DIR/requirements.txt" ]; then
+    "$KOKORO_ENV/bin/pip" install -q -r "$UTILS_DIR/requirements.txt"
+else
+    echo "[WARN] $UTILS_DIR/requirements.txt not found; installing known deps."
+    "$KOKORO_ENV/bin/pip" install -q 'streamlit>=1.30' 'plotly>=5.18' 'pandas>=2.0' mlflow==3.13.0
+fi
+
+# Assert every module the dashboard imports at top level actually resolves.
+# pip's exit code is not evidence the app can start.
+"$KOKORO_ENV/bin/python" - <<'PYDASH'
+import sys
+missing = []
+for mod in ("streamlit", "plotly", "plotly.graph_objects", "pandas", "mlflow"):
+    try:
+        __import__(mod)
+    except Exception as exc:            # noqa: BLE001
+        missing.append(f"{mod} ({exc.__class__.__name__})")
+if missing:
+    print("[FATAL] Dashboard dependencies missing: " + ", ".join(missing))
+    sys.exit(1)
+print("[OK] Dashboard dependencies import cleanly.")
+PYDASH
+if [ $? -ne 0 ]; then
+    echo "[FATAL] Aborting: the telemetry dashboard cannot start."
+    exit 1
+fi
 
 # MIOpen needs this lock directory to persist its kernel DB and avoid errors on
 # new shapes; create it before the server starts.
@@ -742,7 +873,6 @@ if [ -f "$DASHBOARD_APP" ]; then
     for i in $(seq 1 30); do
         code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8501/_stcore/health" || echo "000")
         if [ "$code" -eq 200 ]; then
-            echo "[OK] Streamlit dashboard is up."
             streamlit_ready=1
             break
         fi
@@ -755,6 +885,56 @@ if [ -f "$DASHBOARD_APP" ]; then
     if [ "$streamlit_ready" -ne 1 ]; then
         fail "Streamlit telemetry dashboard" "$WORKSPACE_DIR/streamlit_dashboard.log"
     fi
+
+    # /_stcore/health returning 200 only proves the Streamlit SERVER is alive.
+    # It returns 200 even when the app script raised on import and every visitor
+    # sees a traceback. Verified 2026-08-20: a missing plotly produced a
+    # ModuleNotFoundError page while this loop still printed [OK].
+    #
+    # Parse the app's own top-level imports and confirm each one resolves in the
+    # interpreter Streamlit runs under. That is what the health endpoint cannot
+    # tell us.
+    dash_bad="$("$KOKORO_ENV/bin/python" - "$DASHBOARD_APP" <<'PYPROBE'
+import ast
+import importlib.util
+import sys
+
+path = sys.argv[1]
+try:
+    tree = ast.parse(open(path).read())
+except Exception as exc:                # noqa: BLE001
+    print(f"UNPARSEABLE:{exc.__class__.__name__}")
+    raise SystemExit(0)
+
+mods = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for a in node.names:
+            mods.add(a.name.split(".")[0])
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        mods.add(node.module.split(".")[0])
+
+bad = []
+for m in sorted(mods):
+    if m in sys.builtin_module_names:
+        continue
+    try:
+        if importlib.util.find_spec(m) is None:
+            bad.append(m)
+    except Exception:                   # noqa: BLE001
+        bad.append(m)
+print(",".join(bad))
+PYPROBE
+)"
+    if [ -n "$dash_bad" ]; then
+        echo "[FATAL] The dashboard is serving an error page."
+        echo "        $DASHBOARD_APP imports modules that are not installed in"
+        echo "        $KOKORO_ENV: $dash_bad"
+        echo "        Note /_stcore/health still returns 200, which is why this"
+        echo "        is checked separately."
+        exit 1
+    fi
+    echo "[OK] Streamlit dashboard is up and every app import resolves."
 else
     fail "Streamlit telemetry dashboard" ""
 fi
