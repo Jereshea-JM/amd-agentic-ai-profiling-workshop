@@ -309,12 +309,14 @@ md(
 """## Check your setup
 
 Before sending the agent any work, confirm the `hermes` command is available in
-this notebook's environment. The cell below prepends `~/.local/bin` to `PATH`,
-prints the path to the Hermes binary, then `Hermes is ready.`
+this notebook's environment. The cell below adds the usual install locations to
+`PATH`, prints the path to the Hermes binary, then `Hermes is ready.`
 
-> **Why the `PATH` line?** The Hermes installer puts the binary in
-> `~/.local/bin`, which a JupyterLab kernel does not always inherit. Without
-> this, `!which hermes` finds nothing even though Hermes is correctly installed.
+> **Why the `PATH` line?** Depending on how Hermes was installed, the binary
+> lands in either `/usr/local/bin` (the container and root installs used by
+> `utils/helper.sh`) or `~/.local/bin` (a per-user pip install). A JupyterLab
+> kernel does not always inherit the login shell's `PATH`, so without this cell
+> `!which hermes` can find nothing even though Hermes is correctly installed.
 
 > **If nothing prints,** the notebook still cannot find Hermes. Make sure
 > `utils/helper.sh` has finished starting up, and that the notebook was launched
@@ -325,12 +327,23 @@ prints the path to the Hermes binary, then `Hermes is ready.`
 # tts-aug18 added the PATH fix-up above the `which` call because the kernel does
 # not inherit the login shell's PATH. That is a real functional fix, so it is
 # reproduced here rather than reused from the pristine snapshot.
+#
+# Corrected after a real MI300X run on 2026-08-20: upstream only added
+# ~/.local/bin, but on the workshop image `hermes` actually resolves from
+# /usr/local/bin. The cell passed there by luck (the kernel already inherited
+# /usr/local/bin), and would have printed nothing on any kernel that did not.
+# Both locations are now added explicitly.
 code(
 """import os
 
-# The Hermes installer writes to ~/.local/bin, which the notebook kernel does
-# not necessarily have on its PATH. Add it so `hermes` resolves in every cell.
-os.environ["PATH"] += os.pathsep + os.path.expanduser("~/.local/bin")
+# Hermes may live in either location depending on how it was installed:
+#   /usr/local/bin  -> container / root install performed by utils/helper.sh
+#   ~/.local/bin    -> per-user pip install
+# A JupyterLab kernel does not always inherit the login shell's PATH, so add
+# both and let `which` report the one actually in use.
+for _p in ("/usr/local/bin", os.path.expanduser("~/.local/bin")):
+    if _p not in os.environ["PATH"].split(os.pathsep):
+        os.environ["PATH"] += os.pathsep + _p
 
 !which hermes && echo "Hermes is ready."
 """
