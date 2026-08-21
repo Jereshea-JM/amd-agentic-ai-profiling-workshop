@@ -137,7 +137,8 @@ wait_for_vllm_readiness() {
 
     echo "[INFO] Waiting for $service_name to load weights and start its API on port $port..."
     while true; do
-        status_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/v1/models || echo "000")
+        status_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/v1/models)
+        status_code="${status_code:-000}"
 
         if [ "$status_code" -eq 200 ]; then
             echo "[OK] $service_name is active and responsive."
@@ -256,7 +257,8 @@ echo "[INFO] Waiting for device-metrics-exporter on port $VLLM_DEVICE_METRICS_EX
 exporter_ready=0
 for i in $(seq 1 30); do
     code=$(curl -s -o /dev/null -w "%{http_code}" \
-        "http://localhost:$VLLM_DEVICE_METRICS_EXPORTER_PORT/metrics" || echo "000")
+        "http://localhost:$VLLM_DEVICE_METRICS_EXPORTER_PORT/metrics")
+    code="${code:-000}"
     if [ "$code" -eq 200 ]; then
         echo "[OK] device-metrics-exporter is serving metrics."
         exporter_ready=1
@@ -397,7 +399,8 @@ echo "[INFO] MLflow server started (PID $MLFLOW_PID)."
 echo "[INFO] Waiting for MLflow server /health on port 5004..."
 mlflow_ready=0
 for i in $(seq 1 30); do
-    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5004/health" || echo "000")
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5004/health")
+    code="${code:-000}"
     if [ "$code" -eq 200 ]; then
         echo "[OK] MLflow server is up."
         mlflow_ready=1
@@ -823,7 +826,8 @@ echo "[INFO] Kokoro server started (PID $KOKORO_PID, logs: $WORKSPACE_DIR/kokoro
 echo "[INFO] Waiting for Kokoro server /health on port $KOKORO_PORT..."
 kokoro_ready=0
 for i in $(seq 1 120); do
-    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$KOKORO_PORT/health" || echo "000")
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$KOKORO_PORT/health")
+    code="${code:-000}"
     if [ "$code" -eq 200 ]; then
         echo "[OK] Kokoro TTS server is active (sequential + batched)."
         kokoro_ready=1
@@ -880,7 +884,8 @@ if [ -f "$DASHBOARD_APP" ]; then
     echo "[INFO] Waiting for Streamlit dashboard /_stcore/health on port 8501..."
     streamlit_ready=0
     for i in $(seq 1 30); do
-        code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8501/_stcore/health" || echo "000")
+        code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8501/_stcore/health")
+        code="${code:-000}"
         if [ "$code" -eq 200 ]; then
             streamlit_ready=1
             break

@@ -212,6 +212,55 @@ start_services() {
     wait_for "http://localhost:${DASHBOARD_PORT}/_stcore/health" \
              "Telemetry dashboard" 300 "${LOG_DIR}/dashboard.log"
 
+    # /_stcore/health returning 200 only proves the Streamlit SERVER is alive.
+    # It returns 200 even when the app script raised on import and every visitor
+    # sees a traceback. Verified in-container 2026-08-21: an injected bad import
+    # still answered /_stcore/health with 200 and served a 200 page.
+    #
+    # helper.sh already guards this on the bare-metal path. Do the same here, by
+    # asking the app's OWN interpreter whether every top-level import resolves.
+    dash_bad="$(python3 - "${UTILS_DIR}/hermes_profiler.py" <<'PYPROBE'
+import ast
+import importlib.util
+import sys
+
+path = sys.argv[1]
+try:
+    tree = ast.parse(open(path).read())
+except Exception as exc:                # noqa: BLE001
+    print(f"UNPARSEABLE:{exc.__class__.__name__}")
+    raise SystemExit(0)
+
+mods = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for a in node.names:
+            mods.add(a.name.split(".")[0])
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        mods.add(node.module.split(".")[0])
+
+bad = []
+for m in sorted(mods):
+    if m in sys.builtin_module_names:
+        continue
+    try:
+        if importlib.util.find_spec(m) is None:
+            bad.append(m)
+    except Exception:                   # noqa: BLE001
+        bad.append(m)
+print(",".join(bad))
+PYPROBE
+)"
+    if [ -n "${dash_bad}" ]; then
+        echo "[FATAL] The telemetry dashboard is serving an error page." >&2
+        echo "        ${UTILS_DIR}/hermes_profiler.py imports modules that do not" >&2
+        echo "        resolve: ${dash_bad}" >&2
+        echo "        /_stcore/health still returns 200, which is why this is" >&2
+        echo "        checked separately." >&2
+        exit 1
+    fi
+    log "  Telemetry dashboard imports all resolve."
+
     # --- 5. JupyterLab -------------------------------------------------------
     log "Starting JupyterLab on port ${JUPYTER_PORT}..."
     ( cd "${WORKSHOP_DIR}" && jupyter lab \
