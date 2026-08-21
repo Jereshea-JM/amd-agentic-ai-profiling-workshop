@@ -79,7 +79,13 @@ wait_for() {
     local waited=0 code
     log "Waiting for ${name} (${url}, timeout ${timeout}s)..."
     while [ "${waited}" -lt "${timeout}" ]; do
-        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null || echo 000)"
+        # NOTE: no `|| echo 000` here. curl already prints 000 via -w when it
+        # cannot connect, so the fallback CONCATENATED a second 000 and produced
+        # "000000". The any=1 branch below tests `code != "000"`, so "000000"
+        # slipped through and a service was reported up when nothing answered.
+        # Observed live 2026-08-21: "Metrics exporter is up (HTTP 000000) after 0s."
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null)"
+        code="${code:-000}"
         if [ "${any}" = "1" ] && [ "${code}" != "000" ]; then
             log "  ${name} is up (HTTP ${code}) after ${waited}s."
             return 0
