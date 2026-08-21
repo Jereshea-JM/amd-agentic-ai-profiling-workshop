@@ -341,7 +341,7 @@ hermes config set model.provider custom
 hermes config set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
 hermes config set model.default "$HERMES_MODEL"
 hermes config set compression.enabled false
-hermes config set model.max_tokens 8192
+hermes config set model.max_tokens 16384
 hermes config set terminal.cwd "$WORKSPACE_DIR"
 hermes config set tool_output.max_bytes 150000
 hermes config set tool_output.max_lines 5000

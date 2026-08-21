@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rebuild tts_exec_new.ipynb = the current tts.ipynb, with executed outputs.
+Rebuild tts_executed.ipynb = the current tts.ipynb, with executed outputs.
 
 Alignment strategy (no fabrication):
   * STRUCTURE comes wholesale from tts.ipynb, so prose, images, captions and
@@ -29,7 +29,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 NB = os.path.join(ROOT, "tts.ipynb")
-EXEC_NB = os.path.join(ROOT, "tts_exec_new.ipynb")
+EXEC_NB = os.path.join(ROOT, "tts_executed.ipynb")
 # Genuine captured outputs from the workshop machine.
 CAPTURED = os.path.join(HERE, "captured_outputs.json")
 

@@ -868,6 +868,10 @@ def _build_fileref_prompt(tool_csv_path: str, traces_path=None) -> str:
         "You are a performance analyst. The telemetry for a Hermes agent session "
         "is on disk. Read these files with your file tools and analyze them "
         "directly. Base your analysis ONLY on their contents.\n\n"
+        "**STRICTLY** Do NOT classify tools as CPU-bound or GPU-bound and do NOT "
+        "try to attribute the cpu/gpu numbers to a cause - report the wall-clock "
+        "timing and the span details, and leave the CPU/GPU interpretation to the "
+        "user.\n\n"
         f"1. tool_breakdown.csv (one row per tool call): {tool_csv_path}\n"
         "   Columns: turn, tool_name, input, output, timestamp, "
         "start_time_unix_nano, elapsed_s, duration_s, cpu_avg_pct, cpu_peak_pct, "
@@ -884,22 +888,45 @@ def _build_fileref_prompt(tool_csv_path: str, traces_path=None) -> str:
             "hermes.turn.number = N owns every CSV row where turn = N (one query = "
             "one turn = one trace). Do NOT guess by timestamp; use the turn "
             "number. Analyze each query SEPARATELY, then compare them.\n\n"
+            "The CSV is only a summary; the traces hold the in-depth detail. Read "
+            "each tool's span in full - its attributes and its inputs/outputs - "
+            "and ground your analysis in those specifics rather than the tool "
+            "names alone.\n\n"
         )
     else:
         prompt += "\n"
     prompt += (
         "Please report:\n"
-        "1. The hotspot tools/turns (which tools dominate time and resource use) and why.\n"
-        "2. Redundant, repeated, or inefficient tool usage patterns you notice.\n"
-        "3. Concrete, actionable improvements to the tool usage (e.g. batching, "
+        "1. An overview table FIRST, before any prose: one row per tool call, with "
+        "columns turn, tool, key input (short), duration_s, start-offset-from-turn-"
+        "start, and one notable span detail (e.g. provider). ALWAYS present this "
+        "session/tool overview as a Markdown table - never as prose or bullet "
+        "lists.\n"
+        "2. The hotspot tools/turns (which tools dominate time and resource use) and why.\n"
+        "3. Redundant, repeated, or inefficient tool usage patterns you notice.\n"
+        "4. Concrete, actionable improvements to the tool usage (e.g. batching, "
         "avoiding repeated calls, cheaper alternatives).\n"
     )
     if traces_path:
         prompt += (
-            "4. A per-query breakdown: for each user query (trace), its dominant "
-            "tools, total tool time, and one specific improvement.\n"
+            "5. A per-query breakdown (prefer a compact table): one entry per user "
+            "query (trace) with its total tool time and dominant tool. Add ONLY "
+            "per-query specifics here - do not restate the overall findings or "
+            "improvements already covered in 2-4.\n"
         )
-    prompt += "Keep it concise and specific to this data."
+    prompt += (
+        "Write as an experienced performance engineer delivering a concise, "
+        "professional report. Synthesize the evidence into clear findings and "
+        "prioritized, impactful recommendations - do NOT mechanically list back "
+        "the fields above or restate raw rows. Lead with the key takeaways, back "
+        "every claim with specific numbers from the data, and keep it specific to "
+        "this session. Use a Markdown table where it genuinely makes the report "
+        "cleaner (e.g. comparing tools or turns side by side); otherwise write in "
+        "prose. Format the whole report in Markdown. State each finding, number, "
+        "and recommendation EXACTLY ONCE - do not repeat the same point across "
+        "sections; if a later section would restate something already said, either "
+        "omit it or add only new detail."
+    )
     return prompt
 
 

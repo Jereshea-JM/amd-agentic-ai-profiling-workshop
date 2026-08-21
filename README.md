@@ -45,7 +45,7 @@ Run the agent, **Fetch** the run in the dashboard, inspect the spans and GPU usa
 
 ## The optimization at a glance
 
-The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mostly idle. The workshop adds a **batched** mode that groups sentences into a single GPU forward pass.
+The default **Edge** TTS tool has limitations, so we move to local **Kokoro** TTS in **sequential** mode, which leaves the MI300X mostly idle. The workshop adds a **batched** mode that groups sentences into a single GPU forward pass.
 
 <p align="center">
   <img src="assets/diagrams/04_journey.png" alt="Three approaches compared: cloud Edge TTS baseline, local Kokoro sequential baseline, and local Kokoro batched optimized" width="92%">
@@ -58,7 +58,7 @@ The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mo
 | Path | What it is |
 | :--- | :--- |
 | `tts.ipynb` | **The workshop notebook.** Start here. |
-| `tts_exec_new.ipynb` | The same notebook with all cells already executed, so you can read the expected outputs without a GPU. |
+| `tts_executed.ipynb` | The same notebook with all cells already executed, so you can read the expected outputs without a GPU. |
 | `utils/helper.sh` | One-shot launcher for the full backend (agent, telemetry, dashboard, Kokoro server). |
 | `utils/kokoro_server.py` | The local Kokoro TTS server (FastAPI + Uvicorn), including the batched inference path. |
 | `utils/hermes_profiler.py` | The Streamlit telemetry dashboard. |

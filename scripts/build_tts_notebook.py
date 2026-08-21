@@ -378,7 +378,7 @@ it.
 # Edge TTS baseline. We use the EXPLICIT prompt variant (read_file, then
 # text_to_speech on the full text) rather than the terser upstream wording.
 # Reason: it is the prompt that was actually executed on the workshop machine,
-# so tts_exec_new.ipynb can carry a genuine captured output for this cell
+# so tts_executed.ipynb can carry a genuine captured output for this cell
 # instead of an invented one. It is also less ambiguous for the agent, which
 # is the behaviour we want to demonstrate at this step.
 code(orig_exec(9))
