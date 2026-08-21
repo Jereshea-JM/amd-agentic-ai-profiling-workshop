@@ -29,6 +29,9 @@ LOG_DIR="${WORKSHOP_DIR}/logs"
 VLLM_HERMES_PORT="${VLLM_HERMES_PORT:-8001}"
 KOKORO_PORT="${KOKORO_PORT:-8092}"
 MLFLOW_PORT="${MLFLOW_PORT:-5004}"
+# Device Metrics Exporter payload, copied from rocm/device-metrics-exporter by
+# the Dockerfile. Overridable so a host-run exporter can still be used instead.
+DME_DIR="${DME_DIR:-/root/amd-dme}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8501}"
 JUPYTER_PORT="${JUPYTER_PORT:-8888}"
 HERMES_MODEL="${HERMES_MODEL:-meta-models/Muse-Glimmer-30B}"
@@ -130,6 +133,26 @@ start_services() {
         fi
     fi
 
+    # --- 0. AMD Device Metrics Exporter (embedded GPU metrics source) --------
+    # The profiling poller scrapes HERMES_GPU_EXPORTER_URL for GPU utilization.
+    # The exporter binaries were copied from rocm/device-metrics-exporter at
+    # build time into /root/amd-dme, so no exporter needs to be running on the
+    # Docker host. This mirrors the vendor entrypoint exactly: gpuagent reads
+    # the GPU behind a unix socket with libamd_smi preloaded, then after a 10s
+    # warm-up `server` publishes Prometheus metrics on :5000.
+    log "Starting AMD Device Metrics Exporter on :5000..."
+    (
+        LD_PRELOAD="${DME_DIR}/lib/libamd_smi.so.26" \
+            "${DME_DIR}/bin/gpuagent" -s /var/run/gpuagent.sock &
+        sleep 10
+        exec "${DME_DIR}/bin/server"
+    ) > "${LOG_DIR}/exporter.log" 2>&1 &
+    EXPORTER_PID=$!
+    PIDS+=("${EXPORTER_PID}")
+    # any=1: /metrics answers 200, but accept any HTTP response as "listening".
+    wait_for "http://localhost:5000/metrics" "Metrics exporter" 120 \
+             "${LOG_DIR}/exporter.log" 1 "${EXPORTER_PID}"
+
     # --- 1. vLLM -------------------------------------------------------------
     log "Starting vLLM (${HERMES_MODEL}) on port ${VLLM_HERMES_PORT}..."
     log "  First start downloads about 60 GB of weights; this takes a while."
@@ -156,7 +179,8 @@ start_services() {
         --host 0.0.0.0 \
         --port "${MLFLOW_PORT}" \
         --backend-store-uri "sqlite:///${WORKSHOP_DIR}/mlflow.db" \
-        --default-artifact-root "${WORKSHOP_DIR}/mlruns" \
+        --serve-artifacts \
+        --artifacts-destination "${WORKSHOP_DIR}/mlflow_artifacts" \
         > "${LOG_DIR}/mlflow.log" 2>&1 &
     PIDS+=($!)
     wait_for "http://localhost:${MLFLOW_PORT}/health" "MLflow" 300 "${LOG_DIR}/mlflow.log"

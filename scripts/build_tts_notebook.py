@@ -43,6 +43,11 @@ def orig(idx):
 # upstream one, when the executed variant is the prompt that actually has a
 # genuine captured output. Keeping the prompt and its real output tied to the
 # same source of truth means they cannot drift apart.
+#
+# This snapshot is the MI300X run captured on 2026-08-21 (PR #4). Every code
+# cell below that drives the backend is sourced from it, so the prompts the
+# workshop runs, the outputs tts_executed.ipynb shows, and the timings quoted
+# in the chart all describe ONE real session rather than three different ones.
 EXEC_SNAPSHOT = os.path.join(HERE, "tts_exec_source.ipynb")
 with open(EXEC_SNAPSHOT) as f:
     ORIG_EXEC = json.load(f)
@@ -360,7 +365,17 @@ synthesize. In the cell below we let Hermes itself write the input passage and s
 it to `input_text.txt`, which is then passed to the TTS tool.
 """
 )
-code(orig(7))
+# The input-passage prompt from the 2026-08-21 MI300X run (~8,450 characters).
+# A longer passage than the earlier 4,000-character variant, chosen because it
+# makes the batching win later in the notebook far more visible.
+code(orig_exec(11))
+
+md(
+"""> **Make it your own.** Feel free to pick a different topic for the passage, and
+> to vary its length. Longer input makes the batching win later in the notebook
+> much more visible.
+"""
+)
 
 # ---- 6. Step 1: Baseline ----------------------------------------------------
 md(
@@ -375,13 +390,12 @@ The command below asks the agent to read the generated `input_text.txt` and spea
 it.
 """
 )
-# Edge TTS baseline. We use the EXPLICIT prompt variant (read_file, then
-# text_to_speech on the full text) rather than the terser upstream wording.
-# Reason: it is the prompt that was actually executed on the workshop machine,
-# so tts_exec_new.ipynb can carry a genuine captured output for this cell
-# instead of an invented one. It is also less ambiguous for the agent, which
-# is the behaviour we want to demonstrate at this step.
-code(orig_exec(9))
+# Edge TTS baseline, from the 2026-08-21 MI300X run. This is the terser prompt
+# ("convert the text and save the audio") rather than a step-by-step one. It is
+# deliberate: leaving the agent to work out HOW is what produces the messy,
+# repeated tool calls the "Edge TTS observations" section below discusses, which
+# is the behaviour this step exists to demonstrate.
+code(orig_exec(14))
 
 # ---- 7. Step 2: Profiling ---------------------------------------------------
 md(
@@ -398,7 +412,11 @@ md(
 ```
 
 This appears because `utils/helper.sh` connects the stock-plus-patched hermes-otel plugin
-directly to the MLflow server, so all profiled telemetry is recorded in MLflow.
+directly to the MLflow server, so all profiled telemetry is recorded in MLflow. The
+telemetry dashboard in the next section is built on these same traces.
+
+The three steps below open the raw MLflow interface. Skip them if you only want the
+high-level overview the dashboard gives you.
 
 1. To browse the detailed log, open your local MLflow interface (typically at
    `http://<system_ip>:5004`).
@@ -419,6 +437,19 @@ server address and gives you a direct link.
 > runs on the same machine as the workshop (or when you forwarded the port with
 > `ssh -L 8501:localhost:8501`). Use the **server-IP** link when you are hitting a
 > remote machine directly and port `8501` is reachable from your network.
+
+**The dashboard has four tabs:**
+
+1. **Overview.** Plots the span waterfall for the agent's flow alongside CPU and
+   GPU utilization at each span. A toggle switches between the standalone CPU/GPU
+   timeline (the default) and the full-session waterfall correlated with it. A
+   tool-breakdown table sits below the chart.
+2. **CPU / GPU separate.** Shows the CPU and GPU graphs individually, with an
+   option to view the raw `.csv` files the Overview charts are plotted from.
+3. **Traces.** Provides a direct MLflow link for each turn in the session.
+4. **Analysis.** Feeds the MLflow traces plus each tool's execution time to the
+   local `hermes` CLI and reports how the agent could be improved. Depending on
+   the length of the traces this can take around five minutes.
 """
 )
 # Upstream tts-aug18 changed this cell's single link from localhost to
@@ -500,15 +531,15 @@ Once the run loads, explore what the dashboard shows for this execution:
 """
 )
 
-img("telemetry_dashboard_overview.png",
+img("overview.png",
     "The AMD Agent Telemetry dashboard Overview tab for a Hermes session. A span "
-    "waterfall shows the agent, LLM and API spans plus the kokoro_tts tool span "
-    "highlighted in orange as the longest at 55.64 seconds, and a CPU/GPU "
+    "waterfall shows the agent, LLM and API spans plus the text_to_speech tool "
+    "span highlighted in orange as the longest at 24.44 seconds, and a CPU/GPU "
     "utilization time series below tracks hardware use across the run.",
-    "The Overview tab of the telemetry dashboard. The orange kokoro_tts span is "
-    "the longest single step, and the utilization chart shows the GPU is mostly "
-    "idle while it runs. That gap is exactly the bottleneck we will fix.",
-    width="96%", subdir="outputs")
+    "The Overview tab of the telemetry dashboard. The orange text_to_speech span "
+    "is the longest single step, and the utilization chart shows the GPU is "
+    "mostly idle while it runs. That gap is exactly the bottleneck we will fix.",
+    width="96%", subdir="outputs/hermes_web_ui/edge")
 
 md(
 """<details>
@@ -610,17 +641,24 @@ fi
 
 # Resolve the Hermes installation, whichever layout this machine uses:
 # a per-user install (~/.hermes/hermes-agent) or a system one (/usr/local).
+# Require BOTH tools/ and venv/bin/python: the verification step below runs
+# that interpreter, so a root with tools/ but no venv/ would be selected here
+# and then fail on the next command with a confusing "no such file" error.
 HERMES_ROOT=""
 for cand in "$HOME/.hermes/hermes-agent" /usr/local/lib/hermes-agent; do
-    if [ -d "$cand/tools" ]; then HERMES_ROOT="$cand"; break; fi
+    if [ -x "$cand/venv/bin/python" ] && [ -d "$cand/tools" ]; then
+        HERMES_ROOT="$cand"
+        break
+    fi
 done
 
 if [ -z "$HERMES_ROOT" ]; then
-    echo "[ERROR] Could not find the Hermes tools package."
-    echo "        Has utils/helper.sh finished installing Hermes?"
+    echo "[ERROR] Could not find a complete Hermes install (tools/ + venv/)."
+    echo "        Has hermes finished installing?"
     exit 1
 fi
 
+echo "[INFO] Deploying custom Kokoro TTS tool to $HERMES_ROOT/tools ..."
 cp "$SRC" "$HERMES_ROOT/tools/"
 echo "[OK] Copied kokoro_tts_tool.py -> $HERMES_ROOT/tools/"
 
@@ -653,7 +691,7 @@ The tool is defined in `custom_tools/kokoro_tts_tool.py` and backed by
 `utils/kokoro_server.py`. Let's run it on our input and profile how it performs.
 """
 )
-code(orig(17))
+code(orig_exec(26))
 
 md(
 """### How `kokoro_tts` works, and why the first run is slow
@@ -710,7 +748,7 @@ md(
 compare.
 """
 )
-code(orig(22))
+code(orig_exec(32))
 
 md(
 """Load this run in the dashboard the same way as before: click **Fetch**, select
@@ -729,7 +767,7 @@ single GPU forward pass instead of one at a time:
   reducing wasted padding.
 - **Correct batched processing.** Padding and attention masks keep each sentence
   independent, and the final audio is trimmed back to its true length. See
-  `utils/kokoro_server.py` for the source.
+  `utils/kokoro_server.py` for the source code.
 
 ### What you should see in the dashboard
 
@@ -793,12 +831,14 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 # --- Tool execution time (seconds) for each approach ---
-# Defaults are the numbers measured on the MI300X workshop machine
-# (upstream tts-aug18). Replace them with the execution seconds from your OWN
-# runs, taken from each tool's output line and the profiling dashboard.
-edge_time = 11.43     # Edge TTS (cloud) - note: truncates long text (~5 min cap)
-seq_time = 50.34      # Kokoro, sequential mode (local, unoptimized)
-batched_time = 5.66   # Kokoro, batched mode (local, optimized)
+# Defaults are the numbers measured on the MI300X workshop machine on
+# 2026-08-21, for the ~8,450-character passage this notebook generates. They
+# are the same run that tts_executed.ipynb captures. Replace them with the
+# execution seconds from your OWN runs, taken from each tool's output line and
+# the profiling dashboard.
+edge_time = 24.4      # Edge TTS (cloud) - note: truncates long text (~5 min cap)
+seq_time = 106.1      # Kokoro, sequential mode (local, unoptimized)
+batched_time = 9.7    # Kokoro, batched mode (local, optimized)
 
 # --- AMD look and feel -------------------------------------------------------
 # Arial-metric font (Liberation Sans) so the chart matches the AMD web family,

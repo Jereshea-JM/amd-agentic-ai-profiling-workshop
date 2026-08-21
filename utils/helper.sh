@@ -378,10 +378,17 @@ fi
 echo "[OK] MLflow $(python3 -c 'import mlflow; print(mlflow.__version__)') and the OTLP exporter are installed."
 
 echo "[INFO] Launching MLflow server on port 5004..."
+# --serve-artifacts / --artifacts-destination: without a configured artifact
+# store MLflow records the RUN but cannot serve its artifacts, so the dashboard
+# and the Traces view come up with missing detail. Keep --allowed-hosts "*",
+# which the dashboard needs when it is reached over the server IP rather than
+# localhost.
 python3 -m mlflow server \
   --host 0.0.0.0 \
   --port 5004 \
   --backend-store-uri sqlite:///mlflow.db \
+  --serve-artifacts \
+  --artifacts-destination ./mlflow_artifacts \
   --allowed-hosts "*" > mlflow_server.log 2>&1 &
 
 MLFLOW_PID=$!
@@ -438,7 +445,9 @@ hermes config set model.provider custom
 hermes config set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
 hermes config set model.default "$HERMES_MODEL"
 hermes config set compression.enabled false
-hermes config set model.max_tokens 8192
+# 16384, raised from 8192: the workshop passage is now ~8,450 characters, and
+# at 8192 the agent's replies were being truncated mid-run.
+hermes config set model.max_tokens 16384
 hermes config set terminal.cwd "$WORKSPACE_DIR"
 hermes config set tool_output.max_bytes 150000
 hermes config set tool_output.max_lines 5000
