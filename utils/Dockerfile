@@ -27,6 +27,15 @@
 # The ROCm vLLM nightly already provides Python 3.12, PyTorch 2.12 with HIP 7.2,
 # and a working vLLM install, so the Kokoro TTS server reuses that same PyTorch
 # rather than installing a second multi-gigabyte copy.
+# The AMD Device Metrics Exporter is pulled in as a build stage so the GPU
+# metrics source ships INSIDE this image. Previously the container scraped
+# http://172.17.0.1:5050/metrics, i.e. an exporter the user had to be running
+# on the Docker host: if it was absent the profiling dashboard drew a flat 0%
+# GPU line with no error, which is the single most confusing failure in the
+# workshop. Only /home/amd is copied; `server` is statically linked and
+# `gpuagent` resolves libamd_smi through LD_PRELOAD from the same subtree.
+FROM rocm/device-metrics-exporter:v1.5.0 AS exporter
+
 FROM vllm/vllm-openai-rocm:nightly
 
 LABEL org.opencontainers.image.title="AMD Agentic AI Profiling Workshop"
@@ -55,6 +64,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl rsync ca-certificates procps lsof espeak-ng libsndfile1 \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
+
+# Device Metrics Exporter payload (bin/gpuagent, bin/server, lib/libamd_smi).
+COPY --from=exporter /home/amd /root/amd-dme
 
 # -----------------------------------------------------------------------------
 # 2. Muse-Glimmer support: overlay vLLM PR #51655
@@ -149,7 +161,7 @@ RUN git clone https://github.com/briancaffey/hermes-otel.git \
 # 6. Workshop content
 # -----------------------------------------------------------------------------
 WORKDIR /workshop
-COPY tts.ipynb tts_exec_new.ipynb README.md ./
+COPY tts.ipynb tts_executed.ipynb README.md ./
 COPY assets/ ./assets/
 COPY custom_tools/ ./custom_tools/
 COPY utils/ ./utils/
@@ -185,7 +197,7 @@ RUN hermes config set model.provider custom \
     && hermes config set model.base_url "http://localhost:${VLLM_HERMES_PORT}/v1" \
     && hermes config set model.default "${HERMES_MODEL}" \
     && hermes config set compression.enabled false \
-    && hermes config set model.max_tokens 8192 \
+    && hermes config set model.max_tokens 16384 \
     && hermes config set terminal.cwd "${WORKSHOP_DIR}" \
     && hermes config set tool_output.max_bytes 150000 \
     && hermes config set tool_output.max_lines 5000 \
@@ -215,7 +227,7 @@ RUN printf '%s\n' \
 RUN printf '%s\n' \
     "MLFLOW_TRACKING_URI=http://127.0.0.1:${MLFLOW_PORT}" \
     "HERMES_PROFILING_OUTPUT_DIR=${WORKSHOP_DIR}/outputs" \
-    "HERMES_GPU_EXPORTER_URL=http://172.17.0.1:5050/metrics" \
+    "HERMES_GPU_EXPORTER_URL=http://localhost:5000/metrics" \
     "KOKORO_SERVER_URL=http://localhost:${KOKORO_PORT}" \
     'MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false' \
     'MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL=1' \

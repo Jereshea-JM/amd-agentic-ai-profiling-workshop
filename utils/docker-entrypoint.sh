@@ -29,6 +29,9 @@ LOG_DIR="${WORKSHOP_DIR}/logs"
 VLLM_HERMES_PORT="${VLLM_HERMES_PORT:-8001}"
 KOKORO_PORT="${KOKORO_PORT:-8092}"
 MLFLOW_PORT="${MLFLOW_PORT:-5004}"
+# Device Metrics Exporter payload, copied from rocm/device-metrics-exporter by
+# the Dockerfile. Overridable so a host-run exporter can still be used instead.
+DME_DIR="${DME_DIR:-/root/amd-dme}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8501}"
 JUPYTER_PORT="${JUPYTER_PORT:-8888}"
 HERMES_MODEL="${HERMES_MODEL:-meta-models/Muse-Glimmer-30B}"
@@ -76,7 +79,13 @@ wait_for() {
     local waited=0 code
     log "Waiting for ${name} (${url}, timeout ${timeout}s)..."
     while [ "${waited}" -lt "${timeout}" ]; do
-        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null || echo 000)"
+        # NOTE: no `|| echo 000` here. curl already prints 000 via -w when it
+        # cannot connect, so the fallback CONCATENATED a second 000 and produced
+        # "000000". The any=1 branch below tests `code != "000"`, so "000000"
+        # slipped through and a service was reported up when nothing answered.
+        # Observed live 2026-08-21: "Metrics exporter is up (HTTP 000000) after 0s."
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null)"
+        code="${code:-000}"
         if [ "${any}" = "1" ] && [ "${code}" != "000" ]; then
             log "  ${name} is up (HTTP ${code}) after ${waited}s."
             return 0
@@ -130,6 +139,26 @@ start_services() {
         fi
     fi
 
+    # --- 0. AMD Device Metrics Exporter (embedded GPU metrics source) --------
+    # The profiling poller scrapes HERMES_GPU_EXPORTER_URL for GPU utilization.
+    # The exporter binaries were copied from rocm/device-metrics-exporter at
+    # build time into /root/amd-dme, so no exporter needs to be running on the
+    # Docker host. This mirrors the vendor entrypoint exactly: gpuagent reads
+    # the GPU behind a unix socket with libamd_smi preloaded, then after a 10s
+    # warm-up `server` publishes Prometheus metrics on :5000.
+    log "Starting AMD Device Metrics Exporter on :5000..."
+    (
+        LD_PRELOAD="${DME_DIR}/lib/libamd_smi.so.26" \
+            "${DME_DIR}/bin/gpuagent" -s /var/run/gpuagent.sock &
+        sleep 10
+        exec "${DME_DIR}/bin/server"
+    ) > "${LOG_DIR}/exporter.log" 2>&1 &
+    EXPORTER_PID=$!
+    PIDS+=("${EXPORTER_PID}")
+    # any=1: /metrics answers 200, but accept any HTTP response as "listening".
+    wait_for "http://localhost:5000/metrics" "Metrics exporter" 120 \
+             "${LOG_DIR}/exporter.log" 1 "${EXPORTER_PID}"
+
     # --- 1. vLLM -------------------------------------------------------------
     log "Starting vLLM (${HERMES_MODEL}) on port ${VLLM_HERMES_PORT}..."
     log "  First start downloads about 60 GB of weights; this takes a while."
@@ -156,7 +185,8 @@ start_services() {
         --host 0.0.0.0 \
         --port "${MLFLOW_PORT}" \
         --backend-store-uri "sqlite:///${WORKSHOP_DIR}/mlflow.db" \
-        --default-artifact-root "${WORKSHOP_DIR}/mlruns" \
+        --serve-artifacts \
+        --artifacts-destination "${WORKSHOP_DIR}/mlflow_artifacts" \
         > "${LOG_DIR}/mlflow.log" 2>&1 &
     PIDS+=($!)
     wait_for "http://localhost:${MLFLOW_PORT}/health" "MLflow" 300 "${LOG_DIR}/mlflow.log"
@@ -181,6 +211,55 @@ start_services() {
     PIDS+=($!)
     wait_for "http://localhost:${DASHBOARD_PORT}/_stcore/health" \
              "Telemetry dashboard" 300 "${LOG_DIR}/dashboard.log"
+
+    # /_stcore/health returning 200 only proves the Streamlit SERVER is alive.
+    # It returns 200 even when the app script raised on import and every visitor
+    # sees a traceback. Verified in-container 2026-08-21: an injected bad import
+    # still answered /_stcore/health with 200 and served a 200 page.
+    #
+    # helper.sh already guards this on the bare-metal path. Do the same here, by
+    # asking the app's OWN interpreter whether every top-level import resolves.
+    dash_bad="$(python3 - "${UTILS_DIR}/hermes_profiler.py" <<'PYPROBE'
+import ast
+import importlib.util
+import sys
+
+path = sys.argv[1]
+try:
+    tree = ast.parse(open(path).read())
+except Exception as exc:                # noqa: BLE001
+    print(f"UNPARSEABLE:{exc.__class__.__name__}")
+    raise SystemExit(0)
+
+mods = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for a in node.names:
+            mods.add(a.name.split(".")[0])
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        mods.add(node.module.split(".")[0])
+
+bad = []
+for m in sorted(mods):
+    if m in sys.builtin_module_names:
+        continue
+    try:
+        if importlib.util.find_spec(m) is None:
+            bad.append(m)
+    except Exception:                   # noqa: BLE001
+        bad.append(m)
+print(",".join(bad))
+PYPROBE
+)"
+    if [ -n "${dash_bad}" ]; then
+        echo "[FATAL] The telemetry dashboard is serving an error page." >&2
+        echo "        ${UTILS_DIR}/hermes_profiler.py imports modules that do not" >&2
+        echo "        resolve: ${dash_bad}" >&2
+        echo "        /_stcore/health still returns 200, which is why this is" >&2
+        echo "        checked separately." >&2
+        exit 1
+    fi
+    log "  Telemetry dashboard imports all resolve."
 
     # --- 5. JupyterLab -------------------------------------------------------
     log "Starting JupyterLab on port ${JUPYTER_PORT}..."

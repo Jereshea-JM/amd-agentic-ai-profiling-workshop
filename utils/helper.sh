@@ -137,7 +137,8 @@ wait_for_vllm_readiness() {
 
     echo "[INFO] Waiting for $service_name to load weights and start its API on port $port..."
     while true; do
-        status_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/v1/models || echo "000")
+        status_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/v1/models)
+        status_code="${status_code:-000}"
 
         if [ "$status_code" -eq 200 ]; then
             echo "[OK] $service_name is active and responsive."
@@ -256,7 +257,8 @@ echo "[INFO] Waiting for device-metrics-exporter on port $VLLM_DEVICE_METRICS_EX
 exporter_ready=0
 for i in $(seq 1 30); do
     code=$(curl -s -o /dev/null -w "%{http_code}" \
-        "http://localhost:$VLLM_DEVICE_METRICS_EXPORTER_PORT/metrics" || echo "000")
+        "http://localhost:$VLLM_DEVICE_METRICS_EXPORTER_PORT/metrics")
+    code="${code:-000}"
     if [ "$code" -eq 200 ]; then
         echo "[OK] device-metrics-exporter is serving metrics."
         exporter_ready=1
@@ -378,10 +380,17 @@ fi
 echo "[OK] MLflow $(python3 -c 'import mlflow; print(mlflow.__version__)') and the OTLP exporter are installed."
 
 echo "[INFO] Launching MLflow server on port 5004..."
+# --serve-artifacts / --artifacts-destination: without a configured artifact
+# store MLflow records the RUN but cannot serve its artifacts, so the dashboard
+# and the Traces view come up with missing detail. Keep --allowed-hosts "*",
+# which the dashboard needs when it is reached over the server IP rather than
+# localhost.
 python3 -m mlflow server \
   --host 0.0.0.0 \
   --port 5004 \
   --backend-store-uri sqlite:///mlflow.db \
+  --serve-artifacts \
+  --artifacts-destination ./mlflow_artifacts \
   --allowed-hosts "*" > mlflow_server.log 2>&1 &
 
 MLFLOW_PID=$!
@@ -390,7 +399,8 @@ echo "[INFO] MLflow server started (PID $MLFLOW_PID)."
 echo "[INFO] Waiting for MLflow server /health on port 5004..."
 mlflow_ready=0
 for i in $(seq 1 30); do
-    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5004/health" || echo "000")
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5004/health")
+    code="${code:-000}"
     if [ "$code" -eq 200 ]; then
         echo "[OK] MLflow server is up."
         mlflow_ready=1
@@ -438,7 +448,9 @@ hermes config set model.provider custom
 hermes config set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
 hermes config set model.default "$HERMES_MODEL"
 hermes config set compression.enabled false
-hermes config set model.max_tokens 8192
+# 16384, raised from 8192: the workshop passage is now ~8,450 characters, and
+# at 8192 the agent's replies were being truncated mid-run.
+hermes config set model.max_tokens 16384
 hermes config set terminal.cwd "$WORKSPACE_DIR"
 hermes config set tool_output.max_bytes 150000
 hermes config set tool_output.max_lines 5000
@@ -814,7 +826,8 @@ echo "[INFO] Kokoro server started (PID $KOKORO_PID, logs: $WORKSPACE_DIR/kokoro
 echo "[INFO] Waiting for Kokoro server /health on port $KOKORO_PORT..."
 kokoro_ready=0
 for i in $(seq 1 120); do
-    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$KOKORO_PORT/health" || echo "000")
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$KOKORO_PORT/health")
+    code="${code:-000}"
     if [ "$code" -eq 200 ]; then
         echo "[OK] Kokoro TTS server is active (sequential + batched)."
         kokoro_ready=1
@@ -871,7 +884,8 @@ if [ -f "$DASHBOARD_APP" ]; then
     echo "[INFO] Waiting for Streamlit dashboard /_stcore/health on port 8501..."
     streamlit_ready=0
     for i in $(seq 1 30); do
-        code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8501/_stcore/health" || echo "000")
+        code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8501/_stcore/health")
+        code="${code:-000}"
         if [ "$code" -eq 200 ]; then
             streamlit_ready=1
             break

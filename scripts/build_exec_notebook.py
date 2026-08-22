@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rebuild tts_exec_new.ipynb = the current tts.ipynb, with executed outputs.
+Rebuild tts_executed.ipynb = the current tts.ipynb, with executed outputs.
 
 Alignment strategy (no fabrication):
   * STRUCTURE comes wholesale from tts.ipynb, so prose, images, captions and
@@ -29,13 +29,30 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 NB = os.path.join(ROOT, "tts.ipynb")
-EXEC_NB = os.path.join(ROOT, "tts_exec_new.ipynb")
+EXEC_NB = os.path.join(ROOT, "tts_executed.ipynb")
 # Genuine captured outputs from the workshop machine.
 CAPTURED = os.path.join(HERE, "captured_outputs.json")
 
 
 def src_of(cell):
     return "".join(cell["source"])
+
+
+def executable_text(s):
+    """Normalize a cell to the text that actually RUNS.
+
+    Comments and blank lines change nothing about what a cell does, so a
+    comment-only edit must not silently discard a genuine captured output and
+    leave the cell blank. Everything executable is compared verbatim, so a real
+    change to a command still correctly invalidates the capture.
+    """
+    out = []
+    for line in s.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        out.append(line.rstrip())
+    return "\n".join(out)
 
 
 def run_chart_cell(source):
@@ -69,6 +86,12 @@ def main():
     exec_count = 0
     report = []
 
+    # Secondary index: executable text -> outputs. Used only when the verbatim
+    # source does not match, so a comment reflow never costs a real output.
+    by_exec = {}
+    for k, v in captured.items():
+        by_exec.setdefault(executable_text(k), v)
+
     for cell in out_nb["cells"]:
         if cell["cell_type"] != "code":
             continue
@@ -101,6 +124,11 @@ def main():
             cell["execution_count"] = exec_count
             cell["outputs"] = captured[s]
             report.append(("REAL CAPTURE   ", s[:55]))
+        elif executable_text(s) in by_exec:
+            exec_count += 1
+            cell["execution_count"] = exec_count
+            cell["outputs"] = by_exec[executable_text(s)]
+            report.append(("REAL (comments)", s[:55]))
         else:
             cell["execution_count"] = None
             cell["outputs"] = []

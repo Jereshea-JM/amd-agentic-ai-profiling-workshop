@@ -58,7 +58,7 @@ The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mo
 | Path | What it is |
 | :--- | :--- |
 | `tts.ipynb` | **The workshop notebook.** Start here. |
-| `tts_exec_new.ipynb` | The same notebook with all cells already executed, so you can read the expected outputs without a GPU. |
+| `tts_executed.ipynb` | The same notebook with all cells already executed, so you can read the expected outputs without a GPU. |
 | `utils/helper.sh` | One-shot launcher for the full backend (agent, telemetry, dashboard, Kokoro server). |
 | `utils/kokoro_server.py` | The local Kokoro TTS server (FastAPI + Uvicorn), including the batched inference path. |
 | `utils/hermes_profiler.py` | The Streamlit telemetry dashboard. |
