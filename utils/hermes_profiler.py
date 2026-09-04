@@ -1293,6 +1293,482 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
 
 
 # ---------------------------------------------------------------------------
+# Agent efficiency metrics
+# ---------------------------------------------------------------------------
+# Four metrics derived from the span tree the dashboard already downloads at
+# Load: agent steps, time-to-first-tool, context growth per step, and tool
+# failure rate. Nothing here needs new instrumentation or a re-run -- it is
+# arithmetic over telemetry the patched hermes-otel plugin already emits, so it
+# also works on sessions recorded before these metrics existed.
+#
+# These build on the span helpers above (_clean_attr / _span_attrs /
+# _trace_spans) rather than re-implementing them.
+
+# Bumped whenever compute_session_metrics gains or renames a key. The Load
+# handler stashes its result in st.session_state, which survives a code reload,
+# so a dict built by an older version would otherwise be read by newer render
+# code and raise KeyError on a key that did not exist yet.
+METRICS_SCHEMA = 3
+
+NS_PER_S = 1_000_000_000
+
+# Mirrors the plugin's own policy in on_post_tool_call: only genuine execution
+# failures count against the failure rate. A blocked or denied call is a policy
+# or human decision, not a performance defect, so it is tracked separately
+# rather than inflating the headline number.
+FAILURE_OUTCOMES = frozenset({
+    "error", "failed", "failure", "exception", "timeout", "timed_out",
+})
+NEUTRAL_OUTCOMES = frozenset({
+    "blocked", "denied", "rejected", "cancelled", "canceled", "skipped",
+    "interrupted",
+})
+
+
+def _decode_str(value):
+    """Fully decode a string span attribute, unescaping JSON escapes.
+
+    _clean_attr only strips the surrounding quotes, which is enough for short
+    labels but leaves "\\n" as two literal characters -- so a multi-line value
+    like a traceback comes back as one long line and splitlines() finds nothing
+    to split. Anything inspecting the *content* of a string attribute needs this.
+    """
+    if not isinstance(value, str):
+        return "" if value is None else str(value)
+    text = value.strip()
+    if text[:1] == '"' and text[-1:] == '"':
+        try:
+            decoded = json.loads(text)
+            if isinstance(decoded, str):
+                return decoded
+        except (ValueError, TypeError):
+            pass
+    return _clean_attr(value)
+
+
+def _metric_int(value):
+    """Best-effort int, tolerating JSON-quoted numbers and None."""
+    if value is None:
+        return None
+    try:
+        return int(float(_clean_attr(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_span(name, attrs):
+    """Bucket a span into agent / api / llm_turn / tool / other.
+
+    Name prefix is checked before mlflow.spanType deliberately. Hermes emits two
+    span kinds that both carry spanType == "LLM": one llm.<model> span wrapping
+    the whole turn, and one api.<model> span per HTTP round trip. Only the name
+    separates them, and conflating the two would make every task look like a
+    single step. The spanType fallback keeps this usable against other
+    frameworks, which typically emit one LLM span per call.
+    """
+    lowered = (name or "").lower()
+    if lowered.startswith("api."):
+        return "api"
+    if lowered.startswith("tool."):
+        return "tool"
+    if lowered.startswith("llm."):
+        return "llm_turn"
+    if lowered == "agent" or lowered.startswith("agent."):
+        return "agent"
+    stype = _clean_attr(attrs.get("mlflow.spanType", "")).upper()
+    if stype == "TOOL":
+        return "tool"
+    if stype in ("LLM", "CHAT_MODEL"):
+        return "api"
+    if stype == "AGENT":
+        return "agent"
+    return "other"
+
+
+def _metric_spans(trace):
+    """Flatten a trace into {kind, name, start, end, dur_s, attrs} records.
+
+    Spans without a usable start timestamp are dropped: every metric here is
+    positional, so an unplaceable span cannot contribute and keeping it would
+    corrupt counts. Returned in start order.
+    """
+    out = []
+    for sp in _trace_spans(trace):
+        if not isinstance(sp, dict):
+            continue
+        start = end = None
+        for key in ("start_time", "start_time_ns", "start_time_unix_nano"):
+            if sp.get(key) is not None:
+                start = _metric_int(sp.get(key))
+                if start is not None:
+                    break
+        if start is None:
+            continue
+        for key in ("end_time", "end_time_ns", "end_time_unix_nano"):
+            if sp.get(key) is not None:
+                end = _metric_int(sp.get(key))
+                if end is not None:
+                    break
+        attrs = _span_attrs(sp)
+        name = str(sp.get("name", ""))
+        out.append({
+            "kind": _classify_span(name, attrs),
+            "name": name,
+            "start": start,
+            "end": end,
+            "dur_s": ((end - start) / NS_PER_S) if end is not None else 0.0,
+            "attrs": attrs,
+            "status": sp.get("status", ""),
+        })
+    out.sort(key=lambda x: x["start"])
+    return out
+
+
+def _tool_outcome(span):
+    """Outcome label for one tool span.
+
+    hermes.tool.outcome is set per call by the plugin and is authoritative. When
+    absent -- an unpatched plugin, or another framework -- fall back to the same
+    rules the plugin's extract_tool_result_status applies to the raw payload, so
+    both paths agree on what counts as a failure.
+    """
+    attrs = span.get("attrs", {})
+    outcome = attrs.get("hermes.tool.outcome")
+    if outcome:
+        return _clean_attr(outcome).lower()
+
+    raw = attrs.get("output.value", attrs.get("mlflow.spanOutputs"))
+    if raw is None:
+        # An OTel ERROR status is a weaker signal than the payload, but better
+        # than declaring success with no evidence either way.
+        return "error" if str(span.get("status", "")).upper() == "ERROR" else "unknown"
+
+    payload = raw
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = raw
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        if isinstance(status, str) and status.strip():
+            return status.strip().lower()
+        if payload.get("error") and str(payload["error"]).strip():
+            return "error"
+        if payload.get("timeout"):
+            return "timeout"
+        if payload.get("blocked"):
+            return "blocked"
+    return "completed"
+
+
+def _error_summary(span, limit=160):
+    """One-line reason a tool call failed, or "" if none can be extracted.
+
+    Prefers the plugin's error.message attribute. Many tools instead report
+    failure as {"status": "error", "output": "<traceback>"} with no error key, so
+    the fallback takes the LAST non-empty line -- for a Python traceback that is
+    the exception line (KeyError: 'turn'), the one line worth showing in a table.
+    """
+    attrs = span.get("attrs", {})
+    msg = attrs.get("error.message")
+    if msg:
+        lines = [ln.strip() for ln in _decode_str(msg).splitlines() if ln.strip()]
+        if lines:
+            return lines[-1][:limit]
+
+    raw = attrs.get("output.value", attrs.get("mlflow.spanOutputs"))
+    if raw is None:
+        return ""
+    payload = raw
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = raw
+    text = ""
+    if isinstance(payload, dict):
+        for key in ("error", "output", "stderr", "message"):
+            value = payload.get(key)
+            if value and str(value).strip():
+                text = str(value)
+                break
+    else:
+        text = str(payload)
+    lines = [ln.strip() for ln in _decode_str(text).splitlines() if ln.strip()]
+    return lines[-1][:limit] if lines else ""
+
+
+def _slope(values):
+    """Least-squares slope of values against their 0-based index.
+
+    Reported as "tokens added per step" so the number stays comparable whether a
+    task took 4 steps or 25. Uses every point, so one large jump cannot dominate
+    the way it would with (last - first) / (n - 1). Returns 0.0 below 2 points.
+    """
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean_x = (n - 1) / 2.0
+    mean_y = sum(values) / n
+    num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(values))
+    den = sum((i - mean_x) ** 2 for i in range(n))
+    return (num / den) if den else 0.0
+
+
+def _in_tokens(attrs):
+    for key in ("gen_ai.usage.input_tokens", "llm.token_count.prompt",
+                "llm.request.approx_input_tokens"):
+        value = _metric_int(attrs.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _out_tokens(attrs):
+    for key in ("gen_ai.usage.output_tokens", "llm.token_count.completion"):
+        value = _metric_int(attrs.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def compute_turn_metrics(trace):
+    """Compute the four metrics for a single turn (one MLflow trace).
+
+    Metrics that cannot be computed are None rather than 0 -- a task that called
+    no tools has *no* time-to-first-tool, which differs from "zero seconds", and
+    collapsing the two drags any average toward a value never observed.
+    """
+    spans = _metric_spans(trace)
+    result = {
+        "turn": None, "wall_s": None,
+        "time_to_first_tool_s": None, "time_to_first_tool_pct": None,
+        "agent_steps": 0, "agent_steps_reported": None,
+        "context_series": [], "context_first": None, "context_last": None,
+        "context_delta": None, "context_growth_per_step": None,
+        "context_steps": [],
+        "input_tokens_total": None, "output_tokens_total": None,
+        "tool_calls": 0, "tool_failures": 0, "tool_neutral": 0,
+        "tool_failure_rate_pct": None, "tool_time_failed_s": 0.0,
+        "outcome_counts": {}, "first_tool_name": None,
+        "outcomes_reported": [], "hidden_failure": False,
+        "failed_tools": [], "failed_calls": [],
+    }
+    if not spans:
+        return result
+
+    api = [x for x in spans if x["kind"] == "api"]
+    tools = [x for x in spans if x["kind"] == "tool"]
+    llm_turn = [x for x in spans if x["kind"] == "llm_turn"]
+
+    turn_start = min(x["start"] for x in spans)
+    turn_end = max((x["end"] for x in spans if x["end"] is not None),
+                   default=turn_start)
+    wall_s = (turn_end - turn_start) / NS_PER_S
+    result["wall_s"] = wall_s
+
+    for span in spans:
+        if "hermes.turn.number" in span["attrs"]:
+            result["turn"] = _metric_int(span["attrs"]["hermes.turn.number"])
+            break
+
+    # -- Agent steps --------------------------------------------------------
+    # Count api spans; fall back to per-call LLM spans for frameworks emitting
+    # only those. The plugin's own counter rides alongside as a cross-check, so
+    # an unexported span shows as a disagreement rather than silently lowering
+    # the count.
+    result["agent_steps"] = len(api) if api else len(llm_turn)
+    for span in spans:
+        reported = _metric_int(span["attrs"].get("hermes.turn.api_call_count"))
+        if reported is not None:
+            result["agent_steps_reported"] = reported
+            break
+
+    # -- Time to first tool -------------------------------------------------
+    if tools:
+        first = min(tools, key=lambda x: x["start"])
+        ttft = (first["start"] - turn_start) / NS_PER_S
+        result["time_to_first_tool_s"] = round(ttft, 3)
+        result["first_tool_name"] = first["name"].replace("tool.", "", 1)
+        if wall_s > 0:
+            result["time_to_first_tool_pct"] = round(ttft / wall_s * 100, 1)
+
+    # -- Context growth per step -------------------------------------------
+    series = [t for t in (_in_tokens(x["attrs"]) for x in api) if t is not None]
+    if series:
+        result["context_series"] = series
+        result["context_first"] = series[0]
+        result["context_last"] = series[-1]
+        result["context_delta"] = series[-1] - series[0]
+        result["context_growth_per_step"] = round(_slope([float(v) for v in series]), 1)
+        result["input_tokens_total"] = sum(series)
+    outs = [t for t in (_out_tokens(x["attrs"]) for x in api) if t is not None]
+    if outs:
+        result["output_tokens_total"] = sum(outs)
+
+    # Pair each LLM call with the tool it asked for, so a jump in the context
+    # curve can be attributed to the tool result that caused it. The tool a call
+    # requested is the first tool span starting after that call ends and before
+    # the next call begins -- the agent is strictly serial, so that window holds
+    # exactly one tool.
+    steps = []
+    prev_in = None
+    for i, span in enumerate(api):
+        after = span["end"] if span["end"] is not None else span["start"]
+        before = api[i + 1]["start"] if i + 1 < len(api) else None
+        tool_name = None
+        for tspan in tools:
+            if tspan["start"] >= after and (before is None or tspan["start"] < before):
+                tool_name = tspan["name"].replace("tool.", "", 1)
+                break
+        tokens_in = _in_tokens(span["attrs"])
+        finish = _clean_attr(span["attrs"].get("llm.response.finish_reason", "")) or None
+        steps.append({
+            "step": i + 1,
+            "input_tokens": tokens_in,
+            "output_tokens": _out_tokens(span["attrs"]),
+            # None on step 1: there is no previous call to compare against, and
+            # 0 would read as "nothing was added".
+            "delta": (tokens_in - prev_in
+                      if tokens_in is not None and prev_in is not None else None),
+            "tool": tool_name,
+            "finish_reason": finish,
+            "llm_s": round(span["dur_s"], 2),
+        })
+        if tokens_in is not None:
+            prev_in = tokens_in
+    result["context_steps"] = steps
+
+    # -- Tool failure rate --------------------------------------------------
+    counts = {}
+    failures = neutral = 0
+    failed_time = 0.0
+    failed_tools = []
+    failed_calls = []
+    for span in tools:
+        label = _tool_outcome(span)
+        counts[label] = counts.get(label, 0) + 1
+        if label in FAILURE_OUTCOMES:
+            failures += 1
+            failed_time += span["dur_s"]
+            name = span["name"].replace("tool.", "", 1)
+            # A list, not a set: the same tool failing twice in a row is the
+            # signal that the agent is stuck rather than unlucky, and a set
+            # would erase exactly that.
+            failed_tools.append(name)
+            failed_calls.append({
+                "tool": name,
+                "outcome": label,
+                "offset_s": round((span["start"] - turn_start) / NS_PER_S, 2),
+                "duration_s": round(span["dur_s"], 3),
+                "error": _error_summary(span),
+            })
+        elif label in NEUTRAL_OUTCOMES:
+            neutral += 1
+    result["tool_calls"] = len(tools)
+    result["tool_failures"] = failures
+    result["tool_neutral"] = neutral
+    result["tool_time_failed_s"] = round(failed_time, 3)
+    result["outcome_counts"] = counts
+    result["failed_tools"] = failed_tools
+    result["failed_calls"] = failed_calls
+
+    # Cross-check the per-span view against the plugin's per-turn outcome set,
+    # and flag a disagreement rather than reporting a rate known to be low.
+    #
+    # This is not hypothetical. The plugin keys both the tool span and the CSV
+    # row on f"{tool_name}:{task_id}", so when a model calls the same tool twice
+    # inside one step -- a failed attempt then a retry -- the two collide and
+    # only one survives. The set records which outcomes occurred but not how
+    # many, so the hidden call can be detected but not counted. Reporting
+    # "0% observed, and I know I am blind" beats a bare 0%.
+    reported = []
+    for span in spans:
+        raw = span["attrs"].get("hermes.turn.tool_outcomes")
+        if raw:
+            reported = [p.strip().lower()
+                        for p in _clean_attr(raw).split(",") if p.strip()]
+            break
+    result["outcomes_reported"] = reported
+    if reported:
+        hidden = {o for o in reported if o in FAILURE_OUTCOMES}
+        observed = {o for o, n in counts.items() if n > 0}
+        result["hidden_failure"] = bool(hidden - observed)
+
+    if tools:
+        result["tool_failure_rate_pct"] = round(failures / len(tools) * 100, 1)
+    return result
+
+
+def _mean(values):
+    vals = [v for v in values if v is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def compute_session_metrics(traces):
+    """Aggregate the four metrics across every turn in a session.
+
+    Rates are pooled over raw counts rather than averaged over per-turn rates: a
+    turn with one tool call and a turn with twenty should not carry equal weight.
+    """
+    turns = [compute_turn_metrics(t) for t in (traces or [])]
+    turns = [t for t in turns if t["wall_s"] is not None]
+
+    total_tools = sum(t["tool_calls"] for t in turns)
+    total_failures = sum(t["tool_failures"] for t in turns)
+
+    summary = {
+        "schema": METRICS_SCHEMA,
+        "turns": len(turns),
+        "per_turn": turns,
+
+        "agent_steps_total": sum(t["agent_steps"] for t in turns),
+        "agent_steps_mean": _mean(t["agent_steps"] for t in turns),
+        "agent_steps_max": max((t["agent_steps"] for t in turns), default=None),
+
+        "time_to_first_tool_mean_s": _mean(t["time_to_first_tool_s"] for t in turns),
+        "time_to_first_tool_max_s": max(
+            (t["time_to_first_tool_s"] for t in turns
+             if t["time_to_first_tool_s"] is not None), default=None),
+        "time_to_first_tool_pct_mean": _mean(t["time_to_first_tool_pct"] for t in turns),
+
+        "context_growth_per_step_mean": _mean(
+            t["context_growth_per_step"] for t in turns),
+        "context_peak": max((t["context_last"] for t in turns
+                             if t["context_last"] is not None), default=None),
+        "input_tokens_total": sum(t["input_tokens_total"] or 0 for t in turns) or None,
+        "output_tokens_total": sum(t["output_tokens_total"] or 0 for t in turns) or None,
+
+        "tool_calls_total": total_tools,
+        "tool_failures_total": total_failures,
+        "tool_failure_rate_pct": (round(total_failures / total_tools * 100, 1)
+                                  if total_tools else None),
+        "tool_time_failed_s": round(sum(t["tool_time_failed_s"] for t in turns), 3),
+        # Turns where the plugin recorded a failure that no span captured. A
+        # non-zero count means tool_failure_rate_pct is a lower bound.
+        "hidden_failure_turns": sum(1 for t in turns if t["hidden_failure"]),
+    }
+
+    outcomes = {}
+    failed_counts = {}
+    all_failed_calls = []
+    for turn in turns:
+        for label, n in turn["outcome_counts"].items():
+            outcomes[label] = outcomes.get(label, 0) + n
+        for name in turn["failed_tools"]:
+            failed_counts[name] = failed_counts.get(name, 0) + 1
+        for call in turn["failed_calls"]:
+            all_failed_calls.append(dict(call, turn=turn["turn"]))
+    summary["outcome_counts"] = outcomes
+    # Worst offender first -- that is the one worth fixing.
+    summary["failed_tool_counts"] = dict(
+        sorted(failed_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+    summary["failed_calls"] = all_failed_calls
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -1455,6 +1931,11 @@ if load:
         "cpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "cpu_timeline.csv"))),
         "gpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "gpu_timeline.csv"))),
         "tool_df": parse_timestamps(read_csv(os.path.join(local_dir, "tool_breakdown.csv"))),
+        # Derived from the span trees just fetched -- no new instrumentation and
+        # no re-run, so this also works on sessions recorded before these
+        # metrics existed. Computed once here rather than per-rerun, because
+        # every widget interaction re-executes the script body.
+        "metrics": compute_session_metrics(full_traces) if full_traces else None,
     }
     # Loading a session invalidates per-session tab state from any previous one -
     # clear cached traces & analysis so those tabs don't show stale data. (The
@@ -1466,7 +1947,13 @@ if load:
 # Require a fresh Load if nothing is cached, or if the cache predates the current
 # schema (missing newer keys like local_dir/session_id from an older run).
 _data = st.session_state.get("loaded")
-if not _data or "local_dir" not in _data or "session_id" not in _data:
+_cached_metrics = (_data or {}).get("metrics")
+# A cached dict from an older METRICS_SCHEMA is stale even though its key
+# exists; reading it with newer render code raises KeyError on a key that did
+# not exist yet, so force a fresh Load instead.
+_metrics_stale = bool(_cached_metrics) and _cached_metrics.get("schema") != METRICS_SCHEMA
+if (not _data or "local_dir" not in _data or "session_id" not in _data
+        or "metrics" not in _data or _metrics_stale):
     st.info("Enter the MLflow server IP, port, and a session ID in the sidebar, then click **Load**.")
     st.stop()
 
@@ -1481,6 +1968,7 @@ sess_id = _data["session_id"]
 loaded_full_traces = _data.get("full_traces")
 turn_count = _data.get("turn_count", 0)
 total_latency_ms = _data.get("total_latency_ms", 0.0)
+metrics = _data.get("metrics")
 
 st.write(f"**Tracking URI:** `{tracking_uri}`")
 st.success(f"Found run `{info['run_id']}` in experiment `{info['experiment']}`.")
@@ -1518,8 +2006,9 @@ if cpu_df.empty and gpu_df.empty:
     st.warning("No CPU/GPU timeline data found in the downloaded artifacts.")
     st.stop()
 
-tab_overview, tab_separate, tab_traces, tab_analysis = st.tabs(
-    ["Overview", "CPU / GPU separate", "Traces", "Analysis"]
+(tab_overview, tab_separate, tab_efficiency, tab_traces,
+ tab_analysis) = st.tabs(
+    ["Overview", "CPU / GPU separate", "Efficiency", "Traces", "Analysis"]
 )
 
 with tab_overview:
@@ -1623,6 +2112,195 @@ with tab_separate:
                 _render_csv_panel()
     else:
         _render_graphs()
+
+
+with tab_efficiency:
+    st.subheader("Agent efficiency")
+    st.caption(
+        "Derived from this session's span trees. Nothing here needs new "
+        "instrumentation -- it is arithmetic over telemetry the patched "
+        "hermes-otel plugin already emits."
+    )
+
+    def _fmt(value, suffix="", nd=1):
+        """Render a metric, distinguishing 'not applicable' from zero.
+
+        A turn that called no tools has no time-to-first-tool; showing 0 there
+        would read as 'instant' rather than 'never happened'.
+        """
+        if value is None:
+            return "n/a"
+        if isinstance(value, float):
+            return f"{value:.{nd}f}{suffix}"
+        return f"{value}{suffix}"
+
+    if not metrics or not metrics.get("per_turn", []):
+        st.info(
+            "No traces loaded for this session, so these metrics cannot be "
+            "derived. Click **Load / Reload** in the sidebar."
+        )
+    else:
+        per_turn = metrics.get("per_turn", [])
+        n_turns = metrics.get("turns", 0)
+
+        # Each card aggregates differently -- total, mean, mean, pooled -- so
+        # each says which it is. A bare mean hides the worst turn, which is the
+        # one worth investigating, so the extremum is named alongside.
+        section("Context growth per step")
+        # One line per turn: input tokens against step index. The intercept is
+        # the fixed prompt cost (system message + tool schemas); the slope is
+        # what the agent adds to its own context as it works.
+        fig = go.Figure()
+        for i, t in enumerate(per_turn):
+            pts = [stp for stp in (t.get("context_steps") or [])
+                   if stp["input_tokens"] is not None]
+            if len(pts) < 2:
+                continue
+            label = f"Turn {t['turn']}" if t["turn"] is not None else f"Trace {i + 1}"
+            # Label each point with the tool that LLM call asked for -- the jump
+            # to the NEXT point is that tool's result landing in the prompt, so
+            # naming it is what makes a step change explainable. The final call
+            # requests no tool (finish_reason "stop"); mark it as the answer.
+            #
+            # Loop variable is `stp`, not `st`: `st` is the Streamlit module and
+            # shadowing it here breaks every st.* call later in the script.
+            marks, hovers = [], []
+            for stp in pts:
+                tool = stp["tool"] or "final answer"
+                marks.append(tool)
+                delta = (f"+{stp['delta']:,} tok since previous step<br>"
+                         if stp["delta"] is not None else "")
+                hovers.append(
+                    f"<b>{label} · step {stp['step']}</b><br>"
+                    f"{stp['input_tokens']:,} input tokens<br>{delta}"
+                    f"requested: <b>{tool}</b><br>"
+                    f"LLM call: {stp['llm_s']}s, {stp['output_tokens']} output tokens"
+                )
+            fig.add_trace(go.Scatter(
+                x=[stp["step"] for stp in pts],
+                y=[stp["input_tokens"] for stp in pts],
+                name=label, mode="lines+markers+text",
+                line=dict(width=2), marker=dict(size=8),
+                text=marks, textposition="top center",
+                textfont=dict(size=10, color=SUBINK),
+                hovertext=hovers, hoverinfo="text", cliponaxis=False,
+            ))
+        if fig.data:
+            fig.update_layout(
+                title="Input tokens at each agent step",
+                xaxis=dict(title="Agent step", dtick=1),
+                yaxis=dict(title="Input tokens"),
+                height=400,
+            )
+            st.plotly_chart(style_figure(fig), width="stretch")
+            st.caption(
+                "Each point is labelled with the tool that LLM call requested, "
+                "so the rise to the next point is that tool's result landing in "
+                "the prompt. Hover for the exact token delta. The y-intercept is "
+                "fixed overhead paid on every call (system prompt plus tool "
+                "schemas); the slope is context the agent accumulates as it works."
+            )
+        else:
+            st.info(
+                "Context growth needs at least two LLM calls in a turn; this "
+                "session's turns are all single-step."
+            )
+
+        section("Per-turn breakdown")
+        rows = []
+        for i, t in enumerate(per_turn):
+            rows.append({
+                "turn": t["turn"] if t["turn"] is not None else f"?{i + 1}",
+                "wall_s": round(t["wall_s"], 2) if t["wall_s"] else None,
+                "steps": t["agent_steps"],
+                "time_to_first_tool_s": t["time_to_first_tool_s"],
+                "ttft_pct_of_turn": t["time_to_first_tool_pct"],
+                "first_tool": t["first_tool_name"],
+                "ctx_first": t["context_first"],
+                "ctx_last": t["context_last"],
+                "tool_calls": t["tool_calls"],
+                "tool_failures": t["tool_failures"],
+            })
+        tdf = pd.DataFrame(rows)
+        tdf.index = range(1, len(tdf) + 1)
+        show_left_table(tdf)
+        st.caption(
+            "`first_tool` is listed next to the timing on purpose. A metadata "
+            "call like `tool_describe` counts as the first tool while taking "
+            "~10 ms, so it can hide the real wait before the tool that does the "
+            "work. If `first_tool` is an introspection call, treat the number "
+            "as a floor."
+        )
+
+        section("Tool outcomes")
+        if metrics.get("hidden_failure_turns", 0):
+            st.warning(
+                f"**The failure rate below is a lower bound.** "
+                f"{metrics['hidden_failure_turns']} of {n_turns} turn(s) report "
+                "a failed tool call in `hermes.turn.tool_outcomes` that no tool "
+                "span and no `tool_breakdown.csv` row captured. The plugin keys "
+                "both on `f\"{tool_name}:{task_id}\"`, so a failed call retried "
+                "inside the same step overwrites itself and only one attempt "
+                "survives. The retry is visible in the agent's console output as "
+                "a repeated `preparing tool_call…` line."
+            )
+        oc = metrics.get("outcome_counts", {})
+        if not oc:
+            st.info("No tool calls in this session.")
+        else:
+            odf = pd.DataFrame(
+                [{"outcome": k, "calls": v,
+                  "counts_as": ("failure" if k in FAILURE_OUTCOMES
+                                else "neutral" if k in NEUTRAL_OUTCOMES
+                                else "success")}
+                 for k, v in sorted(oc.items(), key=lambda kv: -kv[1])])
+            odf.index = range(1, len(odf) + 1)
+            c_left, c_right = st.columns([1, 1])
+            with c_left:
+                show_left_table(odf)
+            with c_right:
+                st.metric(
+                    "Wall time in failed calls",
+                    f"{metrics.get('tool_time_failed_s', 0.0):.2f}s",
+                    help="Time spent on tool calls that failed. Separates a "
+                         "reliability problem from a latency problem: many "
+                         "cheap failures cost little wall time but still burn "
+                         "agent steps, each of which costs a full LLM round trip.",
+                )
+
+        if metrics.get("failed_calls", []):
+            section("Failed calls")
+            fdf = pd.DataFrame([
+                {"turn": f["turn"], "tool": f["tool"], "at_s": f["offset_s"],
+                 "duration_s": f["duration_s"], "outcome": f["outcome"],
+                 "error": f["error"]}
+                for f in metrics["failed_calls"]])
+            fdf.index = range(1, len(fdf) + 1)
+            show_left_table(fdf)
+            st.caption(
+                "`at_s` is the offset from the start of that turn, so you can "
+                "find the call in the Overview waterfall. `error` is the last "
+                "line of the failure -- for a traceback that is the exception "
+                "itself. Repeated entries for the same tool usually mean the "
+                "agent retried without changing its approach."
+            )
+
+        with st.expander("What these four metrics mean", expanded=False):
+            st.markdown(
+                "- **Agent steps** -- LLM round trips before a terminal answer. "
+                "In a serial agent this is the dominant latency term, because "
+                "each step costs a full request plus its generated tokens.\n"
+                "- **Time to first tool** -- how long the agent thinks before "
+                "acting. High is not automatically bad; it also describes a "
+                "turn where the model produced the answer itself.\n"
+                "- **Context growth per step** -- slope of input tokens across "
+                "steps. Cheap in latency when prefix caching is working, but it "
+                "sets KV-cache pressure and token cost.\n"
+                "- **Tool failure rate** -- failed calls over total, pooled "
+                "across turns. Read alongside *wall time in failed calls*: a "
+                "20% failure rate costing 0.2s is a correctness annoyance, "
+                "while one costing 40s is a latency bug."
+            )
 
 
 with tab_traces:

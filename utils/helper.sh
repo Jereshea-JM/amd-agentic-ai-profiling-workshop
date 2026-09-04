@@ -361,7 +361,8 @@ PIP_SHADOW_DEBIAN="--ignore-installed typing_extensions"
 # empty with no error. Added in upstream tts-aug18.
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN \
   mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
-  opentelemetry-exporter-otlp-proto-http==1.42.1
+  opentelemetry-exporter-otlp-proto-http==1.42.1 \
+  "anyio<4.5.0"
 
 # Fail HERE with an accurate message rather than 200 lines later as a confusing
 # "MLflow server failed to start" whose log only says "No module named mlflow".
