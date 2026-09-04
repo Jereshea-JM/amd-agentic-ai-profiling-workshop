@@ -872,7 +872,7 @@ def _build_fileref_prompt(tool_csv_path: str, traces_path=None) -> str:
         "try to attribute the cpu/gpu numbers to a cause - report the wall-clock "
         "timing and the span details, and leave the CPU/GPU interpretation to the "
         "user.\n\n"
-        f"1. tool_breakdown.csv (one row per tool call): {tool_csv_path}\n"
+        f"1. tool_execution.csv (one row per tool call): {tool_csv_path}\n"
         "   Columns: turn, tool_name, input, output, timestamp, "
         "start_time_unix_nano, elapsed_s, duration_s, cpu_avg_pct, cpu_peak_pct, "
         "gpu_avg_pct, gpu_peak_pct. duration_s is the tool's execution time; "
@@ -884,7 +884,7 @@ def _build_fileref_prompt(tool_csv_path: str, traces_path=None) -> str:
             f"2. traces.json (JSON array of full MLflow traces, one per user "
             f"query, spans included): {traces_path}\n\n"
             "JOIN KEY: each trace has a span attribute `hermes.turn.number` whose "
-            "value equals the `turn` column in tool_breakdown.csv. The trace with "
+            "value equals the `turn` column in tool_execution.csv. The trace with "
             "hermes.turn.number = N owns every CSV row where turn = N (one query = "
             "one turn = one trace). Do NOT guess by timestamp; use the turn "
             "number. Analyze each query SEPARATELY, then compare them.\n\n"
@@ -940,14 +940,14 @@ def start_hermes_analysis(local_dir: str, session_id: str, full_traces=None):
 
     The data is always written to disk and referenced by path (never inlined), so
     the prompt stays tiny regardless of how many traces there are and can never
-    hit the OS command-line arg limit. tool_breakdown.csv already sits in
+    hit the OS command-line arg limit. tool_execution.csv already sits in
     local_dir (under PROFILING_CACHE_DIR, see download_profiling), so it is
     referenced in place; the traces are reused from the shared per-session cache
     file (traces_cache_path) that Load already wrote, so both the dashboard and
     this analysis read the same traces.json. Everything lives under
     PROFILING_CACHE_DIR so it is purged together on cleanup.
     """
-    tool_csv_path = os.path.join(local_dir, "tool_breakdown.csv")
+    tool_csv_path = os.path.join(local_dir, "tool_execution.csv")
 
     traces_path = None
     if full_traces:
@@ -1151,7 +1151,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     on one shared absolute wall-clock x-axis.
 
     Each span is placed at its ABSOLUTE position from start_time_unix_nano (epoch
-    ns), the same reference the poller writes into cpu/gpu_timeline.csv (ts_abs).
+    ns), the same reference the poller writes into cpu_hermes_trace.csv / gpu_system_wide.csv (ts_abs).
     That puts the spans and the utilization lines on one axis, so the idle wait
     between two queries shows up as the same blank gap in both. A per-trace
     waterfall would instead re-base each span to its own trace start, showing one
@@ -1229,7 +1229,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     # Shade each tool's [start, start+duration_s] window on the utilization row
     # with alternating translucent fills, marking which tool drove the CPU/GPU
     # activity. Uses tool_df["ts_abs"], which parse_timestamps derives from
-    # tool_breakdown.csv's start_time_unix_nano column - the same epoch-ns
+    # tool_execution.csv's start_time_unix_nano column - the same epoch-ns
     # reference as the CPU/GPU CSVs and the MLflow spans, so the shading lines up
     # regardless of the host's timezone. Older CSVs without that column fall back
     # to the local-time string and may be offset on a non-UTC host.
@@ -1928,9 +1928,9 @@ if load:
         "full_traces": full_traces,
         "turn_count": turn_count,
         "total_latency_ms": total_latency_ms,
-        "cpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "cpu_timeline.csv"))),
-        "gpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "gpu_timeline.csv"))),
-        "tool_df": parse_timestamps(read_csv(os.path.join(local_dir, "tool_breakdown.csv"))),
+        "cpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "cpu_hermes_trace.csv"))),
+        "gpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "gpu_system_wide.csv"))),
+        "tool_df": parse_timestamps(read_csv(os.path.join(local_dir, "tool_execution.csv"))),
         # Derived from the span trees just fetched -- no new instrumentation and
         # no re-run, so this also works on sessions recorded before these
         # metrics existed. Computed once here rather than per-rerun, because
@@ -2050,7 +2050,7 @@ with tab_overview:
 
     with st.expander("Tool breakdown table", expanded=True):
         if tool_df.empty:
-            st.write("No tool_breakdown.csv data.")
+            st.write("No tool_execution.csv data.")
         else:
             # Show the row number starting at 1 instead of the 0-based index.
             _disp = tool_df.copy()
@@ -2059,9 +2059,9 @@ with tab_overview:
 
 with tab_separate:
     sources = {
-        "CPU Usage": ("cpu_timeline.csv", cpu_df),
-        "GPU usage": ("gpu_timeline.csv", gpu_df),
-        "Tool Track": ("tool_breakdown.csv", tool_df),
+        "CPU Usage": ("cpu_hermes_trace.csv", cpu_df),
+        "GPU usage": ("gpu_system_wide.csv", gpu_df),
+        "Tool Track": ("tool_execution.csv", tool_df),
     }
 
     show_panel = st.toggle("Show CSV panel (compare live)", value=False,
@@ -2238,7 +2238,7 @@ with tab_efficiency:
                 f"**The failure rate below is a lower bound.** "
                 f"{metrics['hidden_failure_turns']} of {n_turns} turn(s) report "
                 "a failed tool call in `hermes.turn.tool_outcomes` that no tool "
-                "span and no `tool_breakdown.csv` row captured. The plugin keys "
+                "span and no `tool_execution.csv` row captured. The plugin keys "
                 "both on `f\"{tool_name}:{task_id}\"`, so a failed call retried "
                 "inside the same step overwrites itself and only one attempt "
                 "survives. The retry is visible in the agent's console output as "
@@ -2362,7 +2362,7 @@ with tab_analysis:
     st.subheader("Hermes Analysis")
     st.caption(
         "Runs the local `hermes` CLI with a prompt that analyzes this session's "
-        "tool usage (tool_breakdown.csv) and suggests improvements."
+        "tool usage (tool_execution.csv) and suggests improvements."
     )
 
     include_traces = st.toggle(
@@ -2370,7 +2370,7 @@ with tab_analysis:
         value=True,
         help="Downloads this session's complete MLflow traces (each user query "
              "with its full span tree - LLM calls and tool inputs/outputs) and "
-             "sends them alongside tool_breakdown.csv, so hermes can attribute "
+             "sends them alongside tool_execution.csv, so hermes can attribute "
              "tool calls to the query that triggered them and compare multiple "
              "queries. Same data as download_session_traces.py.",
     )
@@ -2409,7 +2409,7 @@ with tab_analysis:
             else:
                 st.caption(f"Including **{len(full_traces)}** full trace(s) in the analysis.")
 
-    with st.expander("Raw tool_breakdown.csv (sent to hermes)", expanded=False):
+    with st.expander("Raw tool_execution.csv (sent to hermes)", expanded=False):
         show_left_table(tool_df)
     if full_traces:
         with st.expander("Full traces JSON (sent to hermes)", expanded=False):

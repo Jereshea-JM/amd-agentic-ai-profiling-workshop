@@ -1,159 +1,51 @@
 diff --git a/hooks.py b/hooks.py
-index 5e8efab..e8b9be3 100644
+index 5e8efab..d17b8f9 100644
 --- a/hooks.py
 +++ b/hooks.py
-@@ -597,6 +597,21 @@ def on_session_start(session_id: str, model: str, platform: str, **kwargs):
-     """Start a top-level session span (or cron span) for the entire run."""
-     tracer = get_tracer()
-     debug_log(f"on_session_start fired: session={session_id}, platform={platform}")
+@@ -1753,3 +1753,16 @@ def on_mcp_request_headers(
+     sid = session_id or kwargs.get("session_id")
+     traceparent = get_current_traceparent(sid)
+     return {"traceparent": traceparent} if traceparent else {}
 +
-+    # Start MLflow run for hardware metrics
-+    try:
-+        from . import mlflow_hooks
-+        mlflow_hooks.start_mlflow_run(session_id, model, platform, **kwargs)
-+    except Exception as e:
-+        debug_log(f"MLflow start_run failed: {e}")
 +
-+    # Start the out-of-process CPU+GPU poller for per-tool attribution
-+    try:
-+        from . import tool_profiler
-+        tool_profiler.start_session_poller(session_id, **kwargs)
-+    except Exception as e:
-+        debug_log(f"Tool profiler start failed: {e}")
++# Advanced hardware / per-tool profiling (MLflow + CPU/GPU). The lifecycle logic
++# lives in profiling_integration.py, which wraps the hooks defined above by name.
++# Wrapped in a guard so a profiling import error can never break hook loading.
++try:
++    import sys as _sys
 +
-     if not tracer.is_enabled:
-         return
- 
-@@ -711,6 +726,25 @@ def on_session_end(
- 
-     debug_log(f"  session span ended: key={key}, status={status}")
- 
-+    # End MLflow run for hardware metrics AFTER the trace span is closed.
-+    try:
-+        from . import mlflow_hooks
-+        mlflow_hooks.end_mlflow_run(session_id, completed, interrupted, model, platform, **kwargs)
-+    except Exception as e:
-+        debug_log(f"MLflow end_run failed: {e}")
++    from . import profiling_integration as _profiling_integration
 +
-+    # Mark the user turn as ended so the next on_pre_llm_call starts a fresh turn
-+    # (counter advances once per prompt, not once per agent-loop LLM call).
-+    try:
-+        from . import tool_profiler
-+        tool_profiler.end_turn(session_id, **kwargs)
-+    except Exception as e:
-+        debug_log(f"Tool profiler end_turn failed: {e}")
-+
-+    # NOTE: the CPU+GPU poller is intentionally NOT stopped here. on_session_end
-+    # fires once per turn, but the poller must run for the whole hermes process.
-+    # It is stopped at process exit via tool_profiler's atexit handler.
-+
- 
- def _open_skill_span(tracer, session_id: str, skill: str, source: str, kwargs: dict) -> None:
-     """Open an overlapping skill execution-window span (idempotent per turn).
-@@ -758,6 +792,13 @@ def on_pre_tool_call(tool_name: str, args: dict, task_id: str, **kwargs):
-     key = f"{tool_name}:{task_id}"
-     tracer.sessions.record_tool_start(key, time.perf_counter())
- 
-+    # Per-tool CPU/GPU attribution: mark the tool's wall-clock start
-+    try:
-+        from . import tool_profiler
-+        tool_profiler.record_tool_start(key, session_id=kwargs.get("session_id"))
-+    except Exception as e:
-+        debug_log(f"Tool profiler record_tool_start failed: {e}")
-+
-     # OpenInference attributes — Phoenix Info panel
-     attributes: Dict[str, Any] = {
-         "tool.name": tool_name,
-@@ -838,6 +879,15 @@ def on_post_tool_call(tool_name: str, args: dict, result: str, task_id: str, **k
-             {"tool_name": tool_name, "gen_ai.tool.name": tool_name},
-         )
- 
-+    # Per-tool CPU/GPU attribution: slice the timelines for this tool's window
-+    try:
-+        from . import tool_profiler
-+        tool_profiler.record_tool_end(
-+            key, tool_name, session_id=kwargs.get("session_id"), args=args, result=result
-+        )
-+    except Exception as e:
-+        debug_log(f"Tool profiler record_tool_end failed: {e}")
-+
-     # Build final attributes — OpenInference conventions for Phoenix Info
-     attributes: Dict[str, Any] = {}
- 
-@@ -1027,6 +1077,30 @@ def on_pre_llm_call(
-     debug_log(f"pre_llm_call fired: model={model}, session={session_id}")
-     tracer = get_tracer()
-     debug_log(f"  tracer.is_enabled={tracer.is_enabled}")
-+
-+    # For resumed sessions, on_session_start doesn't fire again. Ensure the
-+    # MLflow run exists; if not, start one (fallback for --resume).
-+    try:
-+        from . import mlflow_hooks
-+        if session_id and not mlflow_hooks.has_active_run(session_id):
-+            debug_log(f"MLflow run missing for resumed session {session_id}, starting one")
-+            mlflow_hooks.start_mlflow_run(session_id, model, platform, **kwargs)
-+        # Capture the vLLM baseline at the START of each user turn (once per turn;
-+        # the helper ignores intra-turn LLM calls via an internal flag) so each
-+        # turn's delta is self-contained and a non-logging sub-call can't zero it.
-+        if session_id:
-+            mlflow_hooks.capture_turn_baseline(session_id)
-+    except Exception as e:
-+        debug_log(f"MLflow fallback start failed: {e}")
-+
-+    # Advance the per-tool-profiling turn counter (also lazily starts the poller
-+    # on continuation/resumed turns where on_session_start did not fire).
-+    try:
-+        from . import tool_profiler
-+        tool_profiler.note_turn(session_id, is_first_turn=is_first_turn, **kwargs)
-+    except Exception as e:
-+        debug_log(f"Tool profiler note_turn failed: {e}")
-+
-     if not tracer.is_enabled:
-         return None
- 
-@@ -1069,6 +1143,19 @@ def on_pre_llm_call(
-         "llm.provider": platform,
-         "gen_ai.request.model": truncate_string(model, 200),
-     }
-+
-+    # Stamp the turn number (same counter tool_breakdown.csv uses — note_turn ran
-+    # above) onto the span so each trace carries the turn that produced it. This
-+    # is the exact join key the profiler dashboard needs to attribute
-+    # tool_breakdown.csv rows to the user query/trace they belong to.
-+    if session_id:
-+        try:
-+            from . import tool_profiler
-+            turn_no = tool_profiler.current_turn(session_id)
-+            if turn_no:
-+                attributes["hermes.turn.number"] = turn_no
-+        except Exception as e:
-+            debug_log(f"could not stamp turn number on llm span: {e}")
-     attributes.update(_provider_attributes(platform))
-     attributes.update(_gen_ai_attributes(session_id, "chat", kwargs))
-     attributes.update(_correlation_attributes(tracer, session_id, kwargs))
++    _profiling_integration.install(_sys.modules[__name__])
++except Exception as _profiling_exc:  # pragma: no cover
++    debug_log(f"profiling install failed: {_profiling_exc}")
 diff --git a/metrics_poller.py b/metrics_poller.py
 new file mode 100644
-index 0000000..164ab96
+index 0000000..f4535e0
 --- /dev/null
 +++ b/metrics_poller.py
-@@ -0,0 +1,273 @@
-+"""Standalone CPU+GPU metrics poller (runs as a separate OS process).
+@@ -0,0 +1,337 @@
++"""Standalone CPU / GPU metrics poller (runs as a separate OS process).
 +
-+Launched by tool_profiler.start_session_poller via subprocess.Popen so that all
-+sampling happens OUTSIDE the hermes interpreter (no extra threads inside hermes).
-+It samples on a fixed interval and appends timestamped rows to two CSVs:
++Launched by tool_profiler via subprocess.Popen so that all sampling happens
++OUTSIDE the hermes interpreter (no extra threads inside hermes). It samples on a
++fixed interval and appends timestamped rows to one CSV per ENABLED signal:
 +
-+  * gpu_timeline.csv  — gfx_busy / power / vram from the AMD Device Metrics Exporter
-+  * cpu_timeline.csv  — CPU% of the hermes process + its children (psutil)
++  * cpu_hermes_trace.csv  — hermes process + children CPU%%   [HERMES_CPU_TRACE]
++  * cpu_system_wide.csv   — whole-host CPU%%                  [HERMES_CPU_SYSTEM_WIDE]
++  * gpu_system_wide.csv   — gfx_busy / power / vram (AMD)     [HERMES_GPU_SYSTEM_WIDE]
 +
-+vLLM runs in a separate container and is NOT a child of the hermes process, so it
-+is excluded from the CPU figure by construction.
++Which files are written is decided entirely by the HERMES_* env flags, which the
++subprocess inherits from the launching hermes process (see profiling_env.py for
++the authoritative list). Disabled signals are never scraped. cpu_hermes_trace is
++attributable to hermes; the system-wide CPU includes the OS, other containers and
++vLLM and is provided as context only.
 +
 +Usage:
-+    python metrics_poller.py <exporter_url> <gpu_csv> <cpu_csv> <interval> <hermes_pid>
++    python metrics_poller.py <out_dir> <exporter_url> <interval> <hermes_pid>
 +
-+Runs until SIGTERM/SIGINT (sent by stop_session_poller), flushing each row so the
-+CSVs can be read while still being written. Imports nothing from the hermes plugin.
++Runs until SIGTERM/SIGINT, flushing each row so the CSVs can be read while still
++being written. Imports nothing from the hermes plugin.
 +"""
 +
 +import os
@@ -172,6 +64,12 @@ index 0000000..164ab96
 +    import psutil
 +except ImportError:
 +    psutil = None
++
++
++def _flag(name: str) -> bool:
++    """Standalone copy of profiling_env._flag (this process can't import the
++    plugin). The variable NAMES are the contract shared with profiling_env.py."""
++    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 +
 +
 +_RUNNING = True
@@ -318,25 +216,55 @@ index 0000000..164ab96
 +    return round(total_delta / elapsed / ncpu * 100, 2)
 +
 +
++def sample_system_cpu() -> float:
++    """Return whole-host CPU%% since the previous call (0..100, already
++    normalized so 100 = every logical core fully busy). Prime once before the
++    loop so the first real reading covers a real interval rather than 0. Unlike
++    ``sample_cpu`` this counts EVERYTHING on the box — OS, other containers,
++    vLLM, and the poller itself — so it is a total-load backdrop, not per-tool
++    attributable."""
++    if psutil is None:
++        return 0.0
++    try:
++        return psutil.cpu_percent(interval=None)
++    except Exception:
++        return 0.0
++
++
++def _open_append(path: str, header):
++    """Open ``path`` in append mode (so ``hermes -r`` accumulates rather than
++    overwriting) and write ``header`` only when the file is new/empty."""
++    is_new = not os.path.exists(path) or os.path.getsize(path) == 0
++    fh = open(path, "a", newline="")
++    writer = csv.writer(fh)
++    if is_new:
++        writer.writerow(header)
++        fh.flush()
++    return fh, writer
++
++
 +def main():
-+    if len(sys.argv) < 6:
++    if len(sys.argv) < 5:
 +        sys.stderr.write(
-+            "usage: metrics_poller.py <exporter_url> <gpu_csv> <cpu_csv> <interval> "
-+            "<hermes_pid>\n"
++            "usage: metrics_poller.py <out_dir> <exporter_url> <interval> <hermes_pid>\n"
 +        )
 +        return 1
 +
-+    url = sys.argv[1]
-+    gpu_csv = sys.argv[2]
-+    cpu_csv = sys.argv[3]
++    out_dir = sys.argv[1]
++    url = sys.argv[2]
 +    try:
-+        interval = float(sys.argv[4])
++        interval = float(sys.argv[3])
 +    except ValueError:
 +        interval = 0.1
 +    try:
-+        hermes_pid = int(sys.argv[5])
++        hermes_pid = int(sys.argv[4])
 +    except ValueError:
 +        hermes_pid = None
++
++    # Each signal is sampled only when its flag is set (inherited from hermes).
++    want_cpu = _flag("HERMES_CPU_TRACE")
++    want_cpu_system = _flag("HERMES_CPU_SYSTEM_WIDE")
++    want_gpu = _flag("HERMES_GPU_SYSTEM_WIDE")
 +
 +    signal.signal(signal.SIGTERM, _stop)
 +    signal.signal(signal.SIGINT, _stop)
@@ -349,62 +277,86 @@ index 0000000..164ab96
 +            root = None
 +    cpu_state = {}
 +
-+    # Optional per-PID attribution of non-zero CPU readings. Set HERMES_CPU_DEBUG=1
-+    # to find out WHICH process/command is responsible for the idle blips.
-+    debug_cpu = os.environ.get("HERMES_CPU_DEBUG", "").lower() in ("1", "true", "yes")
++    # Open one writer per enabled signal. If nothing is enabled there is nothing
++    # to do — exit cleanly (tool_profiler shouldn't have launched us, but guard).
++    handles = []
++    cpu_writer = cpu_system_writer = gpu_writer = None
++    if want_cpu:
++        fh, cpu_writer = _open_append(
++            os.path.join(out_dir, "cpu_hermes_trace.csv"),
++            ["timestamp", "start_time_unix_nano", "cpu_pct"],
++        )
++        handles.append(fh)
++    if want_cpu_system:
++        fh, cpu_system_writer = _open_append(
++            os.path.join(out_dir, "cpu_system_wide.csv"),
++            ["timestamp", "start_time_unix_nano", "cpu_pct"],
++        )
++        handles.append(fh)
++    if want_gpu:
++        fh, gpu_writer = _open_append(
++            os.path.join(out_dir, "gpu_system_wide.csv"),
++            ["timestamp", "start_time_unix_nano", "gfx_busy_pct", "power_w", "vram_mb"],
++        )
++        handles.append(fh)
++
++    if not handles:
++        return 0
++
++    # Optional per-PID attribution of non-zero hermes-tree CPU readings. Set
++    # HERMES_CPU_DEBUG=1 to record which process/command accounts for each reading.
++    debug_cpu = want_cpu and os.environ.get("HERMES_CPU_DEBUG", "").lower() in ("1", "true", "yes")
 +    debug_file = None
 +    debug_writer = None
 +    if debug_cpu:
-+        debug_path = os.path.join(os.path.dirname(cpu_csv), "cpu_debug.csv")
-+        debug_new = not os.path.exists(debug_path) or os.path.getsize(debug_path) == 0
-+        debug_file = open(debug_path, "a", newline="")
-+        debug_writer = csv.writer(debug_file)
-+        if debug_new:
-+            debug_writer.writerow(["timestamp", "pid", "cpu_pct", "name", "cmdline"])
-+        debug_file.flush()
++        debug_path = os.path.join(out_dir, "cpu_debug.csv")
++        debug_file, debug_writer = _open_append(
++            debug_path, ["timestamp", "pid", "cpu_pct", "name", "cmdline"]
++        )
 +
-+    # Append mode so a resumed session (hermes -r) accumulates rather than
-+    # overwriting earlier samples. Header is written only when the file is new.
-+    gpu_new = not os.path.exists(gpu_csv) or os.path.getsize(gpu_csv) == 0
-+    cpu_new = not os.path.exists(cpu_csv) or os.path.getsize(cpu_csv) == 0
-+    with open(gpu_csv, "a", newline="") as fg, open(cpu_csv, "a", newline="") as fc:
-+        gw = csv.writer(fg)
-+        cw = csv.writer(fc)
-+        if gpu_new:
-+            gw.writerow(["timestamp", "start_time_unix_nano", "gfx_busy_pct", "power_w", "vram_mb"])
-+        if cpu_new:
-+            cw.writerow(["timestamp", "start_time_unix_nano", "cpu_pct"])
-+        fg.flush()
-+        fc.flush()
-+
-+        # Prime CPU delta baseline before the first real sample.
++    # Prime the CPU delta baselines before the first real sample.
++    if want_cpu:
 +        sample_cpu(cpu_state, root)
++    if want_cpu_system:
++        sample_system_cpu()
 +
++    try:
 +        while _RUNNING:
 +            wall = time.time()
 +            ts = datetime.fromtimestamp(wall).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 +            # Absolute epoch nanoseconds — same reference MLflow uses for span
-+            # start_time_unix_nano, so the timeline and the trace waterfall can be
-+            # plotted on one shared wall-clock axis (no local/UTC offset ambiguity).
++            # start_time_unix_nano, so the timelines and the trace waterfall can
++            # be plotted on one shared wall-clock axis (no UTC-offset ambiguity).
 +            ts_ns = int(wall * 1_000_000_000)
-+            gfx, power, vram = scrape_gpu(url)
-+            contributors = [] if debug_cpu else None
-+            cpu = sample_cpu(cpu_state, root, contributors)
 +
-+            gw.writerow([ts, ts_ns, gfx, power, vram])
-+            cw.writerow([ts, ts_ns, cpu])
-+            fg.flush()
-+            fc.flush()
++            if want_cpu:
++                contributors = [] if debug_cpu else None
++                cpu = sample_cpu(cpu_state, root, contributors)
++                cpu_writer.writerow([ts, ts_ns, cpu])
++                if debug_writer is not None and contributors:
++                    for pid, c, name, cmd in contributors:
++                        debug_writer.writerow([ts, pid, c, name, cmd])
++                    debug_file.flush()
 +
-+            if debug_writer is not None and contributors:
-+                for pid, c, name, cmd in contributors:
-+                    debug_writer.writerow([ts, pid, c, name, cmd])
-+                debug_file.flush()
++            if want_cpu_system:
++                cpu_system_writer.writerow([ts, ts_ns, sample_system_cpu()])
++
++            if want_gpu:
++                gfx, power, vram = scrape_gpu(url)
++                gpu_writer.writerow([ts, ts_ns, gfx, power, vram])
++
++            for fh in handles:
++                fh.flush()
 +
 +            time.sleep(interval)
-+
-+    if debug_file is not None:
-+        debug_file.close()
++    finally:
++        for fh in handles:
++            try:
++                fh.close()
++            except Exception:
++                pass
++        if debug_file is not None:
++            debug_file.close()
 +    return 0
 +
 +
@@ -412,10 +364,10 @@ index 0000000..164ab96
 +    sys.exit(main())
 diff --git a/mlflow_hooks.py b/mlflow_hooks.py
 new file mode 100644
-index 0000000..0f492b8
+index 0000000..c5ef3d4
 --- /dev/null
 +++ b/mlflow_hooks.py
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,463 @@
 +"""MLflow hardware metrics integration for Hermes.
 +
 +Extends hermes-otel hooks to start/stop MLflow runs automatically,
@@ -423,26 +375,39 @@ index 0000000..0f492b8
 +Also captures vLLM cache metrics per session.
 +"""
 +
-+import os
++import csv
 +import logging
++import os
++from datetime import datetime
 +from typing import Dict, Optional
 +
-+from .debug_utils import logger, debug_log
++from . import profiling_env as _env
++from .debug_utils import debug_log, logger
 +
-+
-+# Configure MLflow before import to ensure settings are applied
-+os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
-+os.environ["MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL"] = "1"
-+os.environ["MLFLOW_TRACKING_URI"] = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
-+# Suppress MLflow's own INFO logs (e.g. "View run"/"View experiment" URLs).
-+# MLflow reads this env var when it configures its loggers on import.
-+os.environ["MLFLOW_LOGGING_LEVEL"] = os.environ.get("MLFLOW_LOGGING_LEVEL", "ERROR")
 +
 +try:
 +    import mlflow
 +    MLFLOW_AVAILABLE = True
 +except ImportError:
 +    MLFLOW_AVAILABLE = False
++
++try:
++    import requests
++    REQUESTS_AVAILABLE = True
++except ImportError:
++    REQUESTS_AVAILABLE = False
++
++
++# MLflow applies these settings when a run starts, so defining them here — after
++# the imports — still takes effect before the first run. Disabling system-metrics
++# logging matters: it stops MLflow from launching its own background sampler
++# thread, keeping all hardware sampling in the out-of-process poller. Log-level
++# suppression is additionally enforced at call time by _mute_mlflow_logging().
++os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
++os.environ["MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL"] = "1"
++os.environ["MLFLOW_TRACKING_URI"] = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
++os.environ["MLFLOW_LOGGING_LEVEL"] = os.environ.get("MLFLOW_LOGGING_LEVEL", "ERROR")
++
 +
 +def _mute_mlflow_logging():
 +    """Silence MLflow's own INFO logs (e.g. "View run"/"View experiment" URLs).
@@ -451,12 +416,6 @@ index 0000000..0f492b8
 +    """
 +    for name in ("mlflow", "mlflow.tracking.fluent"):
 +        logging.getLogger(name).setLevel(logging.WARNING)
-+
-+try:
-+    import requests
-+    REQUESTS_AVAILABLE = True
-+except ImportError:
-+    REQUESTS_AVAILABLE = False
 +
 +# Track active MLflow run per session
 +_active_runs = {}
@@ -475,6 +434,10 @@ index 0000000..0f492b8
 +_last_logged_turn = {}
 +# Ensure the process-exit handler that closes runs is registered exactly once
 +_atexit_registered = False
++# Set once MLflow has failed to start a run (e.g. an unreachable or misconfigured
++# tracking server). Further MLflow work is then skipped for the rest of the
++# process so the failure is reported once instead of on every turn.
++_mlflow_disabled = False
 +
 +
 +def has_active_run(session_id: str) -> bool:
@@ -489,14 +452,13 @@ index 0000000..0f492b8
 +    guarded by the _awaiting_baseline flag, so intra-turn LLM calls don't re-snap
 +    it and produce a ~0 delta.
 +    """
-+    if not MLFLOW_AVAILABLE or not session_id:
++    if not MLFLOW_AVAILABLE or not session_id or not _env.vllm_cache_metrics():
 +        return
 +    if session_id not in _active_runs:
 +        return
 +    if not _awaiting_baseline.get(session_id, False):
 +        return  # already captured for this turn; ignore intra-turn LLM calls
-+    vllm_port = os.environ.get("VLLM_HERMES_PORT", "8001")
-+    _cache_baselines[session_id] = scrape_vllm_cache_metrics(vllm_port)
++    _cache_baselines[session_id] = scrape_vllm_cache_metrics(_env.vllm_port())
 +    _awaiting_baseline[session_id] = False
 +
 +
@@ -553,7 +515,17 @@ index 0000000..0f492b8
 +
 +def start_mlflow_run(session_id: str, model: str, platform: str, **kwargs):
 +    """Start MLflow run for hardware metrics collection."""
++    global _mlflow_disabled
 +    if not MLFLOW_AVAILABLE:
++        return
++    # MLflow is only used for the vLLM cache metrics. Skip it entirely for
++    # CSV-only traces (CPU/GPU/tool) so a session that is not collecting vLLM
++    # metrics never contacts a tracking server.
++    if not _env.mlflow_enabled():
++        return
++    # A prior start already failed (e.g. unreachable tracking server); stay
++    # disabled so the failure is not re-reported on every turn.
++    if _mlflow_disabled:
 +        return
 +
 +    _mute_mlflow_logging()
@@ -582,10 +554,9 @@ index 0000000..0f492b8
 +                _turn_counters[session_id] = 1
 +
 +            # Refresh baseline cache metrics for this resumed session
-+            vllm_port = os.environ.get("VLLM_HERMES_PORT", "8001")
-+            baseline = scrape_vllm_cache_metrics(vllm_port)
-+            _cache_baselines[session_id] = baseline
-+            _awaiting_baseline[session_id] = True
++            if _env.vllm_cache_metrics():
++                _cache_baselines[session_id] = scrape_vllm_cache_metrics(_env.vllm_port())
++                _awaiting_baseline[session_id] = True
 +            _register_atexit_once()
 +            return
 +
@@ -620,12 +591,11 @@ index 0000000..0f492b8
 +        mlflow.log_param("model", model)
 +        mlflow.log_param("platform", platform)
 +
-+        # Capture baseline vLLM cache metrics
-+        vllm_port = os.environ.get("VLLM_HERMES_PORT", "8001")
-+        baseline = scrape_vllm_cache_metrics(vllm_port)
-+        _cache_baselines[session_id] = baseline
-+        # First real user turn should re-snap the baseline right before it runs.
-+        _awaiting_baseline[session_id] = True
++        # Capture baseline vLLM cache metrics (only when vLLM tracing is on).
++        if _env.vllm_cache_metrics():
++            _cache_baselines[session_id] = scrape_vllm_cache_metrics(_env.vllm_port())
++            # First real user turn should re-snap the baseline right before it runs.
++            _awaiting_baseline[session_id] = True
 +
 +        # Initialize turn counter for this session
 +        _turn_counters[session_id] = 1
@@ -636,7 +606,13 @@ index 0000000..0f492b8
 +
 +    except Exception as e:
 +        import traceback
-+        logger.warning("[hermes-otel] MLflow: failed to start run: %s", e)
++
++        _mlflow_disabled = True
++        logger.warning(
++            "[hermes-otel] MLflow run could not be started (%s); disabling MLflow "
++            "metrics for the rest of this process. Check MLFLOW_TRACKING_URI.",
++            e,
++        )
 +        debug_log(f"MLflow start_run traceback:\n{traceback.format_exc()}")
 +
 +
@@ -663,7 +639,13 @@ index 0000000..0f492b8
 +        out_dir = os.path.join(
 +            os.environ.get("HERMES_PROFILING_OUTPUT_DIR", "./outputs"), session_id
 +        )
-+        for fname in ("cpu_timeline.csv", "gpu_timeline.csv", "tool_breakdown.csv"):
++        for fname in (
++            "cpu_hermes_trace.csv",
++            "cpu_system_wide.csv",
++            "gpu_system_wide.csv",
++            "tool_execution.csv",
++            "vllm_cache_metrics.csv",
++        ):
 +            fpath = os.path.join(out_dir, fname)
 +            if os.path.exists(fpath):
 +                try:
@@ -703,6 +685,43 @@ index 0000000..0f492b8
 +            _last_logged_turn.pop(session_id, None)
 +
 +
++_VLLM_CACHE_HEADER = [
++    "turn", "timestamp", "start_time_unix_nano",
++    "text_hits", "text_queries", "text_hit_rate_pct",
++    "mm_hits", "mm_queries", "mm_hit_rate_pct",
++]
++
++
++def _append_vllm_cache_csv(
++    session_id, turn, text_hits, text_queries, text_hit_rate,
++    mm_hits, mm_queries, mm_hit_rate,
++):
++    """Append one per-turn row to <out_dir>/vllm_cache_metrics.csv (created with
++    a header on first write). This is the CSV twin of the MLflow cache graphs so
++    the same numbers are available offline / uploaded as an artifact."""
++    try:
++        out_dir = os.path.join(
++            os.environ.get("HERMES_PROFILING_OUTPUT_DIR", "./outputs"), session_id
++        )
++        os.makedirs(out_dir, exist_ok=True)
++        path = os.path.join(out_dir, "vllm_cache_metrics.csv")
++        is_new = not os.path.exists(path) or os.path.getsize(path) == 0
++        wall = datetime.now()
++        ts = wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
++        ts_ns = int(wall.timestamp() * 1_000_000_000)
++        with open(path, "a", newline="") as f:
++            w = csv.writer(f)
++            if is_new:
++                w.writerow(_VLLM_CACHE_HEADER)
++            w.writerow([
++                turn, ts, ts_ns,
++                int(text_hits), int(text_queries), round(text_hit_rate, 2),
++                int(mm_hits), int(mm_queries), round(mm_hit_rate, 2),
++            ])
++    except Exception as e:
++        debug_log(f"could not append vllm_cache_metrics.csv: {e}")
++
++
 +def end_mlflow_run(
 +    session_id: str, completed: bool, interrupted: bool, model: str, platform: str, **kwargs
 +):
@@ -722,11 +741,12 @@ index 0000000..0f492b8
 +        return
 +
 +    try:
-+        # Capture final vLLM cache metrics and compute delta
++        # Capture final vLLM cache metrics and compute delta. baseline is only
++        # set when HERMES_VLLM_CACHE_METRICS is on, so this whole block is a
++        # no-op otherwise.
 +        baseline = _cache_baselines.get(session_id, None)
 +        if baseline:
-+            vllm_port = os.environ.get("VLLM_HERMES_PORT", "8001")
-+            after_metrics = scrape_vllm_cache_metrics(vllm_port)
++            after_metrics = scrape_vllm_cache_metrics(_env.vllm_port())
 +
 +            # Calculate deltas for this turn
 +            req_text_queries = after_metrics["prefix_queries"] - baseline["prefix_queries"]
@@ -776,6 +796,14 @@ index 0000000..0f492b8
 +                    client.set_tag(run_id, "cache.image_hit", "True" if req_mm_hits > 0 else "False")
 +                    client.set_tag(run_id, "latest_turn", turn_number)
 +
++                # Mirror this turn's cache metrics into vllm_cache_metrics.csv
++                # (same once-per-turn guard as the MLflow graphs, so no dupes).
++                _append_vllm_cache_csv(
++                    session_id, turn_number,
++                    req_text_hits, req_text_queries, text_hit_rate,
++                    req_mm_hits, req_mm_queries, mm_hit_rate,
++                )
++
 +            # Baseline is re-captured at the next turn's start (capture_turn_baseline),
 +            # not reset here, so each turn's delta is self-contained.
 +            _turn_counters[session_id] = turn_number
@@ -803,12 +831,669 @@ index 0000000..0f492b8
 +        import traceback
 +        logger.warning("[hermes-otel] MLflow: failed to end run: %s", e)
 +        debug_log(f"MLflow end_run traceback:\n{traceback.format_exc()}")
+diff --git a/plot_profiling.py b/plot_profiling.py
+new file mode 100644
+index 0000000..8e94631
+--- /dev/null
++++ b/plot_profiling.py
+@@ -0,0 +1,232 @@
++"""Render the profiling CSVs for a session into PNG charts (offline).
++
++This is a standalone post-processing tool: it reads whichever CSVs a session
++produced and writes one chart per signal plus a combined CPU/GPU timeline. It is
++run manually after a session and imports nothing from the hermes plugin, so it
++has no effect on a profiled run — all rendering happens out of process, once
++sampling is already finished.
++
++Usage:
++    python plot_profiling.py <session_dir> [--out <dir>]
++
++    <session_dir>  the per-session output directory, i.e.
++                   <HERMES_PROFILING_OUTPUT_DIR>/<session_id>
++    --out          where to write the PNGs (default: <session_dir>/plots)
++
++Inputs (any subset may be present):
++    cpu_hermes_trace.csv, cpu_system_wide.csv, gpu_system_wide.csv,
++    tool_execution.csv, vllm_cache_metrics.csv
++
++Outputs (only for the inputs that exist):
++    cpu_hermes_trace.png, cpu_system_wide.png, gpu_system_wide.png,
++    vllm_cache_metrics.png, combined_timeline.png
++
++tool_execution.csv has no chart of its own; it is used only to shade each tool's
++execution window on combined_timeline.png.
++"""
++
++import argparse
++import csv
++import os
++import sys
++
++try:
++    import matplotlib
++
++    matplotlib.use("Agg")  # headless: render to files, never open a window
++    import matplotlib.pyplot as plt
++except ImportError:
++    sys.stderr.write("plot_profiling.py requires matplotlib (pip install matplotlib)\n")
++    raise
++
++
++def _read_csv(path):
++    """Return the rows of a CSV as a list of dicts (empty list if missing/empty)."""
++    if not os.path.exists(path) or os.path.getsize(path) == 0:
++        return []
++    with open(path, "r", newline="") as f:
++        return list(csv.DictReader(f))
++
++
++def _f(value):
++    """Parse a CSV cell as float, treating blanks/garbage as 0.0."""
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return 0.0
++
++
++def _elapsed(rows, t0):
++    """Return per-row elapsed seconds relative to ``t0`` (epoch seconds), read
++    from the shared start_time_unix_nano column the timelines all carry."""
++    return [_f(r.get("start_time_unix_nano")) / 1e9 - t0 for r in rows]
++
++
++def _t0_of(rows):
++    """Earliest start_time_unix_nano in a timeline, as epoch seconds (0 if none)."""
++    vals = [_f(r.get("start_time_unix_nano")) for r in rows if r.get("start_time_unix_nano")]
++    return min(vals) / 1e9 if vals else 0.0
++
++
++def _save(fig, out_dir, name):
++    path = os.path.join(out_dir, name)
++    fig.savefig(path, dpi=120, bbox_inches="tight")
++    plt.close(fig)
++
++
++def _plot_cpu(rows, out_dir, name, title):
++    if not rows:
++        return
++    t0 = _t0_of(rows)
++    xs = _elapsed(rows, t0)
++    ys = [_f(r.get("cpu_pct")) for r in rows]
++    fig, ax = plt.subplots(figsize=(11, 3.5))
++    ax.plot(xs, ys, linewidth=0.9, color="#1f77b4")
++    ax.fill_between(xs, ys, alpha=0.15, color="#1f77b4")
++    ax.set_title(title)
++    ax.set_xlabel("elapsed seconds")
++    ax.set_ylabel("CPU %")
++    ax.set_ylim(bottom=0)
++    ax.grid(True, alpha=0.3)
++    _save(fig, out_dir, name)
++
++
++def _plot_gpu(rows, out_dir):
++    if not rows:
++        return
++    t0 = _t0_of(rows)
++    xs = _elapsed(rows, t0)
++    series = [
++        ("gfx_busy_pct", "GPU busy %", "#d62728"),
++        ("power_w", "Power (W)", "#2ca02c"),
++        ("vram_mb", "VRAM (MB)", "#9467bd"),
++    ]
++    fig, axes = plt.subplots(len(series), 1, figsize=(11, 7), sharex=True)
++    for ax, (col, label, color) in zip(axes, series):
++        ys = [_f(r.get(col)) for r in rows]
++        ax.plot(xs, ys, linewidth=0.9, color=color)
++        ax.fill_between(xs, ys, alpha=0.15, color=color)
++        ax.set_ylabel(label)
++        ax.set_ylim(bottom=0)
++        ax.grid(True, alpha=0.3)
++    axes[0].set_title("GPU (device-wide)")
++    axes[-1].set_xlabel("elapsed seconds")
++    _save(fig, out_dir, "gpu_system_wide.png")
++
++
++def _plot_vllm(rows, out_dir):
++    """Two stacked charts, both x = turn: text cache hit rate, then multimodal
++    cache hit rate. Each y-axis is fixed to 0-100 % so turns stay comparable."""
++    if not rows:
++        return
++    turns = [_f(r.get("turn")) for r in rows]
++    text_rate = [_f(r.get("text_hit_rate_pct")) for r in rows]
++    mm_rate = [_f(r.get("mm_hit_rate_pct")) for r in rows]
++    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
++
++    ax1.plot(turns, text_rate, marker="o", color="#1f77b4")
++    ax1.fill_between(turns, text_rate, alpha=0.15, color="#1f77b4")
++    ax1.set_title("vLLM text cache hit rate per turn")
++    ax1.set_ylabel("text hit rate %")
++    ax1.set_ylim(0, 100)
++    ax1.grid(True, alpha=0.3)
++
++    ax2.plot(turns, mm_rate, marker="s", color="#d62728")
++    ax2.fill_between(turns, mm_rate, alpha=0.15, color="#d62728")
++    ax2.set_title("vLLM multimodal cache hit rate per turn")
++    ax2.set_xlabel("turn")
++    ax2.set_ylabel("mm hit rate %")
++    ax2.set_ylim(0, 100)
++    ax2.grid(True, alpha=0.3)
++    _save(fig, out_dir, "vllm_cache_metrics.png")
++
++
++def _plot_combined(cpu_hermes, cpu_system, gpu, tools, out_dir):
++    """Overlay hermes CPU %, system CPU % and GPU busy % on one shared timeline.
++
++    Every overlaid signal is already on the same 0-100 % scale, so they share a
++    single y-axis fixed at 0-100 rather than one axis per source. That keeps the
++    curves directly comparable and stops matplotlib from autoscaling the top,
++    which would otherwise differ between runs and make an idle session look busy.
++    Power and VRAM use other units and are deliberately not overlaid here — see
++    the per-CSV GPU chart for those.
++    """
++    present = [r for r in (cpu_hermes, cpu_system, gpu) if r]
++    if not present:
++        return
++    # Shared origin across every timeline so the curves line up in real time.
++    t0 = min(_t0_of(r) for r in present)
++
++    fig, ax = plt.subplots(figsize=(12, 4.5))
++    if cpu_hermes:
++        ax.plot(_elapsed(cpu_hermes, t0), [_f(r.get("cpu_pct")) for r in cpu_hermes],
++                linewidth=0.9, label="CPU hermes %", color="#1f77b4")
++    if cpu_system:
++        ax.plot(_elapsed(cpu_system, t0), [_f(r.get("cpu_pct")) for r in cpu_system],
++                linewidth=0.9, label="CPU system %", color="#ff7f0e")
++    if gpu:
++        ax.plot(_elapsed(gpu, t0), [_f(r.get("gfx_busy_pct")) for r in gpu],
++                linewidth=0.9, label="GPU system %", color="#d62728")
++
++    # Shade each tool's execution window in a light blue that reads clearly on a
++    # white background (skip labels when there are many).
++    label_tools = len(tools) <= 20
++    for r in tools:
++        start = _f(r.get("start_time_unix_nano")) / 1e9 - t0
++        end = start + _f(r.get("duration_s"))
++        ax.axvspan(start, end, alpha=0.2, color="cornflowerblue")
++        if label_tools:
++            ax.text(start, 1, r.get("tool_name", ""), rotation=90, fontsize=6,
++                    va="bottom", ha="left", alpha=0.6)
++
++    ax.set_title("CPU / GPU utilisation vs time (tool windows shaded)")
++    ax.set_xlabel("elapsed seconds")
++    ax.set_ylabel("utilisation %")
++    # One shared y-axis, locked to 0-100 %, for every overlaid signal.
++    ax.set_ylim(0, 100)
++    ax.set_yticks(range(0, 101, 20))
++    ax.legend(loc="upper right")
++    ax.grid(True, alpha=0.3)
++    _save(fig, out_dir, "combined_timeline.png")
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Plot the profiling CSVs for a session.")
++    parser.add_argument("session_dir", help="per-session output directory containing the CSVs")
++    parser.add_argument("--out", help="output dir for the PNGs (default: <session_dir>/plots)")
++    args = parser.parse_args()
++
++    session_dir = args.session_dir
++    if not os.path.isdir(session_dir):
++        sys.stderr.write(f"not a directory: {session_dir}\n")
++        return 1
++
++    out_dir = args.out or os.path.join(session_dir, "plots")
++    os.makedirs(out_dir, exist_ok=True)
++
++    def load(name):
++        return _read_csv(os.path.join(session_dir, name))
++
++    cpu_hermes = load("cpu_hermes_trace.csv")
++    cpu_system = load("cpu_system_wide.csv")
++    gpu = load("gpu_system_wide.csv")
++    # tool_execution.csv is not charted on its own; it is read only to shade the
++    # tool windows on the combined timeline.
++    tools = load("tool_execution.csv")
++    vllm = load("vllm_cache_metrics.csv")
++
++    if not any((cpu_hermes, cpu_system, gpu, vllm)):
++        sys.stderr.write(f"no profiling CSVs found in {session_dir}\n")
++        return 1
++
++    print(f"rendering plots into {out_dir}")
++    _plot_cpu(cpu_hermes, out_dir, "cpu_hermes_trace.png", "Hermes process-tree CPU %")
++    _plot_cpu(cpu_system, out_dir, "cpu_system_wide.png", "System-wide CPU %")
++    _plot_gpu(gpu, out_dir)
++    _plot_vllm(vllm, out_dir)
++    _plot_combined(cpu_hermes, cpu_system, gpu, tools, out_dir)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/profiling_env.py b/profiling_env.py
+new file mode 100644
+index 0000000..9c33a86
+--- /dev/null
++++ b/profiling_env.py
+@@ -0,0 +1,96 @@
++"""Single source of truth for the advanced-profiling feature flags.
++
++Every toggle shares the ``HERMES_`` prefix so the whole surface is easy to grep
++and document, and every one is opt-in (off unless explicitly set to a truthy
++value). ``metrics_poller.py`` runs as a standalone subprocess and cannot import
++this module, so it reads the same variable *names* directly — the names here are
++the contract, not this parser.
++
++Feature flags (each writes one CSV under <output_dir>/<session_id>/):
++
++  HERMES_CPU_TRACE           hermes process-tree CPU%%      -> cpu_hermes_trace.csv
++  HERMES_CPU_SYSTEM_WIDE     whole-host CPU%% (context)     -> cpu_system_wide.csv
++  HERMES_GPU_SYSTEM_WIDE     device-wide GPU (AMD exporter) -> gpu_system_wide.csv
++  HERMES_TOOL_TRACE          per-tool execution breakdown   -> tool_execution.csv
++  HERMES_VLLM_CACHE_METRICS  vLLM cache hit-rate per turn   -> vllm_cache_metrics.csv (+ graphs)
++
++Supporting values (with defaults):
++
++  HERMES_VLLM_PORT             vLLM metrics port          (8001)
++  HERMES_GPU_EXPORTER_URL      AMD exporter endpoint      (http://localhost:5050/metrics)
++  HERMES_POLL_INTERVAL         sampling interval seconds  (0.1)
++  HERMES_PROFILING_OUTPUT_DIR  base output directory      (./outputs)
++
++Behaviour:
++
++  HERMES_PLOT_PROFILING        render the CSVs to PNGs at process exit (off)
++
++Attribution note: ``cpu_hermes_trace`` is the hermes process plus its children,
++so it is *attributable* to hermes/tool work and is what the per-tool breakdown
++slices. ``cpu_system_wide`` is the whole host (OS, other containers, vLLM, the
++poller itself) — useful as a total-load backdrop but NOT attributable per tool,
++which is why it lives in its own file and is never used for tool slicing.
++"""
++
++import os
++
++_TRUE = ("1", "true", "yes", "on")
++
++
++def _flag(name: str) -> bool:
++    return os.environ.get(name, "").strip().lower() in _TRUE
++
++
++def cpu_trace() -> bool:
++    return _flag("HERMES_CPU_TRACE")
++
++
++def cpu_system_wide() -> bool:
++    return _flag("HERMES_CPU_SYSTEM_WIDE")
++
++
++def gpu_system_wide() -> bool:
++    return _flag("HERMES_GPU_SYSTEM_WIDE")
++
++
++def tool_trace() -> bool:
++    return _flag("HERMES_TOOL_TRACE")
++
++
++def vllm_cache_metrics() -> bool:
++    return _flag("HERMES_VLLM_CACHE_METRICS")
++
++
++def plot_profiling() -> bool:
++    """When set, the CSVs are rendered to PNGs at process exit by a separate
++    plot_profiling subprocess. It runs only after the poller has stopped, so it
++    never adds samples and cannot affect any timing or CPU/GPU measurement.
++    Requires matplotlib in the environment that runs hermes."""
++    return _flag("HERMES_PLOT_PROFILING")
++
++
++def vllm_port() -> str:
++    """vLLM metrics port. ``HERMES_VLLM_PORT`` wins; the legacy
++    ``VLLM_HERMES_PORT`` is still honoured so existing launch scripts keep
++    working; otherwise the default 8001."""
++    return os.environ.get("HERMES_VLLM_PORT") or os.environ.get("VLLM_HERMES_PORT") or "8001"
++
++
++def hardware_trace_enabled() -> bool:
++    """True when any signal that needs the out-of-process poller is on."""
++    return cpu_trace() or cpu_system_wide() or gpu_system_wide()
++
++
++def any_enabled() -> bool:
++    """True when any profiling feature is enabled. Gates the shared per-turn
++    counter and the per-session output setup so neither is started for a session
++    that has not enabled any feature."""
++    return hardware_trace_enabled() or tool_trace() or vllm_cache_metrics()
++
++
++def mlflow_enabled() -> bool:
++    """True when a feature that requires an MLflow run is enabled. Only the vLLM
++    cache metrics use MLflow (the per-turn hit-rate graphs and the run that holds
++    them); the CPU/GPU/tool traces are written to CSV files and need no tracking
++    server, so a CSV-only session never contacts MLflow."""
++    return vllm_cache_metrics()
+diff --git a/profiling_integration.py b/profiling_integration.py
+new file mode 100644
+index 0000000..4693c23
+--- /dev/null
++++ b/profiling_integration.py
+@@ -0,0 +1,311 @@
++"""Wire the MLflow + CPU/GPU profiling into the hermes-otel hook lifecycle.
++
++The profiling features run side-effects at specific points in the plugin's hook
++lifecycle: session start/end, each tool call, and each LLM call. This module
++attaches them by wrapping the relevant hook callbacks at import time instead of
++interleaving the calls into each hook body, which keeps the profiling logic in
++its own module and decoupled from the internals of ``hooks.py``.
++
++Hooks are wrapped by name and forward ``*args``/``**kwargs`` unchanged, so the
++integration is unaffected by parameter reordering or additions as long as the
++hook names are stable. Profiling state, turn accounting and interrupt handling
++live in ``mlflow_hooks.py`` and ``tool_profiler.py``; this module only decides
++when each call fires:
++
++  * on_session_start  -> start MLflow run + CPU/GPU poller       (before, always)
++  * on_pre_llm_call   -> MLflow resume-fallback + turn baseline
++                         + advance the per-turn counter           (before, always)
++  * <llm span create> -> stamp ``hermes.turn.number`` on the span (at creation)
++  * on_pre_tool_call  -> record the tool's wall-clock start        (before, if tracing on)
++  * on_post_tool_call -> slice CPU/GPU timelines for the tool      (after, if tracing on)
++  * on_session_end    -> end MLflow turn metrics + arm next turn   (after, if tracing on)
++
++MLflow is used only for the vLLM cache metrics, so every MLflow call above is
++guarded by HERMES_VLLM_CACHE_METRICS: when it is off, ``mlflow`` is never even
++imported and a CSV-only session never contacts a tracking server.
++
++The "always" side-effects run regardless of whether tracing is enabled; the
++tool-call and session-end side-effects run only when the tracer is enabled, to
++match the ``if not tracer.is_enabled: return`` guard in each corresponding hook.
++The turn number is applied by wrapping ``start_span`` so the attribute is added
++at span creation and works for every backend (OTLP, LangSmith).
++"""
++
++import functools
++import inspect
++
++_INSTALLED = False
++
++
++def _debug(msg):
++    try:
++        from .debug_utils import debug_log
++
++        debug_log(msg)
++    except Exception:
++        pass
++
++
++def _tracing_enabled():
++    """Return whether the tracer is enabled, used to gate the tool-call and
++    session-end side-effects so they match the guard in the corresponding hook."""
++    try:
++        from .tracer import get_tracer
++
++        return get_tracer().is_enabled
++    except Exception:
++        return False
++
++
++def _vllm_cache_enabled():
++    """Return whether the vLLM cache metrics are enabled. MLflow is used only for
++    that feature, so the MLflow helpers are called — and ``mlflow`` is imported —
++    only when it is on. A CSV-only session never touches MLflow."""
++    try:
++        from . import profiling_env
++
++        return profiling_env.vllm_cache_metrics()
++    except Exception:
++        return False
++
++
++def _bind(func, args, kwargs):
++    """Map a wrapped call's ``*args`` / ``**kwargs`` onto ``func``'s parameter
++    names and return a name->value dict. The hook's ``**kwargs`` overflow appears
++    under the key of the variadic-keyword parameter (conventionally ``"kwargs"``).
++    Tolerant of positional-or-keyword dispatch and of parameters being added or
++    removed in a future Hermes release (unknown names are simply absent)."""
++    try:
++        bound = inspect.signature(func).bind_partial(*args, **kwargs)
++        bound.apply_defaults()
++        return dict(bound.arguments)
++    except Exception:
++        return dict(kwargs)
++
++
++def _extra_kwargs(params):
++    """Return the dict captured by the wrapped hook's ``**kwargs``, forwarded
++    verbatim to the profiling helpers."""
++    extra = params.get("kwargs")
++    return extra if isinstance(extra, dict) else {}
++
++
++# --------------------------------------------------------------------------- #
++# Per-hook side-effects (each receives the bound-argument dict of the hook).
++# --------------------------------------------------------------------------- #
++def _session_start_before(params):
++    session_id = params.get("session_id")
++    model = params.get("model")
++    platform = params.get("platform")
++    extra = _extra_kwargs(params)
++    if _vllm_cache_enabled():
++        try:
++            from . import mlflow_hooks
++
++            mlflow_hooks.start_mlflow_run(session_id, model, platform, **extra)
++        except Exception as e:
++            _debug(f"MLflow start_run failed: {e}")
++    try:
++        from . import tool_profiler
++
++        tool_profiler.start_session_poller(session_id, **extra)
++    except Exception as e:
++        _debug(f"Tool profiler start failed: {e}")
++
++
++def _pre_llm_before(params):
++    session_id = params.get("session_id")
++    model = params.get("model")
++    platform = params.get("platform")
++    is_first_turn = params.get("is_first_turn", False)
++    extra = _extra_kwargs(params)
++
++    # For resumed sessions on_session_start doesn't fire again; ensure the run
++    # exists, then snapshot the vLLM cache baseline at the START of the turn.
++    if _vllm_cache_enabled():
++        try:
++            from . import mlflow_hooks
++
++            if session_id and not mlflow_hooks.has_active_run(session_id):
++                _debug(f"MLflow run missing for resumed session {session_id}, starting one")
++                mlflow_hooks.start_mlflow_run(session_id, model, platform, **extra)
++            if session_id:
++                mlflow_hooks.capture_turn_baseline(session_id)
++        except Exception as e:
++            _debug(f"MLflow fallback start failed: {e}")
++
++    # Advance the per-tool-profiling turn counter (also lazily starts the poller
++    # on continuation / resumed turns where on_session_start did not fire).
++    try:
++        from . import tool_profiler
++
++        tool_profiler.note_turn(session_id, is_first_turn=is_first_turn, **extra)
++    except Exception as e:
++        _debug(f"Tool profiler note_turn failed: {e}")
++
++
++def _pre_tool_before(params):
++    if not _tracing_enabled():
++        return
++    tool_name = params.get("tool_name")
++    task_id = params.get("task_id")
++    extra = _extra_kwargs(params)
++    key = f"{tool_name}:{task_id}"
++    try:
++        from . import tool_profiler
++
++        tool_profiler.record_tool_start(key, session_id=extra.get("session_id"))
++    except Exception as e:
++        _debug(f"Tool profiler record_tool_start failed: {e}")
++
++
++def _post_tool_after(params):
++    if not _tracing_enabled():
++        return
++    tool_name = params.get("tool_name")
++    task_id = params.get("task_id")
++    args = params.get("args")
++    result = params.get("result")
++    extra = _extra_kwargs(params)
++    key = f"{tool_name}:{task_id}"
++    try:
++        from . import tool_profiler
++
++        tool_profiler.record_tool_end(
++            key, tool_name, session_id=extra.get("session_id"), args=args, result=result
++        )
++    except Exception as e:
++        _debug(f"Tool profiler record_tool_end failed: {e}")
++
++
++def _session_end_after(params):
++    if not _tracing_enabled():
++        return
++    session_id = params.get("session_id")
++    completed = params.get("completed")
++    interrupted = params.get("interrupted")
++    model = params.get("model")
++    platform = params.get("platform")
++    extra = _extra_kwargs(params)
++
++    # End the MLflow run after the wrapped hook has closed the trace span. The
++    # completed / interrupted flags are forwarded unchanged so the interrupt
++    # handling inside mlflow_hooks behaves identically.
++    if _vllm_cache_enabled():
++        try:
++            from . import mlflow_hooks
++
++            mlflow_hooks.end_mlflow_run(session_id, completed, interrupted, model, platform, **extra)
++        except Exception as e:
++            _debug(f"MLflow end_run failed: {e}")
++
++    # Arm the next turn so the counter advances once per prompt, not once per
++    # agent-loop LLM call. The CPU+GPU poller is intentionally left running; it
++    # is stopped at process exit via tool_profiler's atexit handler.
++    try:
++        from . import tool_profiler
++
++        tool_profiler.end_turn(session_id, **extra)
++    except Exception as e:
++        _debug(f"Tool profiler end_turn failed: {e}")
++
++
++# --------------------------------------------------------------------------- #
++# Wrapping machinery.
++# --------------------------------------------------------------------------- #
++def _wrap(original, before=None, after=None):
++    """Return ``original`` wrapped so ``before(params)`` runs before it and
++    ``after(params)`` after it. Both are best-effort; a failure in either never
++    breaks the underlying hook. Idempotent."""
++    if getattr(original, "_hermes_profiling_wrapped", False):
++        return original
++
++    @functools.wraps(original)
++    def wrapper(*args, **kwargs):
++        params = _bind(original, args, kwargs)
++        if before is not None:
++            try:
++                before(params)
++            except Exception as e:
++                _debug(f"profiling before-hook failed: {e}")
++        result = original(*args, **kwargs)
++        if after is not None:
++            try:
++                after(params)
++            except Exception as e:
++                _debug(f"profiling after-hook failed: {e}")
++        return result
++
++    wrapper._hermes_profiling_wrapped = True
++    return wrapper
++
++
++def _wrap_hook(module, name, before=None, after=None):
++    original = getattr(module, name, None)
++    if not callable(original):
++        _debug(f"profiling: hook {name} not found on hooks module; skipping wrap")
++        return
++    setattr(module, name, _wrap(original, before=before, after=after))
++
++
++def _install_turn_stamp():
++    """Wrap ``HermesOTelPlugin.start_span`` so the LLM span carries
++    ``hermes.turn.number`` — the join key the profiler dashboard uses to tie
++    tool_execution.csv rows to the trace they belong to. Adding it at span
++    creation keeps it backend-agnostic (OTLP and LangSmith both honour the
++    attribute dict). Idempotent."""
++    try:
++        from .tracer import HermesOTelPlugin
++    except Exception as e:
++        _debug(f"profiling: could not import tracer for turn stamp: {e}")
++        return
++
++    original = HermesOTelPlugin.start_span
++    if getattr(original, "_hermes_profiling_wrapped", False):
++        return
++    sig = inspect.signature(original)
++
++    @functools.wraps(original)
++    def start_span(*args, **kwargs):
++        try:
++            bound = sig.bind_partial(*args, **kwargs)
++            bound.apply_defaults()
++            a = bound.arguments
++            if a.get("kind") == "llm" and a.get("session_id"):
++                from . import tool_profiler
++
++                turn_no = tool_profiler.current_turn(a.get("session_id"))
++                if turn_no:
++                    attrs = dict(a.get("attributes") or {})
++                    attrs["hermes.turn.number"] = turn_no
++                    bound.arguments["attributes"] = attrs
++                    return original(*bound.args, **bound.kwargs)
++        except Exception as e:
++            _debug(f"could not stamp turn number on llm span: {e}")
++        return original(*args, **kwargs)
++
++    start_span._hermes_profiling_wrapped = True
++    HermesOTelPlugin.start_span = start_span
++
++
++def install(hooks_module):
++    """Wrap the hermes-otel hooks so the profiling side-effects fire at the
++    right lifecycle points. Safe to call more than once (no-op after the first).
++
++    Args:
++        hooks_module: the ``hooks`` module object whose top-level hook functions
++            should be wrapped in place (pass ``sys.modules[__name__]`` from
++            within hooks.py).
++    """
++    global _INSTALLED
++    if _INSTALLED:
++        return
++    _INSTALLED = True
++
++    _wrap_hook(hooks_module, "on_session_start", before=_session_start_before)
++    _wrap_hook(hooks_module, "on_pre_llm_call", before=_pre_llm_before)
++    _wrap_hook(hooks_module, "on_pre_tool_call", before=_pre_tool_before)
++    _wrap_hook(hooks_module, "on_post_tool_call", after=_post_tool_after)
++    _wrap_hook(hooks_module, "on_session_end", after=_session_end_after)
++    _install_turn_stamp()
++    _debug("advanced profiling hooks installed")
 diff --git a/tool_profiler.py b/tool_profiler.py
 new file mode 100644
-index 0000000..40f9a98
+index 0000000..bcc34ed
 --- /dev/null
 +++ b/tool_profiler.py
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,474 @@
 +"""Per-tool CPU/GPU attribution for hermes-otel.
 +
 +Answers "which tool used how much CPU and GPU" by measuring each tool call
@@ -828,11 +1513,18 @@ index 0000000..40f9a98
 +parent accounted for; hermes tools are in-process Python, so this is accurate in
 +practice.
 +
-+Everything here is opt-in via HERMES_TOOL_PROFILING=1. When unset, every public
-+function is a no-op with zero overhead.
++Everything here is opt-in via the HERMES_* feature flags (see profiling_env.py).
++When nothing is enabled every public function is a no-op with zero overhead.
 +
-+Configuration (env vars):
-+  HERMES_TOOL_PROFILING        "1"/"true" to enable (default off)
++Responsibilities split by flag:
++  * the out-of-process poller starts when any hardware trace is on
++    (HERMES_CPU_TRACE / HERMES_CPU_SYSTEM_WIDE / HERMES_GPU_SYSTEM_WIDE);
++  * the per-tool breakdown (tool_execution.csv) is written only under
++    HERMES_TOOL_TRACE;
++  * the shared per-turn counter advances whenever ANY profiling feature is on,
++    because it is the join key the tool CSV and the MLflow cache metrics share.
++
++Configuration (env vars): see profiling_env.py for the authoritative list.
 +  HERMES_GPU_EXPORTER_URL      AMD exporter endpoint (default http://localhost:5050/metrics)
 +  HERMES_PROFILING_OUTPUT_DIR  base output dir (default "./outputs")
 +  HERMES_POLL_INTERVAL         poll interval seconds (default "0.1")
@@ -847,11 +1539,8 @@ index 0000000..40f9a98
 +from datetime import datetime
 +from typing import Any, Dict, Optional
 +
++from . import profiling_env as _env
 +from .helpers import truncate_string
-+
-+
-+def _enabled() -> bool:
-+    return os.environ.get("HERMES_TOOL_PROFILING", "").lower() in ("1", "true", "yes")
 +
 +
 +def _debug(msg: str):
@@ -875,7 +1564,9 @@ index 0000000..40f9a98
 +# attributes MLflow/Phoenix already show for the same tool call.
 +_PREVIEW_MAX_CHARS = 1200
 +
-+# session_id -> {"proc": Popen, "gpu_csv": path, "cpu_csv": path, "breakdown": path, "out_dir": path}
++# session_id -> {"proc": Popen|None, "out_dir": path, "cpu_csv": path,
++#                 "gpu_csv": path, "breakdown": path, "_devnull": fh}
++# "proc" is None when only tool/vLLM tracing is on (no hardware poller needed).
 +_session_pollers: Dict[str, dict] = {}
 +# key (f"{tool_name}:{task_id}") -> {"wall_start": float, "session_id": str}
 +_tool_starts: Dict[str, dict] = {}
@@ -893,20 +1584,23 @@ index 0000000..40f9a98
 +_atexit_registered = False
 +
 +
-+def _ensure_poller(session_id: str):
-+    """Start the poller subprocess for this session if not already running.
++def _ensure_session(session_id: str):
++    """Ensure the per-session output dir, file paths and (if needed) the poller
++    exist. Returns the session state dict, or None when nothing is enabled.
 +
 +    Idempotent and safe across turns AND resume: hermes fires on_session_start
 +    only on the first turn (and a fresh process on `hermes -r`), while tools run
-+    on every turn. CSVs are opened in append mode by the poller, so a resumed
-+    session accumulates onto the same files. The breakdown CSV header is written
-+    here only when the file is new/empty.
++    on every turn. All CSVs are opened in append mode, so a resumed session
++    accumulates onto the same files. The breakdown header is written only when
++    the file is new/empty and only when tool tracing is on.
 +    """
-+    if not _enabled() or not session_id:
-+        return
++    if not _env.any_enabled() or not session_id:
++        return None
++
 +    existing = _session_pollers.get(session_id)
-+    if existing and existing.get("proc") is not None and existing["proc"].poll() is None:
-+        return  # already running in this process
++    if existing is not None:
++        _maybe_start_poller(session_id, existing)  # relaunch if it died
++        return existing
 +
 +    base = os.environ.get("HERMES_PROFILING_OUTPUT_DIR", "./outputs")
 +    out_dir = os.path.join(base, session_id)
@@ -914,38 +1608,30 @@ index 0000000..40f9a98
 +        os.makedirs(out_dir, exist_ok=True)
 +    except Exception as e:
 +        _debug(f"could not create output dir {out_dir}: {e}")
-+        return
++        return None
 +
-+    gpu_csv = os.path.join(out_dir, "gpu_timeline.csv")
-+    cpu_csv = os.path.join(out_dir, "cpu_timeline.csv")
-+    breakdown = os.path.join(out_dir, "tool_breakdown.csv")
-+    url = os.environ.get("HERMES_GPU_EXPORTER_URL", "http://localhost:5050/metrics")
-+    interval = os.environ.get("HERMES_POLL_INTERVAL", "0.1")
-+    poller_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_poller.py")
++    state = {
++        "proc": None,
++        "out_dir": out_dir,
++        # The per-tool breakdown slices the ATTRIBUTABLE hermes-tree CPU and the
++        # device-wide GPU; system-wide CPU is deliberately not used for slicing.
++        "cpu_csv": os.path.join(out_dir, "cpu_hermes_trace.csv"),
++        "gpu_csv": os.path.join(out_dir, "gpu_system_wide.csv"),
++        "breakdown": os.path.join(out_dir, "tool_execution.csv"),
++    }
 +
-+    state = {"proc": None, "gpu_csv": gpu_csv, "cpu_csv": cpu_csv,
-+             "breakdown": breakdown, "out_dir": out_dir}
-+    try:
-+        devnull = open(os.devnull, "w")
-+        state["_devnull"] = devnull
-+        state["proc"] = subprocess.Popen(
-+            [sys.executable, poller_script, url, gpu_csv, cpu_csv, interval,
-+             str(os.getpid())],
-+            stdout=devnull, stderr=devnull,
-+        )
-+        _debug(f"CPU+GPU poller started (pid={state['proc'].pid}) -> {out_dir}")
-+    except Exception as e:
-+        _debug(f"failed to start poller: {e}")
-+
-+    # Write the breakdown header only if the file is new (append-safe for resume).
-+    try:
-+        if not os.path.exists(breakdown) or os.path.getsize(breakdown) == 0:
-+            with open(breakdown, "a", newline="") as f:
-+                csv.writer(f).writerow(_BREAKDOWN_HEADER)
-+    except Exception as e:
-+        _debug(f"could not init tool_breakdown.csv: {e}")
++    # Write the breakdown header only when tool tracing is on and the file is new.
++    if _env.tool_trace():
++        try:
++            bd = state["breakdown"]
++            if not os.path.exists(bd) or os.path.getsize(bd) == 0:
++                with open(bd, "a", newline="") as f:
++                    csv.writer(f).writerow(_BREAKDOWN_HEADER)
++        except Exception as e:
++            _debug(f"could not init tool_execution.csv: {e}")
 +
 +    _session_pollers[session_id] = state
++    _maybe_start_poller(session_id, state)
 +
 +    global _atexit_registered
 +    if not _atexit_registered:
@@ -953,10 +1639,38 @@ index 0000000..40f9a98
 +        atexit.register(_stop_all_pollers)
 +        _atexit_registered = True
 +
++    return state
++
++
++def _maybe_start_poller(session_id: str, state: dict):
++    """Launch the out-of-process CPU/GPU poller if a hardware trace is enabled
++    and it isn't already running. No-op when only tool/vLLM tracing is on."""
++    if not _env.hardware_trace_enabled():
++        return
++    proc = state.get("proc")
++    if proc is not None and proc.poll() is None:
++        return  # already running in this process
++
++    url = os.environ.get("HERMES_GPU_EXPORTER_URL", "http://localhost:5050/metrics")
++    interval = os.environ.get("HERMES_POLL_INTERVAL", "0.1")
++    poller_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_poller.py")
++    try:
++        devnull = open(os.devnull, "w")
++        state["_devnull"] = devnull
++        # The poller reads the HERMES_* flags from the inherited environment to
++        # decide which per-signal CSVs to write in out_dir.
++        state["proc"] = subprocess.Popen(
++            [sys.executable, poller_script, state["out_dir"], url, interval, str(os.getpid())],
++            stdout=devnull, stderr=devnull,
++        )
++        _debug(f"metrics poller started (pid={state['proc'].pid}) -> {state['out_dir']}")
++    except Exception as e:
++        _debug(f"failed to start poller: {e}")
++
 +
 +def start_session_poller(session_id: str, **kwargs):
 +    """Hook entry: start profiling at session start (first turn)."""
-+    _ensure_poller(session_id)
++    _ensure_session(session_id)
 +
 +
 +def note_turn(session_id: str, is_first_turn: bool = False, **kwargs):
@@ -966,10 +1680,10 @@ index 0000000..40f9a98
 +    safety net for continuation turns and `hermes -r` resume, where
 +    on_session_start does not fire in this process.
 +    """
-+    if not _enabled() or not session_id:
++    if not _env.any_enabled() or not session_id:
 +        return
 +
-+    _ensure_poller(session_id)
++    _ensure_session(session_id)
 +    # On the first turn seen in THIS process, seed the counter from the persisted
 +    # turn-count file. `hermes -r` resumes the same session_id in a fresh process,
 +    # so the in-memory counter would otherwise restart at 1. We persist the count
@@ -1002,7 +1716,7 @@ index 0000000..40f9a98
 +    flag here is what makes the counter advance exactly once per prompt instead
 +    of once per agent-loop LLM call.
 +    """
-+    if not _enabled() or not session_id:
++    if not _env.any_enabled() or not session_id:
 +        return
 +    _new_turn_pending[session_id] = True
 +
@@ -1016,7 +1730,7 @@ index 0000000..40f9a98
 +    """Read the last persisted turn number for this session (0 if none).
 +
 +    Persisting the count directly means it survives `hermes -r` and counts every
-+    turn — including tool-less turns that leave no row in tool_breakdown.csv."""
++    turn — including tool-less turns that leave no row in tool_execution.csv."""
 +    try:
 +        with open(_turn_state_path(session_id), "r") as f:
 +            return int(f.read().strip() or 0)
@@ -1068,10 +1782,34 @@ index 0000000..40f9a98
 +def _stop_all_pollers():
 +    """Stop every running poller. Registered via atexit so it runs once when the
 +    hermes process exits — NOT per turn (on_session_end fires every turn)."""
++    out_dirs = []
 +    for sid, state in list(_session_pollers.items()):
 +        _stop_one(state)
++        if state.get("out_dir"):
++            out_dirs.append(state["out_dir"])
 +        _session_pollers.pop(sid, None)
 +    _debug("all pollers stopped at process exit")
++
++    # Optional plotting runs here — after every poller has stopped and the CSVs
++    # are final — rather than as its own atexit handler. This guarantees the
++    # render never overlaps sampling, so the LLM/tool timings and the per-tool
++    # CPU/GPU figures (already computed during the run) cannot be affected by it.
++    if _env.plot_profiling():
++        for out_dir in out_dirs:
++            _render_plots(out_dir)
++
++
++def _render_plots(out_dir: str):
++    """Render the session CSVs to PNGs by running the standalone plot_profiling
++    script in a separate process. Invoked only at process exit, after the poller
++    has stopped, so it adds no samples and cannot perturb any measurement. A
++    missing matplotlib (or any render error) is logged and otherwise ignored."""
++    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plot_profiling.py")
++    try:
++        subprocess.run([sys.executable, script, out_dir], timeout=120)
++        _debug(f"profiling plots rendered -> {os.path.join(out_dir, 'plots')}")
++    except Exception as e:
++        _debug(f"plot rendering failed: {e}")
 +
 +
 +def stop_session_poller(session_id: str, **kwargs):
@@ -1092,7 +1830,7 @@ index 0000000..40f9a98
 +    call` receives the same `args` and that's also where the CSV row is
 +    actually written.
 +    """
-+    if not _enabled():
++    if not _env.tool_trace():
 +        return
 +    _tool_starts[key] = {"wall_start": time.time(), "session_id": session_id}
 +
@@ -1140,7 +1878,7 @@ index 0000000..40f9a98
 +    Phoenix's "Inputs"/"Outputs" for the same tool call — regardless of which
 +    argument keys a given tool happens to use.
 +    """
-+    if not _enabled():
++    if not _env.tool_trace():
 +        return
 +    start = _tool_starts.pop(key, None)
 +    if not start:
@@ -1203,7 +1941,7 @@ index 0000000..40f9a98
 +
 +        start_ts = datetime.fromtimestamp(wall_start).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 +        # Absolute epoch nanoseconds, same convention as metrics_poller.py's
-+        # cpu/gpu_timeline.csv and MLflow's span start_time_unix_nano - lets the
++        # cpu_hermes_trace/gpu_system_wide CSVs and MLflow's span start_time_unix_nano - lets the
 +        # dashboard correlate a tool's shaded window with the utilization curve on
 +        # one shared clock instead of falling back to this local-time string.
 +        start_ns = int(wall_start * 1_000_000_000)

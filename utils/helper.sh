@@ -20,29 +20,18 @@ cd "$WORKSPACE_DIR"
 
 export PATH="$HOME/.local/bin:$PATH"
 
-# Upstream tts-aug18 added `source ~/.bashrc` and an unconditional
-# `sudo chown -R $USER:$USER $HOME/.cache/` here. Both are ported, but guarded:
-#   * ~/.bashrc short-circuits on non-interactive shells on Debian/Ubuntu, and
-#     `set -u` inside a user's rc file would kill this script, so it is sourced
-#     defensively and only when it exists.
-#   * The chown fixes a real failure: on a fresh machine an earlier root-run
-#     step can leave $HOME/.cache root-owned, after which the HF download and
-#     the Playwright install both fail with EACCES. It is skipped when the cache
-#     is already owned correctly, so the common path costs nothing and the
-#     script still works where sudo is unavailable (for example in the
-#     container, which already runs as root).
+# Source the user's ~/.bashrc when it exists, but defensively: it may
+# short-circuit on non-interactive shells, and a `set -u` inside it could
+# otherwise abort this script. The chown that follows repairs a common failure
+# mode where an earlier root-run step leaves $HOME/.cache root-owned, after which
+# Hugging Face downloads and the Playwright install fail with EACCES.
 if [ -f "$HOME/.bashrc" ]; then
     # shellcheck disable=SC1090
     source "$HOME/.bashrc" || true
 fi
 
 mkdir -p "$HOME/.cache"
-if [ ! -O "$HOME/.cache" ] && command -v sudo >/dev/null 2>&1; then
-    echo "[INFO] Repairing ownership of $HOME/.cache ..."
-    sudo chown -R "$(id -un):$(id -gn)" "$HOME/.cache" || \
-        echo "[WARN] Could not chown $HOME/.cache; continuing."
-fi
-
+sudo chown -R $USER:$USER $HOME/.cache/
 export HF_HOME="$HOME/.cache/huggingface"
 
 HERMES_GPU="0"   # Muse-Glimmer-30B runs on GPU 0
@@ -277,13 +266,11 @@ echo "[INFO] Installing MLflow and OpenTelemetry dependencies..."
 
 # Bootstrap a usable Python toolchain BEFORE anything tries to pip install.
 #
-# Several AMD Dev Cloud ROCm images (verified on rocm714-vllm-0.27.1-omni,
-# Ubuntu 24.04, Python 3.12.3) ship with NO pip and NO ensurepip for the system
-# interpreter, and they mark it PEP 668 externally-managed. Every `python3 -m
-# pip` below then dies with "No module named pip". That failure used to surface
-# far downstream as "[FATAL] MLflow server failed to start properly", whose log
-# said only "No module named mlflow", which points at the wrong problem
-# entirely.
+# Some ROCm base images ship with NO pip and NO ensurepip for the system
+# interpreter and mark it PEP 668 externally-managed, so every `python3 -m pip`
+# below dies with "No module named pip". Left unhandled that surfaces far
+# downstream as "MLflow server failed to start properly", whose log says only
+# "No module named mlflow" -- pointing at the wrong problem entirely.
 ensure_python_toolchain() {
     local need_pip=0 need_venv=0
     python3 -m pip --version  >/dev/null 2>&1 || need_pip=1
@@ -330,9 +317,8 @@ ensure_python_toolchain() {
 ensure_python_toolchain
 
 # PEP 668 marks the system interpreter externally-managed on Ubuntu 24.04, so a
-# plain `pip install` is refused. These are throwaway workshop boxes and the
-# script already owns the system Python, so opt out explicitly rather than
-# letting the install fail.
+# plain `pip install` is refused. This script manages the system Python itself,
+# so opt out explicitly rather than letting the install fail.
 PIP_SYS_FLAGS=""
 if python3 -c "import sys,sysconfig,os; \
 sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('stdlib'), \
@@ -348,21 +334,20 @@ fi
 #   ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
 #          Hint: The package was installed by debian.
 #
-# Verified on rocm714-vllm-0.27.1-omni: mlflow 3.13.0 pulls a newer
-# typing_extensions than the apt-shipped 4.10.0. --ignore-installed on just the
-# offending names lets pip shadow them in site-packages without trying to
-# remove the apt copy. Scoped deliberately: a blanket --ignore-installed would
-# redownload the entire dependency tree.
+# mlflow pulls a newer typing_extensions than the apt-shipped 4.10.0.
+# --ignore-installed on just the offending name lets pip shadow it in
+# site-packages without trying to remove the apt copy. Scoped deliberately: a
+# blanket --ignore-installed would redownload the entire dependency tree.
 PIP_SHADOW_DEBIAN="--ignore-installed typing_extensions"
 
 # opentelemetry-exporter-otlp-proto-http is required: the hermes-otel plugin
 # ships traces to MLflow over the OTLP/HTTP protobuf endpoint. Without it the
 # plugin loads and prints its banner but exports nothing, so the dashboard sits
-# empty with no error. Added in upstream tts-aug18.
+# empty with no error.
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN \
   mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
   opentelemetry-exporter-otlp-proto-http==1.42.1 \
-  "anyio<4.5.0"
+  "anyio<4.5.0" 
 
 # Fail HERE with an accurate message rather than 200 lines later as a confusing
 # "MLflow server failed to start" whose log only says "No module named mlflow".
@@ -425,9 +410,8 @@ if ! command -v hermes &> /dev/null && [ ! -f "$HOME/.local/bin/hermes" ]; then
     echo "[INFO] Installing Hermes agent..."
     # The Hermes installer needs npm for its Node-based TUI. On a bare image
     # npm is absent and the install completes with a broken front end, so it is
-    # provisioned first. Ported from upstream tts-aug18, made conditional so a
-    # machine that already has npm (and the container image) does not pay for an
-    # apt round-trip, and a failure here does not abort the whole setup.
+    # provisioned first. Made conditional so a machine that already has npm does
+    # not pay for an apt round-trip, and a failure here does not abort setup.
     if ! command -v npm >/dev/null 2>&1; then
         echo "[INFO] npm not found; installing it for the Hermes front end..."
         sudo apt-get update -qq && sudo apt-get install -y -qq npm \
@@ -441,7 +425,7 @@ fi
 
 # Second chown, after the installer has run: the install script can create
 # files under $HOME/.hermes as root when invoked through sudo, which then makes
-# every later `hermes config set` fail on permissions. Ported from tts-aug18.
+# every later `hermes config set` fail on permissions.
 sudo chown -R $(whoami):$(whoami) "$HOME/.hermes"
 
 echo "[INFO] Applying local backend configuration..."
@@ -460,34 +444,21 @@ hermes config set tool_output.max_line_length 5000
 # ===========================================================================
 # Playwright and browser dependencies (browser-driving Hermes tools)
 # ===========================================================================
-# Ported from upstream tts-aug18. Two corrections were needed:
-#   * Upstream installs only the pip package and never runs `playwright
-#     install`, so the browser binary is missing and any browser tool fails at
-#     first use, after the script has already printed "installed successfully".
-#     The Chromium download is done here so the success message is earned.
-#   * Upstream reports [OK] unconditionally. Here the message is emitted only
-#     after a real post-install import check.
-# Locate the Hermes venv rather than assuming a path.
+# Two corrections over a plain pip install of playwright:
+#   * `playwright install` must also run, or the browser binary is missing and
+#     any browser tool fails at first use despite an "installed" message. The
+#     Chromium download is done here so the success message is earned.
+#   * The [OK] message is emitted only after a real post-install import check,
+#     not unconditionally.
 #
-# The Hermes installer links the binary into /usr/local/bin and installs the
-# code to /usr/local/lib/hermes-agent, NOT $HOME/.hermes/hermes-agent. On a
-# root install (the workshop path) $HOME/.hermes/hermes-agent/venv does not
-# exist at all.
-#
-# Verified on a clean MI300X run of merged main on 2026-08-20: the hardcoded
-# path caused FIVE consecutive silent failures, all buried at log line ~2472
-# while setup still printed "[OK] Setup complete":
-#
-#   utils/helper.sh: line 538: /root/.hermes/hermes-agent/venv/bin/python: No such file or directory
-#   ... lines 549, 552, 553, 558 identical
-#
-# The consequence was invisible: mlflow, opentelemetry-sdk and the hermes_otel
-# plugin were never installed into the venv Hermes actually runs, so the agent
-# emitted no traces, MLflow held 0 runs and 0 traces, no profiling CSVs were
-# written, and the telemetry dashboard rendered empty with no error anywhere.
-#
-# Resolve the venv from the `hermes` launcher itself, which is authoritative,
-# and fall back to the known install locations.
+# Locate the Hermes venv rather than assuming a path. The installer links the
+# binary into /usr/local/bin and installs the code under
+# /usr/local/lib/hermes-agent, NOT $HOME/.hermes/hermes-agent -- and on a root
+# install $HOME/.hermes/hermes-agent/venv does not exist at all. A hardcoded
+# path then installs telemetry into the wrong interpreter: the agent emits no
+# traces, MLflow holds no runs, no profiling CSVs are written, and the dashboard
+# renders empty with no error anywhere. Resolve the venv from the `hermes`
+# launcher itself, which is authoritative, and fall back to known locations.
 find_hermes_venv_py() {
     local launcher py
     launcher="$(command -v hermes 2>/dev/null || true)"
@@ -600,9 +571,9 @@ EOF
 
 hermes plugins enable hermes_otel --allow-tool-override
 
-# Everything below MUST go into the venv Hermes actually runs. Using a
-# hardcoded $HOME path here silently installed nothing on a root install and
-# left the dashboard empty. See find_hermes_venv_py above.
+# Everything below MUST go into the venv Hermes actually runs, resolved above as
+# HERMES_VENV_PY. A hardcoded $HOME path installs nothing on a root install and
+# leaves the dashboard empty.
 if [ -z "$HERMES_VENV_PY" ] || [ ! -x "$HERMES_VENV_PY" ]; then
     echo "[FATAL] Hermes venv not found, so telemetry cannot be installed."
     echo "        The profiling dashboard would render empty with no error."
@@ -610,11 +581,10 @@ if [ -z "$HERMES_VENV_PY" ] || [ ! -x "$HERMES_VENV_PY" ]; then
     exit 1
 fi
 
-# The Hermes venv is created by `uv` and ships WITHOUT pip (verified on a clean
-# MI300X run 2026-08-20: pyvenv.cfg shows `uv = 0.12.5`, and every
-# `-m pip install` failed with "No module named pip"). Bootstrap it, and do NOT
-# swallow the result: if pip cannot be installed here, none of the telemetry
-# packages below land and the dashboard ends up empty with no visible error.
+# The Hermes venv is created by `uv` and ships WITHOUT pip, so `-m pip install`
+# fails with "No module named pip". Bootstrap it, and do NOT swallow the result:
+# if pip cannot be installed here, none of the telemetry packages below land and
+# the dashboard ends up empty with no visible error.
 if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
     echo "[INFO] Hermes venv has no pip (uv-created); bootstrapping..."
     "$HERMES_VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
@@ -628,18 +598,19 @@ if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
 fi
 echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)"
 # Dependencies for the patched hermes-otel plugin, inside the Hermes venv.
-# Upstream tts-aug18 trimmed pyrsmi, amdsmi and cryptography from this line and
-# the trim is correct: nothing in this repo imports them. The patched plugin
-# gets GPU numbers by scraping the AMD Device Metrics Exporter over HTTP
-# (`requests`), not through amdsmi/pyrsmi bindings, and its CPU numbers come
-# from `psutil`. Carrying the extra wheels only risked pip resolving a
-# conflicting transitive dependency into the Hermes venv.
+# pyrsmi, amdsmi and cryptography are intentionally omitted: nothing here imports
+# them. The patched plugin gets GPU numbers by scraping the AMD Device Metrics
+# Exporter over HTTP (`requests`), not through amdsmi/pyrsmi bindings, and its
+# CPU numbers come from `psutil`. Carrying the extra wheels only risked pip
+# resolving a conflicting transitive dependency into the Hermes venv.
 #
 # psutil is installed with --no-deps deliberately: it is a leaf dependency and
 # this keeps pip from touching anything else already resolved in the venv.
 "$HERMES_VENV_PY" -m pip install -q \
   opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
-  opentelemetry-exporter-otlp-proto-http==1.42.1
+  opentelemetry-exporter-otlp-proto-http==1.42.1 \
+  "anyio<4.5.0" \
+  matplotlib
 "$HERMES_VENV_PY" -m pip install -q --no-deps psutil
 "$HERMES_VENV_PY" -m pip install -q mlflow==3.13.0 requests
 
@@ -663,9 +634,9 @@ for mod in ("opentelemetry.sdk",
     except Exception as exc:            # noqa: BLE001
         missing.append(f"{mod} ({exc.__class__.__name__})")
 if missing:
-    # Deliberately FATAL, not a warning. This used to sys.exit(0), so the run
-    # continued to "[OK] Setup complete" while the agent emitted no traces at
-    # all and the dashboard sat empty with nothing in any log to explain it.
+    # Deliberately FATAL, not a warning: a missing dependency here means the
+    # agent emits no telemetry and the dashboard renders empty, with nothing in
+    # any log to explain it.
     print("[FATAL] Hermes venv is missing: " + ", ".join(missing))
     print("[FATAL] The agent would emit no telemetry and the profiling")
     print("        dashboard would render empty. Refusing to continue.")
@@ -674,8 +645,7 @@ print("[OK] Hermes venv telemetry dependencies import cleanly.")
 PYCHECK
 # This script does NOT use `set -e`, so the heredoc's exit status must be
 # checked explicitly. Without this the exit 1 above is discarded and the run
-# continues to "[OK] Setup complete" with no telemetry, which is the exact
-# failure being fixed.
+# continues to "[OK] Setup complete" with no telemetry installed.
 if [ $? -ne 0 ]; then
     echo "[FATAL] Aborting: Hermes telemetry dependencies are not installed."
     exit 1
@@ -683,21 +653,20 @@ fi
 echo "[INFO] MLflow tracking available at http://${SYSTEM_IP}:5004/"
 
 cat << 'EOF' >> "$HOME/.hermes/.env"
-# MLflow and vLLM observability configuration
-MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false
-MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL=1
+# MLflow and vLLM observability configuration in Hermes-otel
+# HERMES_PROFILING_OUTPUT_DIR is appended separately below so it can expand
+# $WORKSPACE_DIR (this quoted heredoc does not perform variable expansion).
+HERMES_CPU_TRACE=1
+HERMES_CPU_SYSTEM_WIDE=1
+HERMES_PLOT_PROFILING=1
+HERMES_VLLM_CACHE_METRICS=1
+HERMES_TOOL_TRACE=1
+HERMES_GPU_SYSTEM_WIDE=1
 MLFLOW_TRACKING_URI=http://127.0.0.1:5004
-MLFLOW_EXPERIMENT_NAME=Default
-VLLM_HERMES_PORT=8001
+HERMES_VLLM_PORT=8001
 MLFLOW_RUN_NAME=Hermes_Profiling
-MLFLOW_KEEP_RUN_ACTIVE=false
-MLFLOW_LOGGING_LEVEL=ERROR
-MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT=1
-HERMES_TOOL_PROFILING=1
 HERMES_GPU_EXPORTER_URL=http://localhost:5050/metrics
-HERMES_PROFILING_DEBUG=0
-MLFLOW_DISABLE_TELEMETRY=true
-HERMES_CPU_DEBUG=0
+HERMES_POLL_INTERVAL=0.1
 EOF
 
 echo "HERMES_PROFILING_OUTPUT_DIR=${WORKSPACE_DIR}/outputs" >> "$HOME/.hermes/.env"
@@ -717,14 +686,11 @@ echo "[INFO] Installing kokoro, soundfile, fastapi, uvicorn, streamlit..."
 "$KOKORO_ENV/bin/pip" install kokoro soundfile fastapi uvicorn
 
 # Install the dashboard's dependencies from utils/requirements.txt rather than
-# naming streamlit alone.
-#
-# Verified on a clean MI300X run 2026-08-20: installing only streamlit meant
-# plotly was never present, so utils/hermes_profiler.py died on
-# `import plotly.graph_objects` and the dashboard rendered a bare
-# ModuleNotFoundError traceback. Setup still printed "[OK] Streamlit dashboard
-# is up." because /_stcore/health returns 200 for a crashed app: the Streamlit
-# server is alive, the script inside it is not.
+# naming streamlit alone. Installing only streamlit leaves plotly absent, so the
+# dashboard dies on `import plotly.graph_objects` and renders a bare
+# ModuleNotFoundError. Setup can still print "[OK] Streamlit dashboard is up."
+# because /_stcore/health returns 200 for a crashed app: the Streamlit server is
+# alive, the script inside it is not.
 if [ -f "$UTILS_DIR/requirements.txt" ]; then
     "$KOKORO_ENV/bin/pip" install -q -r "$UTILS_DIR/requirements.txt"
 else
@@ -903,12 +869,9 @@ if [ -f "$DASHBOARD_APP" ]; then
 
     # /_stcore/health returning 200 only proves the Streamlit SERVER is alive.
     # It returns 200 even when the app script raised on import and every visitor
-    # sees a traceback. Verified 2026-08-20: a missing plotly produced a
-    # ModuleNotFoundError page while this loop still printed [OK].
-    #
-    # Parse the app's own top-level imports and confirm each one resolves in the
-    # interpreter Streamlit runs under. That is what the health endpoint cannot
-    # tell us.
+    # sees a traceback (e.g. a missing plotly). So parse the app's own top-level
+    # imports and confirm each one resolves in the interpreter Streamlit runs
+    # under -- that is what the health endpoint cannot tell us.
     dash_bad="$("$KOKORO_ENV/bin/python" - "$DASHBOARD_APP" <<'PYPROBE'
 import ast
 import importlib.util
