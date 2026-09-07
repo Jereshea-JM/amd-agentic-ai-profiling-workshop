@@ -33,7 +33,6 @@ import json
 import socket
 import subprocess
 import tempfile
-import time
 from datetime import timedelta
 
 import pandas as pd
@@ -1151,7 +1150,8 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     on one shared absolute wall-clock x-axis.
 
     Each span is placed at its ABSOLUTE position from start_time_unix_nano (epoch
-    ns), the same reference the poller writes into cpu_hermes_trace.csv / gpu_system_wide.csv (ts_abs).
+    ns), the same reference the poller writes into cpu_hermes_trace.csv /
+    gpu_system_wide.csv (ts_abs).
     That puts the spans and the utilization lines on one axis, so the idle wait
     between two queries shows up as the same blank gap in both. A per-trace
     waterfall would instead re-base each span to its own trace start, showing one
@@ -1290,7 +1290,6 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     fig.update_xaxes(type="date", row=1, col=1)
     fig.update_xaxes(title_text="Wall-clock time", type="date", row=2, col=1)
     return style_figure(fig, axes=False)
-
 
 # ---------------------------------------------------------------------------
 # Agent efficiency metrics
@@ -1706,6 +1705,8 @@ def _mean(values):
     return (sum(vals) / len(vals)) if vals else None
 
 
+
+
 def compute_session_metrics(traces):
     """Aggregate the four metrics across every turn in a session.
 
@@ -1766,6 +1767,168 @@ def compute_session_metrics(traces):
         sorted(failed_counts.items(), key=lambda kv: (-kv[1], kv[0])))
     summary["failed_calls"] = all_failed_calls
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Session flow diagram (Graphviz)
+# ---------------------------------------------------------------------------
+# Ported from aug_25/hermes_profiler.py. Renders the session's control flow as
+# a DOT graph via st.graphviz_chart: one cluster per turn (hermes.turn.number),
+# each turn's spans drawn as the agent->LLM->tool call tree, colored by span
+# type. Reuses this file's own _turn_of_trace / _norm_spans / _order_spans /
+# _fmt_dur rather than redefining them.
+
+def _safe_id(v) -> str:
+    """Alphanumeric-only token safe as a Graphviz node/cluster id."""
+    return "".join(ch if ch.isalnum() else "_" for ch in str(v)) or "x"
+
+
+def _dot_escape(v, limit=40) -> str:
+    """Sanitize a string for a quoted DOT label (drop quotes/backslashes, cap)."""
+    s = str(v).replace("\\", " ").replace('"', "'").replace("\n", " ").strip()
+    s = " ".join(s.split())
+    return (s[:limit] + "…") if len(s) > limit else s
+
+
+# Node fill/border per span type, keyed to the AMD palette (matches the waterfall
+# bar colors): model work blue, tool work orange, retrieval/chain teal, parsing
+# red, everything else grey.
+_DOT_TYPE_STYLE = {
+    "LLM": (BLUE, "#EFF4FB"), "CHAT_MODEL": (BLUE, "#EFF4FB"),
+    "AGENT": (BLUE, "#EFF4FB"),
+    "TOOL": (ORANGE, "#FFF2E6"),
+    "CHAIN": (TEAL, "#E9F7F8"), "RETRIEVER": (TEAL, "#E9F7F8"),
+    "PARSER": (AMD_RED, "#FDE7E8"), "RERANKER": (AMD_RED, "#FDE7E8"),
+}
+_DOT_DEFAULT_STYLE = (SUBINK, "#F4F5F7")
+
+
+# Shared DOT preamble (everything after the `digraph {` opener). Kept in one place
+# so the whole-session graph and the per-turn graph render identically.
+#
+# `size` caps the rendered drawing at fit_h INCHES tall (width left effectively
+# unbounded), and Graphviz only ever scales DOWN to honor it - so a graph taller
+# than the box is zoomed out to fit its height instead of overflowing/scrolling.
+# The chart is drawn with use_container_width=False so this absolute size is
+# respected (use_container_width would restretch to the container width and
+# reintroduce the vertical overflow). ~1.55in ~= 150px keeps a turn inside the
+# 180px box with a little padding.
+def _dot_header(fit_h=1.55):
+    return [
+        "  rankdir=TB;",
+        "  compound=true;",
+        f'  size="1000,{fit_h}";',
+        f'  graph [fontname="Segoe UI", fontsize=12, labeljust=l, '
+        f'style="rounded", color="{LINE}", fontcolor="{SUBINK}"];',
+        f'  node [shape=box, style="rounded,filled", fontname="Segoe UI", '
+        f'fontsize=11, penwidth=1.4];',
+        f'  edge [color="{SUBINK}", arrowsize=0.7];',
+    ]
+
+
+def ordered_turns(traces):
+    """Return [(turn_label, trace), ...] ordered by hermes.turn.number then start.
+
+    turn_label is the printable turn number (a plain string); traces with no turn
+    attribute fall back to their 1-based position. Shared by the whole-session
+    builder and the per-turn dropdown so both agree on turn identity and order.
+    """
+    def _key(tr):
+        t = _turn_of_trace(tr)
+        if isinstance(t, int):
+            return (0, t)
+        ns = [s["start"] for s in _norm_spans(tr) if s["start"] is not None]
+        return (1, min(ns) if ns else 0)
+
+    out = []
+    for ti, tr in enumerate(sorted(traces or [], key=_key)):
+        t = _turn_of_trace(tr)
+        try:
+            lbl = str(int(float(t)))
+        except (TypeError, ValueError):
+            lbl = str(t) if t is not None else str(ti + 1)
+        out.append((lbl, tr))
+    return out
+
+
+def _turn_dot_lines(trace, turn_lbl):
+    """DOT lines for ONE turn's span tree, wrapped in its `cluster_<turn>` box.
+
+    Returns (lines, root_node_id); lines is empty when the trace has no spans.
+    root_node_id is the turn's first root span, used to chain turns in the
+    whole-session view.
+    """
+    spans = [s for s in _order_spans(_norm_spans(trace)) if s["span_id"]]
+    if not spans:
+        return [], None
+    ids = {s["span_id"] for s in spans}
+    pref = f"t{_safe_id(turn_lbl)}_"
+
+    lines = [
+        f"  subgraph cluster_{_safe_id(turn_lbl)} {{",
+        f'    label="Turn {turn_lbl}"; labelloc=t; bgcolor="{WHITE}";',
+    ]
+    root_id = None
+    for s in spans:
+        nid = pref + _safe_id(s["span_id"])
+        name = _dot_escape(s["name"])
+        if s["start"] is not None and s["end"] is not None:
+            dtxt = _fmt_dur(max((s["end"] - s["start"]) / 1e9, 0))
+            label = f"{name}\\n{dtxt}"
+        else:
+            label = name
+        border, fill = _DOT_TYPE_STYLE.get((s["type"] or "").upper(), _DOT_DEFAULT_STYLE)
+        lines.append(f'    "{nid}" [label="{label}", color="{border}", '
+                     f'fillcolor="{fill}"];')
+        pid = s["parent_id"]
+        if pid and pid in ids:
+            lines.append(f'    "{pref + _safe_id(pid)}" -> "{nid}";')
+        elif root_id is None:
+            root_id = nid
+    lines.append("  }")
+    return lines, root_id
+
+
+def build_turn_flowchart(trace, turn_lbl) -> str:
+    """Graphviz DOT for a single turn's span tree (one readable diagram)."""
+    body, _ = _turn_dot_lines(trace, turn_lbl)
+    if not body:
+        return ""
+    return "\n".join(["digraph turn {"] + _dot_header() + body + ["}"])
+
+
+def build_session_flowchart(traces) -> str:
+    """Build a Graphviz DOT flow of the WHOLE session from its MLflow traces.
+
+    One cluster per turn (ordered by hermes.turn.number, else by first span
+    start), each turn's spans drawn as a parent->child call tree in execution
+    order, colored by span type and labelled with duration. Consecutive turns are
+    linked by a dashed edge so the whole session reads top-to-bottom. Returns ""
+    when the traces carry no spans to draw.
+    """
+    turns = ordered_turns(traces)
+    if not turns:
+        return ""
+
+    lines = ["digraph session {"] + _dot_header()
+    prev_root = None
+    any_span = False
+    for turn_lbl, tr in turns:
+        body, root_id = _turn_dot_lines(tr, turn_lbl)
+        if not body:
+            continue
+        any_span = True
+        lines += body
+        # Dashed link from the previous turn's root into this one's, so turns read
+        # in order without forcing them into one rigid column (constraint=false).
+        if prev_root and root_id:
+            lines.append(f'  "{prev_root}" -> "{root_id}" '
+                         f'[style=dashed, color="{LINE}", constraint=false];')
+        if root_id:
+            prev_root = root_id
+
+    lines.append("}")
+    return "\n".join(lines) if any_span else ""
 
 
 # ---------------------------------------------------------------------------
@@ -1931,10 +2094,6 @@ if load:
         "cpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "cpu_hermes_trace.csv"))),
         "gpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "gpu_system_wide.csv"))),
         "tool_df": parse_timestamps(read_csv(os.path.join(local_dir, "tool_execution.csv"))),
-        # Derived from the span trees just fetched -- no new instrumentation and
-        # no re-run, so this also works on sessions recorded before these
-        # metrics existed. Computed once here rather than per-rerun, because
-        # every widget interaction re-executes the script body.
         "metrics": compute_session_metrics(full_traces) if full_traces else None,
     }
     # Loading a session invalidates per-session tab state from any previous one -
@@ -2112,7 +2271,6 @@ with tab_separate:
                 _render_csv_panel()
     else:
         _render_graphs()
-
 
 with tab_efficiency:
     st.subheader("Agent efficiency")
@@ -2450,28 +2608,71 @@ with tab_analysis:
             st.session_state.pop("analysis_run", None)
             st.rerun()
 
-    # While running: poll the process; refresh ~every 2s so the Stop button stays
-    # responsive (subprocess.Popen is non-blocking, unlike subprocess.run).
-    if running:
-        rs = st.session_state["analysis_run"]
+    @st.fragment(run_every=2)
+    def _poll_analysis():
+        """Poll the running hermes subprocess on its own timer, isolated from
+        the rest of the page.
+
+        A plain time.sleep()+st.rerun() loop here reruns the WHOLE script
+        every 2s while hermes works - and st.tabs() does not persist the
+        selected tab across a full-page rerun, so that bounced this page back
+        to the first tab (Overview, with its CPU/GPU graph) every 2 seconds
+        instead of staying on the Analysis tab until the result was ready.
+        st.fragment reruns only this function's body on its own schedule,
+        leaving tab selection (and the rest of the page) untouched.
+        """
+        rs = st.session_state.get("analysis_run")
+        if rs is None:
+            return  # nothing running; cheap no-op until Analyze is clicked
         proc = rs["proc"]
         if proc.poll() is None:
             st.info("Running hermes analysis … click **⏹ Stop** to cancel.")
-            time.sleep(2)
-            st.rerun()
-        else:
-            # Finished - capture output and clear running state.
-            text = read_analysis_output(rs.get("out_path", ""))
-            ok = proc.returncode == 0 or bool(text)
-            st.session_state["analysis_result"] = {
-                "ok": ok,
-                "text": text or f"hermes exited with code {proc.returncode} and no output.",
-            }
-            st.session_state.pop("analysis_run", None)
-            st.rerun()
+            return
+        # Finished - capture output, clear running state, and do ONE
+        # page-level rerun so the result renders below, outside this fragment.
+        text = read_analysis_output(rs.get("out_path", ""))
+        ok = proc.returncode == 0 or bool(text)
+        st.session_state["analysis_result"] = {
+            "ok": ok,
+            "text": text or f"hermes exited with code {proc.returncode} and no output.",
+        }
+        st.session_state.pop("analysis_run", None)
+        st.rerun()
+
+    _poll_analysis()
 
     result = st.session_state.get("analysis_result")
     if result:
+        # Session flow diagram, shown together with the report - only once hermes
+        # has actually finished, not immediately when the tab opens. Built from
+        # the loaded MLflow traces, so it needs no data from the hermes run itself.
+        if loaded_full_traces:
+            section("Session flow")
+            _turns = ordered_turns(loaded_full_traces)
+            if not _turns:
+                st.info("No spans found in this session's traces to diagram.")
+            else:
+                _opts = ["All turns"] + [f"Turn {lbl}" for lbl, _ in _turns]
+                _scope = st.selectbox(
+                    "Diagram scope", _opts, index=0,
+                    help="Draw the whole session in one graph, or pick a single "
+                         "turn to focus on it.",
+                    key="flow_diagram_scope",
+                )
+                if _scope == "All turns":
+                    flow_dot = build_session_flowchart(loaded_full_traces)
+                else:
+                    _sel = _scope[len("Turn "):]
+                    _tr = next((tr for lbl, tr in _turns if lbl == _sel), None)
+                    flow_dot = build_turn_flowchart(_tr, _sel) if _tr is not None else ""
+                if flow_dot:
+                    # The DOT `size` cap (see _dot_header) already zooms the graph
+                    # down to fit, so use_container_width=False keeps that
+                    # absolute size instead of restretching it.
+                    st.graphviz_chart(flow_dot, use_container_width=False)
+                else:
+                    st.info("No spans found for this selection to diagram.")
+
         if result["ok"]:
             st.markdown(result["text"])
         else:
