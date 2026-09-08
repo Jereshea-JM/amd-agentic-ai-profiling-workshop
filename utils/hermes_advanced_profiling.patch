@@ -18,10 +18,10 @@ index e6bd3e5..328aa23 100644
  
 diff --git a/hermes_otel/csv_dump.py b/hermes_otel/csv_dump.py
 new file mode 100644
-index 0000000..c2edcfa
+index 0000000..753072f
 --- /dev/null
 +++ b/hermes_otel/csv_dump.py
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,517 @@
 +"""Internal-only: mirror the host-metrics sampler's readings to CSV + PNGs.
 +
 +Not part of upstream hermes-otel. The mainline ``host_metrics`` sampler
@@ -44,8 +44,21 @@ index 0000000..c2edcfa
 +Opt-in via HERMES_CSV_DUMP=true (writes CSVs); HERMES_PLOT_PROFILING=true
 +additionally renders the 4 PNGs at process exit. Off has zero overhead beyond
 +one wrapped method call. Output: <HERMES_PROFILING_OUTPUT_DIR or ./outputs>/
-+<run-timestamp>/{cpu_hermes_trace,cpu_system_wide,gpu_system_wide}.csv, then
++<session_id>/{cpu_hermes_trace,cpu_system_wide,gpu_system_wide}.csv, then
 +plots/ under the same directory.
++
++The output folder is keyed on the Hermes ``session_id`` (not a per-process
++timestamp) so ``hermes --resume <session_id>`` lands in the SAME directory and
++appends to the existing CSVs instead of starting a fresh run. The sampler is
++started in ``tracer.init()`` — before any session exists — so ``session_id`` is
++captured from ``on_session_start`` (which also fires on resume) and the sampler
++callback holds off writing until it is known.
++
++The per-turn number is likewise persisted to ``<session_dir>/.turn_count`` and
++re-seeded on the first prompt after ``hermes --resume``, so the CSV ``turn``
++column (and the vLLM/MLflow per-turn step) continue instead of restarting at 1.
++The core turn counter in ``tracer.sessions`` is process-local, so without this
++a resumed session would renumber from 1.
 +"""
 +
 +from __future__ import annotations
@@ -60,7 +73,7 @@ index 0000000..c2edcfa
 +import threading
 +import time
 +from datetime import datetime
-+from typing import Any, Dict, Optional, Tuple
++from typing import Any, Dict, Optional, Set, Tuple
 +
 +from .debug_utils import debug_log
 +from .helpers import truncate_string
@@ -76,6 +89,15 @@ index 0000000..c2edcfa
 +_run_start_wall: Optional[float] = None
 +_writers: Dict[str, Tuple[Any, Any]] = {}
 +_installed = False
++# The Hermes session_id, captured from on_session_start. Used as the output
++# folder name so a resumed session reuses the same directory. None until the
++# first session starts; the sampler callback holds off writing until then.
++_session_id: Optional[str] = None
++
++# Sessions whose persisted turn counter we've already restored in THIS process,
++# so the one-time reseed on the first prompt after `hermes --resume` happens
++# exactly once per session (subsequent prompts advance normally).
++_turn_restored: Set[str] = set()
 +
 +# Per-tool bookkeeping for tool_execution.csv. Keyed by "{tool_name}:{task_id}",
 +# same convention the original tool_profiler.py used.
@@ -108,7 +130,11 @@ index 0000000..c2edcfa
 +    global _out_dir, _run_start_wall
 +    if _out_dir is None:
 +        base = os.environ.get("HERMES_PROFILING_OUTPUT_DIR", "./outputs")
-+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
++        # Key the folder on the Hermes session_id so `hermes --resume <id>`
++        # reuses it and the CSVs append. Fall back to a wall-clock timestamp
++        # only if a writer is somehow reached before on_session_start captured
++        # the id (guarded against for samples in _on_sample).
++        run_id = _session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
 +        _out_dir = os.path.join(base, run_id)
 +        os.makedirs(_out_dir, exist_ok=True)
 +        _run_start_wall = time.time()
@@ -155,6 +181,12 @@ index 0000000..c2edcfa
 +    if not _flag("HERMES_CSV_DUMP"):
 +        return
 +
++    # The sampler starts in tracer.init(), before on_session_start fires, so the
++    # first ticks arrive with no session_id yet. Skip them rather than create a
++    # timestamp-named folder that a resumed session could never find again.
++    if _session_id is None:
++        return
++
 +    writers = _get_writers()
 +    ts = datetime.fromtimestamp(sample.wall_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 +    ts_ns = sample.wall_ns
@@ -186,14 +218,141 @@ index 0000000..c2edcfa
 +    return _writers["tool"]
 +
 +
++def _note_session_id(session_id: Optional[str]) -> None:
++    """Record the Hermes session_id (first non-empty wins) so the output folder
++    can be named after it. Called from every hook that carries it, because it
++    must be set BEFORE _ensure_output_dir() first runs — otherwise the folder
++    falls back to a per-process timestamp and a resumed session can't find it."""
++    global _session_id
++    if session_id and _session_id is None:
++        _session_id = session_id
++
++
++def _turn_tracking_active() -> bool:
++    """The turn counter only matters when something keys off it: the CSV `turn`
++    column or the vLLM/MLflow per-turn step. Skip persistence otherwise."""
++    return _flag("HERMES_CSV_DUMP") or _flag("HERMES_VLLM_CACHE_METRICS")
++
++
++def _turn_state_path(session_id: str) -> str:
++    """Path of the persisted turn counter, alongside the session's CSVs."""
++    base = os.environ.get("HERMES_PROFILING_OUTPUT_DIR", "./outputs")
++    return os.path.join(base, session_id, ".turn_count")
++
++
++def _read_turn_state(session_id: str) -> int:
++    """Last persisted turn number for this session (0 if none). We persist the
++    count itself — rather than infer it from the CSV — so it stays correct even
++    for turns that ran no tools and therefore left no CSV row."""
++    try:
++        with open(_turn_state_path(session_id)) as f:
++            return int(f.read().strip() or 0)
++    except (FileNotFoundError, ValueError):
++        return 0
++    except Exception as e:
++        debug_log(f"csv_dump: could not read turn state: {e}")
++        return 0
++
++
++def _write_turn_state(session_id: str, turn: int) -> None:
++    try:
++        path = _turn_state_path(session_id)
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w") as f:
++            f.write(str(turn))
++    except Exception as e:
++        debug_log(f"csv_dump: could not write turn state: {e}")
++
++
++def _restore_turn_counter(session_id, args, kwargs):
++    """First prompt after `hermes --resume`: seed the core turn counter from the
++    persisted file so numbering continues instead of restarting at 1. Returns
++    possibly-rewritten (args, kwargs) with is_first_turn forced False, since the
++    core on_pre_llm_call resets to 1 when is_first_turn is truthy.
++
++    The counter lives in tracer.sessions (in-memory, process-local); on a fresh
++    `hermes -r` process it would otherwise be empty. We poke the private
++    _turn_counters directly because SessionState exposes only an incrementing
++    next_turn(), no setter."""
++    if not session_id or not _turn_tracking_active() or session_id in _turn_restored:
++        return args, kwargs
++    _turn_restored.add(session_id)
++    try:
++        persisted = _read_turn_state(session_id)
++        if persisted <= 0:
++            return args, kwargs
++        from .tracer import get_tracer
++
++        get_tracer().sessions._turn_counters[session_id] = persisted
++        # Force is_first_turn False so next_turn() continues from `persisted`.
++        if "is_first_turn" in kwargs:
++            kwargs = {**kwargs, "is_first_turn": False}
++        elif len(args) >= 3:
++            args = args[:2] + (False,) + args[3:]
++        debug_log(f"csv_dump: resumed turn counter for {session_id} at {persisted}")
++    except Exception as e:
++        debug_log(f"csv_dump: turn restore failed: {e}")
++    return args, kwargs
++
++
++def _persist_turn_counter(session_id) -> None:
++    """After the core hook advanced the turn, mirror the current number to disk
++    so the next `hermes -r` process can pick up where this one left off."""
++    if not session_id or not _turn_tracking_active():
++        return
++    try:
++        from .tracer import get_tracer
++
++        turn = get_tracer().sessions.turn_number(session_id)
++        if turn > 0:
++            _write_turn_state(session_id, turn)
++    except Exception as e:
++        debug_log(f"csv_dump: turn persist failed: {e}")
++
++
++def _wrap_session_start(original):
++    """Capture the Hermes session_id as it starts so the output folder can be
++    named after it (see _ensure_output_dir). Fires on both fresh starts and
++    `hermes --resume`, so a resumed session resolves to the same directory."""
++
++    @functools.wraps(original)
++    def wrapper(session_id, model, platform, **kwargs):
++        _note_session_id(session_id)
++        return original(session_id, model, platform, **kwargs)
++
++    return wrapper
++
++
++def _wrap_pre_llm_call(original):
++    """Fallback session_id capture + turn-counter resume. on_pre_llm_call fires
++    once per prompt — early, on every turn (including tool-less turns and
++    `hermes --resume`) — and carries session_id as its first argument, so it
++    reliably sets the id before any writer creates the output dir. It is also
++    where the core hook advances the turn number, so it is the right place to
++    seed that counter from disk on resume and to persist it afterward."""
++
++    @functools.wraps(original)
++    def wrapper(session_id, *args, **kwargs):
++        _note_session_id(session_id)
++        args, kwargs = _restore_turn_counter(session_id, args, kwargs)
++        result = original(session_id, *args, **kwargs)
++        _persist_turn_counter(session_id)
++        return result
++
++    return wrapper
++
++
 +def _wrap_pre_tool_call(original):
 +    """Capture the tool's wall-clock start (time.time()), keyed the same way
 +    on_post_tool_call keys its own state. _tool_host_utilization_attributes
 +    only sees time.perf_counter() values (monotonic, no epoch), so this is the
-+    only place a real timestamp for the CSV row is available."""
++    only place a real timestamp for the CSV row is available. Also a fallback
++    capture point for the session_id, in case on_session_start's wrapper is
++    dispatched differently and this is the first hook to see the id."""
 +
 +    @functools.wraps(original)
 +    def wrapper(tool_name, args, task_id, **kwargs):
++        _note_session_id(kwargs.get("session_id"))
 +        if _flag("HERMES_CSV_DUMP"):
 +            _tool_starts[f"{tool_name}:{task_id}"] = time.time()
 +        return original(tool_name, args, task_id, **kwargs)
@@ -246,6 +405,7 @@ index 0000000..c2edcfa
 +        return
 +
 +    session_id = kwargs.get("session_id")
++    _note_session_id(session_id)
 +    turn = tracer.sessions.turn_number(session_id) if session_id else 0
 +
 +    # Respect the same privacy toggle the OTel spans already honor (see
@@ -340,9 +500,11 @@ index 0000000..c2edcfa
 +
 +def install() -> None:
 +    """Patch HermesOTelPlugin._mirror_host_sample at the class level so every
-+    host-metrics sample also gets written to CSV, and wrap three hooks.py
-+    functions by name so tool_execution.csv gets one row per tool call,
-+    reusing the avg/peak values the mainline code already computes.
++    host-metrics sample also gets written to CSV, and wrap hooks.py functions
++    by name: on_session_start + on_pre_llm_call to capture the session_id for
++    the output folder, and the three tool hooks so tool_execution.csv gets one
++    row per tool call, reusing the avg/peak values the mainline code already
++    computes.
 +
 +    Must run before tracer.init() starts the sampler (see module docstring).
 +    Idempotent; a no-op when HERMES_CSV_DUMP is never set to true, beyond a
@@ -370,6 +532,8 @@ index 0000000..c2edcfa
 +        wrapped._hermes_csv_dump_wrapped = True
 +        HermesOTelPlugin._mirror_host_sample = wrapped
 +
++    _wrap_by_name(hooks, "on_session_start", _wrap_session_start)
++    _wrap_by_name(hooks, "on_pre_llm_call", _wrap_pre_llm_call)
 +    _wrap_by_name(hooks, "on_pre_tool_call", _wrap_pre_tool_call)
 +    _wrap_by_name(hooks, "on_post_tool_call", _wrap_post_tool_call)
 +    _wrap_by_name(hooks, "_tool_host_utilization_attributes", _wrap_tool_utilization_attrs)
