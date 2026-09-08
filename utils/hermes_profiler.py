@@ -853,81 +853,54 @@ def show_left_table(df, height=None):
         kwargs["height"] = height
     st.dataframe(disp, **kwargs)
 
-
 def _build_fileref_prompt(tool_csv_path: str, traces_path=None) -> str:
-    """Prompt that points hermes at the on-disk data files to analyze.
+    """Prompt that points hermes at the absolute on-disk data files to analyze."""
+    abs_tool_csv = os.path.abspath(tool_csv_path)
+    abs_traces = os.path.abspath(traces_path) if traces_path else None
 
-    The prompt is passed to `hermes -z <PROMPT>` as a single CLI argument, which
-    the OS caps at ~128 KB (Linux MAX_ARG_STRLEN) - inlining a dozen full traces
-    would blow past it ("Argument list too long"). So we always write the data to
-    disk and pass only these short path references. Under --yolo one-shot mode
-    hermes still loads its file-reading tools, so it can open the paths itself.
-    """
     prompt = (
-        "You are a performance analyst. The telemetry for a Hermes agent session "
+        "You are a senior performance engineer. The telemetry for a Hermes agent session "
         "is on disk. Read these files with your file tools and analyze them "
         "directly. Base your analysis ONLY on their contents.\n\n"
         "**STRICTLY** Do NOT classify tools as CPU-bound or GPU-bound and do NOT "
         "try to attribute the cpu/gpu numbers to a cause - report the wall-clock "
         "timing and the span details, and leave the CPU/GPU interpretation to the "
         "user.\n\n"
-        f"1. tool_execution.csv (one row per tool call): {tool_csv_path}\n"
-        "   Columns: turn, tool_name, input, output, timestamp, "
-        "start_time_unix_nano, elapsed_s, duration_s, cpu_avg_pct, cpu_peak_pct, "
-        "gpu_avg_pct, gpu_peak_pct. duration_s is the tool's execution time; "
-        "cpu_avg_pct/gpu_avg_pct are the average CPU/GPU during it (CPU is "
-        "hermes+children, excludes the vLLM model server).\n"
+        f"1. tool_execution.csv (one row per tool call): {abs_tool_csv}\n"
     )
-    if traces_path:
+    if abs_traces:
         prompt += (
-            f"2. traces.json (JSON array of full MLflow traces, one per user "
-            f"query, spans included): {traces_path}\n\n"
-            "JOIN KEY: each trace has a span attribute `hermes.turn.number` whose "
-            "value equals the `turn` column in tool_execution.csv. The trace with "
-            "hermes.turn.number = N owns every CSV row where turn = N (one query = "
-            "one turn = one trace). Do NOT guess by timestamp; use the turn "
-            "number. Analyze each query SEPARATELY, then compare them.\n\n"
-            "The CSV is only a summary; the traces hold the in-depth detail. Read "
-            "each tool's span in full - its attributes and its inputs/outputs - "
-            "and ground your analysis in those specifics rather than the tool "
-            "names alone.\n\n"
-        )
-    else:
-        prompt += "\n"
-    prompt += (
-        "Please report:\n"
-        "1. An overview table FIRST, before any prose: one row per tool call, with "
-        "columns turn, tool, key input (short), duration_s, start-offset-from-turn-"
-        "start, and one notable span detail (e.g. provider). ALWAYS present this "
-        "session/tool overview as a Markdown table - never as prose or bullet "
-        "lists.\n"
-        "2. The hotspot tools/turns (which tools dominate time and resource use) and why.\n"
-        "3. Redundant, repeated, or inefficient tool usage patterns you notice.\n"
-        "4. Concrete, actionable improvements to the tool usage (e.g. batching, "
-        "avoiding repeated calls, cheaper alternatives).\n"
-    )
-    if traces_path:
-        prompt += (
-            "5. A per-query breakdown (prefer a compact table): one entry per user "
-            "query (trace) with its total tool time and dominant tool. Add ONLY "
-            "per-query specifics here - do not restate the overall findings or "
-            "improvements already covered in 2-4.\n"
+            f"2. traces.json (JSON array of full MLflow traces): {abs_traces}\n\n"
+            "JOIN KEY: trace span attribute `hermes.turn.number` equals the `turn` column "
+            "in tool_execution.csv. Analyze each query using this join key.\n\n"
         )
     prompt += (
-        "Write as an experienced performance engineer delivering a concise, "
-        "professional report. Synthesize the evidence into clear findings and "
-        "prioritized, impactful recommendations - do NOT mechanically list back "
-        "the fields above or restate raw rows. Lead with the key takeaways, back "
-        "every claim with specific numbers from the data, and keep it specific to "
-        "this session. Use a Markdown table where it genuinely makes the report "
-        "cleaner (e.g. comparing tools or turns side by side); otherwise write in "
-        "prose. Format the whole report in Markdown. State each finding, number, "
-        "and recommendation EXACTLY ONCE - do not repeat the same point across "
-        "sections; if a later section would restate something already said, either "
-        "omit it or add only new detail."
+        "Please deliver a narrative-driven engineering report using bold markdown headings (e.g., **Heading**) "
+        "structured exactly as follows:\n\n"
+        "**Session Overview**\n"
+        "Provide a summary paragraph followed by a clean Markdown table showing: turn, tool, short key input, "
+        "duration (seconds), start offset, and provider details.\n\n"
+        "**Executive Summary & Core Metrics**\n\n"
+        "For each metric below, write the exact bold metric name followed by the final calculated percentage "
+        "on its own line, then insert a BLANK LINE, then write your narrative explanation as a separate "
+        "paragraph. The blank line is required so the explanation renders on a new line (a single line break "
+        "is not enough in Markdown). Do NOT use a bullet list for these four metrics. Format each exactly like:\n\n"
+        "**Success Rate: <pct>%** — computed as `(Successful Root Spans / Total Completed Root Spans) * 100`\n\n"
+        "<explanation paragraph on its own line>\n\n"
+        "**Tool Selection Accuracy: <pct>%** — computed as `(Valid Schema Calls Without Retries / Total Tool Calls) * 100`\n\n"
+        "<explanation paragraph on its own line>\n\n"
+        "**Autonomy Score: <pct>%** — computed as `(Autonomous Steps / [Autonomous Steps + Human Interventions]) * 100`\n\n"
+        "<explanation paragraph on its own line>\n\n"
+        "**Recovery Rate: <pct>%** — computed as `(Errors Followed by Successful Path Correction / Total Errors Encountered) * 100`\n\n"
+        "<explanation paragraph on its own line>\n\n"
+        "**Per-Query Breakdown**\n"
+        "A compact table mapping each query to its total tool time, dominant tool, and outcome, followed by a brief note.\n\n"
+        "**Insights**\n"
+        "Write your findings as fluid, professional prose. Synthesize the raw numbers into actionable observations. "
+        "Drop raw epoch nanoseconds, internal trace IDs, and redundant formula text. Speak directly to execution efficiency, "
+        "token scale, and tool behavior."
     )
     return prompt
-
 
 def start_hermes_analysis(local_dir: str, session_id: str, full_traces=None):
     """Start hermes analysis as a non-blocking subprocess.
