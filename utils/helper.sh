@@ -93,6 +93,10 @@ cleanup() {
     sudo docker stop hermes_service >/dev/null 2>&1
     sudo docker rm hermes_service >/dev/null 2>&1
 
+    echo "[INFO] Stopping Grafana LGTM container..."
+    sudo docker stop lgtm >/dev/null 2>&1
+    sudo docker rm lgtm >/dev/null 2>&1
+
     echo "[INFO] Removing profiling artifacts cache..."
     rm -rf "$HOME/profiling_cache" >/dev/null 2>&1
     echo "[INFO] Cleanup complete. Exiting."
@@ -316,6 +320,7 @@ echo "[INFO] Launching MLflow server on port 5004..."
 # and the Traces view come up with missing detail. Keep --allowed-hosts "*",
 # which the dashboard needs when it is reached over the server IP rather than
 # localhost.
+pip install --upgrade anyio starlette fastapi mlflow
 python3 -m mlflow server \
   --host 0.0.0.0 \
   --port 5004 \
@@ -346,6 +351,41 @@ done
 if [ "$mlflow_ready" -ne 1 ]; then
     fail "MLflow server" "$WORKSPACE_DIR/mlflow_server.log"
 fi
+
+# ===========================================================================
+# Grafana LGTM (CPU/GPU metrics backend for hermes-otel)
+# ===========================================================================
+# hermes-otel exports CPU/GPU as OTel metrics, not files - MLflow only records
+# traces, so a metrics-capable OTLP backend is needed separately. LGTM bundles
+# an OTLP receiver (traces+metrics+logs) in front of an embedded Mimir/
+# Prometheus store, all in one container - matches the "lgtm" backend already
+# written into config.yaml below (endpoint :4318, metrics: true).
+echo "[INFO] Launching Grafana LGTM (CPU/GPU metrics backend)..."
+sudo docker rm -f lgtm >/dev/null 2>&1
+sudo docker run -d --name lgtm \
+    -p 3000:3000 -p 4317:4317 -p 4318:4318 -p 9090:9090 \
+    grafana/otel-lgtm
+
+echo "[INFO] Waiting for Grafana (LGTM) /api/health on port 3000..."
+lgtm_ready=0
+for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000/api/health")
+    code="${code:-000}"
+    if [ "$code" -eq 200 ]; then
+        echo "[OK] Grafana LGTM is up."
+        lgtm_ready=1
+        break
+    fi
+    # Fail fast if the container already exited.
+    if ! sudo docker inspect -f '{{.State.Running}}' lgtm 2>/dev/null | grep -q true; then
+        break
+    fi
+    sleep 2
+done
+if [ "$lgtm_ready" -ne 1 ]; then
+    fail "Grafana LGTM" ""
+fi
+echo "[INFO] Grafana UI at http://${SYSTEM_IP}:3000/ (metrics also queryable at :9090)"
 
 # ===========================================================================
 # Hermes Installation & Configuration
@@ -459,40 +499,26 @@ else
 fi
 
 # ===========================================================================
-# Hermes OpenTelemetry Plugin & Patch Setup
+# Hermes OpenTelemetry Plugin Setup
 # ===========================================================================
-echo "[INFO] Installing Hermes OpenTelemetry plugin..."
+# The per-span/per-turn CPU and GPU profiling this whole workshop is built
+# around is native on upstream main as of this commit (host_metrics.py,
+# gpu_probe.py, the host_metrics/host_metrics_gpu/host_metrics_interval_ms/
+# flush_interval_ms config keys) - no patch needed. No tagged release has it
+# yet, so this pins the exact commit rather than a bare clone left on whatever
+# `main` happens to be on the day the script runs (that drifts silently -
+# matches utils/Dockerfile, which pins the same commit for the same reason).
+echo "[INFO] Installing Hermes OpenTelemetry plugin (pinned @ ${HERMES_OTEL_COMMIT:0:7})..."
 
 rm -rf "$HOME/.hermes/plugins/hermes_otel"
 mkdir -p "$HOME/.hermes/plugins"
 git clone https://github.com/briancaffey/hermes-otel.git "$HOME/.hermes/plugins/hermes_otel"
 
 cd "$HOME/.hermes/plugins/hermes_otel"
-git fetch origin
-
-echo "[INFO] Applying advanced profiling patch..."
-# Two patches, applied together in order: the base patch adds full-session
-# CPU/GPU/tool CSV capture, and the addon (layered on top of it) adds MLflow
-# run tracking + vLLM prefix-cache metrics. Both are generated against the
-# same base commit in the hermes-otel repo, so if HEAD has since moved past
-# it and no longer applies cleanly, reset to that exact commit first.
-PATCH_FILE_GRAPH="$UTILS_DIR/hermes_advanced_profiling.patch"
-PATCH_FILE_VLLM="$UTILS_DIR/hermes_vllm_addon.patch"
-
-if [ ! -f "$PATCH_FILE_GRAPH" ] || [ ! -f "$PATCH_FILE_VLLM" ]; then
-    echo "[ERROR] One or both patch files not found ($PATCH_FILE_GRAPH, $PATCH_FILE_VLLM); profiling not installed."
-elif git apply --check "$PATCH_FILE_GRAPH" >/dev/null 2>&1 && git apply --check "$PATCH_FILE_VLLM" >/dev/null 2>&1; then
-    git apply "$PATCH_FILE_GRAPH"
-    git apply "$PATCH_FILE_VLLM"
-    echo "[OK] Advanced profiling patches applied cleanly."
-else
-    echo "[WARN] Patches did not apply cleanly on current HEAD. Resetting to target commit 7497441..."
-    git stash --include-untracked
-    git checkout 7497441ccf156b9ed1f009fefe08935925bd7b42
-    git apply "$PATCH_FILE_GRAPH"
-    git apply "$PATCH_FILE_VLLM"
-    echo "[OK] Reset and applied patches successfully."
-fi
+git getch origin 
+# The code was tested in the below commit-id
+# HERMES_OTEL_COMMIT="7497441ccf156b9ed1f009fefe08935925bd7b42"
+# git checkout "$HERMES_OTEL_COMMIT"
 
 # Install the plugin package in editable mode using standard python/pip.
 # Same PEP 668 opt-out as the MLflow install above; PIP_SYS_FLAGS is empty on
@@ -514,11 +540,12 @@ cat << 'EOF' > "$HOME/.hermes/plugins/hermes_otel/config.yaml"
 enabled: true
 force_flush_on_session_end: true
 capture_previews: true
-capture_full_prompts: true
-capture_full_responses: true
+capture_full_prompts: false
+capture_full_responses: false
 host_metrics: true
 host_metrics_gpu: amd
 host_metrics_interval_ms: 100
+flush_interval_ms: 100
 backends:
   - type: otlp
     name: mlflow
@@ -527,6 +554,12 @@ backends:
     logs: false
     headers:
       x-mlflow-experiment-id: "0"
+  - type: otlp
+    name: lgtm
+    endpoint: http://127.0.0.1:4318/v1/traces
+    traces: false
+    metrics: true
+    logs: false
 EOF
 
 hermes plugins enable hermes_otel --allow-tool-override
@@ -558,12 +591,10 @@ if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
     exit 1
 fi
 echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)"
-# Dependencies for the patched hermes-otel plugin, inside the Hermes venv.
-# GPU numbers come from amdsmi queried directly in-process (gpu_probe.py /
-# host_metrics.py), not from scraping an external AMD Device Metrics Exporter
-# container over HTTP. CPU numbers come from `psutil`. `requests` is needed
-# separately for the vLLM prefix-cache metrics feature (mlflow_hooks.py scrapes
-# vLLM's own /metrics endpoint), unrelated to GPU readings.
+# Dependencies for the hermes-otel plugin, inside the Hermes venv. GPU numbers
+# come from amdsmi queried directly in-process (gpu_probe.py / host_metrics.py),
+# not from scraping an external AMD Device Metrics Exporter container over
+# HTTP. CPU numbers come from `psutil`.
 #
 # amdsmi is intentionally left unpinned: it ships with the ROCm stack and
 # should match whatever ROCm version is already on this host rather than a
@@ -617,17 +648,16 @@ if [ $? -ne 0 ]; then
 fi
 echo "[INFO] MLflow tracking available at http://${SYSTEM_IP}:5004/"
 
-cat << 'EOF' >> "$HOME/.hermes/.env"
-HERMES_CSV_DUMP=true
-HERMES_PLOT_PROFILING=true
-HERMES_VLLM_CACHE_METRICS=true
-HERMES_VLLM_PORT=8001
-MLFLOW_TRACKING_URI=http://127.0.0.1:5004
-MLFLOW_EXPERIMENT_NAME=Default
-MLFLOW_RUN_NAME=Hermes_Profiling_{session_id}
-EOF
-
-echo "HERMES_PROFILING_OUTPUT_DIR=${WORKSPACE_DIR}/outputs" >> "$HOME/.hermes/.env"
+# No more ~/.hermes/.env writes here. HERMES_CSV_DUMP / HERMES_PLOT_PROFILING /
+# HERMES_VLLM_CACHE_METRICS / HERMES_VLLM_PORT / HERMES_PROFILING_OUTPUT_DIR /
+# MLFLOW_RUN_NAME / MLFLOW_TRACKING_URI / MLFLOW_EXPERIMENT_NAME all gated or
+# fed csv_dump.py / mlflow_hooks.py, neither of which exists on upstream main
+# (confirmed: no file in the plugin references any of them) - CSV output and
+# MLflow run-based metadata were specific to an old out-of-tree patch. CPU/GPU
+# now flows as OTel metrics into Grafana LGTM (config.yaml above, endpoint set
+# there directly, not via env), and traces carry their own session/turn
+# metadata without any MLflow "run" being created at all. The hermes-otel
+# plugin needs nothing from ~/.hermes/.env.
 
 # ===========================================================================
 # Kokoro TTS server
@@ -885,6 +915,7 @@ echo "[OK] Setup complete."
 echo "  vLLM endpoint:        http://${SYSTEM_IP}:$VLLM_HERMES_PORT"
 echo "  Kokoro TTS server:    http://${SYSTEM_IP}:$KOKORO_PORT"
 echo "  MLflow tracking:      http://${SYSTEM_IP}:5004"
+echo "  Grafana (CPU/GPU):    http://${SYSTEM_IP}:3000"
 echo "  Telemetry dashboard:  http://${SYSTEM_IP}:8501"
 echo "========================================================================="
 echo "[INFO] Holding the session open. Press Ctrl+C to stop all services and exit."

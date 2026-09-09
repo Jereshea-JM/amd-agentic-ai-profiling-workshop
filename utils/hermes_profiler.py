@@ -5,11 +5,14 @@ MLflow by the hermes-otel plugin. Point it at an MLflow tracking server (IP +
 port), pick a session id, and it will:
 
   1. connect to the tracking server and list every session id it can find
-     (session_id is stored as an MLflow run param by the plugin),
-  2. resolve the chosen session id -> run_id,
-  3. download that run's ``profiling/`` artifacts (CPU/GPU timelines and the
-     per-tool breakdown CSVs) locally,
-  4. fetch the session's MLflow traces (one per user turn, full span trees).
+     (session_id lives in each trace's trace_metadata - the plugin creates no
+     MLflow "run" at all under the plain-OTLP architecture),
+  2. resolve the chosen session id -> its experiment,
+  3. fetch the session's MLflow traces (one per user turn, full span trees),
+  4. for each turn, pull CPU/GPU from Prometheus over that turn's own
+     [start, end] window and merge into one session-level CSV (see
+     fetch_session_cpu_gpu / save_session_cpu_gpu) - there is no MLflow
+     artifact for CPU/GPU anymore, hermes-otel exports them as OTel metrics.
 
 The UI is organized into four tabs:
 
@@ -33,11 +36,12 @@ import json
 import socket
 import subprocess
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 import streamlit as st
 
 import mlflow
@@ -410,70 +414,81 @@ def build_tracking_uri(ip: str, port: str) -> str:
     return f"http://{ip}:{port}"
 
 
+def _clean_meta(v) -> str:
+    """Strip the surrounding JSON quotes MLflow uses for trace_metadata values."""
+    s = str(v).strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s
+
+
+def _search_traces_all_experiments(client: "MlflowClient", max_results: int = 2000):
+    """Yield (experiment, row) for every trace across every experiment.
+
+    mlflow.search_traces() with no location argument only searches the ACTIVE
+    experiment (defaults to "Default" and can be empty) - see the same caveat
+    in fetch_session_traces() - so this lists every experiment explicitly and
+    searches each one.
+    """
+    experiments = client.search_experiments()
+    for exp in experiments:
+        try:
+            traces = mlflow.search_traces(locations=[exp.experiment_id], max_results=max_results)
+        except TypeError:
+            traces = mlflow.search_traces(experiment_ids=[exp.experiment_id], max_results=max_results)
+        if traces is None or len(traces) == 0:
+            continue
+        for _, row in traces.iterrows():
+            yield exp, row
+
+
 @st.cache_data(show_spinner=False)
 def resolve_run(tracking_uri: str, session_id: str):
-    """Find the run whose params.session_id matches, across all experiments.
+    """Find the experiment holding this session's traces, across all experiments.
 
-    Returns dict(run_id, experiment, experiment_id, artifact_uri), or None if no
-    run has that session_id.
+    hermes-otel's plain OTLP backend never creates an MLflow "run" (no
+    mlflow.start_run()/log_param() anywhere upstream) - a session lives purely
+    as trace_metadata["mlflow.trace.session"] on each trace it sends. So this
+    resolves a session_id by searching TRACES, not runs.
+
+    Returns dict(experiment, experiment_id), or None if no trace has that
+    session_id. There is no run_id/artifact_uri anymore - nothing downloads
+    MLflow artifacts; CPU/GPU comes from Prometheus (see fetch_session_cpu_gpu).
     """
+    mlflow.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
-    experiments = client.search_experiments()
-    if not experiments:
-        return None
-    runs = client.search_runs(
-        experiment_ids=[e.experiment_id for e in experiments],
-        filter_string=f"params.session_id = '{session_id}'",
-        max_results=1,
-        order_by=["start_time DESC"],
-    )
-    if not runs:
-        return None
-    run = runs[0]
-    exp_name = next(
-        (e.name for e in experiments if e.experiment_id == run.info.experiment_id),
-        run.info.experiment_id,
-    )
-    return {
-        "run_id": run.info.run_id,
-        "experiment": exp_name,
-        "experiment_id": run.info.experiment_id,
-        "artifact_uri": run.info.artifact_uri,
-    }
+    for exp, row in _search_traces_all_experiments(client):
+        meta = row.get("trace_metadata")
+        if isinstance(meta, dict) and _clean_meta(meta.get("mlflow.trace.session", "")) == session_id:
+            return {"experiment": exp.name, "experiment_id": exp.experiment_id}
+    return None
 
 
 @st.cache_data(show_spinner=False)
 def fetch_session_ids(tracking_uri: str):
-    """Return all distinct session ids on the tracking server, newest first.
+    """Return all distinct session ids across every experiment's traces, newest first.
 
-    session_id is stored as a run param (see the plugin's mlflow_hooks.py), so we
-    scan runs across every experiment, keep the most recent start_time per session
-    id, and return them ordered newest-first for the dropdown.
+    session_id lives in trace_metadata["mlflow.trace.session"] (set by the
+    plugin on every span it sends), NOT as a run param - there is no run at
+    all under the plain-OTLP architecture. Keeps the most recent request_time
+    per session id.
     """
+    mlflow.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
-    experiments = client.search_experiments()
-    if not experiments:
-        return []
-    latest = {}  # session_id -> newest start_time seen
-    token = None
-    while True:
-        runs = client.search_runs(
-            experiment_ids=[e.experiment_id for e in experiments],
-            filter_string="attributes.status != 'DELETED'",
-            max_results=1000,
-            order_by=["start_time DESC"],
-            page_token=token,
-        )
-        for run in runs:
-            sid = run.data.params.get("session_id")
-            if not sid:
-                continue
-            start = run.info.start_time or 0
-            if sid not in latest or start > latest[sid]:
-                latest[sid] = start
-        token = getattr(runs, "token", None)
-        if not token:
-            break
+    latest = {}  # session_id -> newest request_time seen (epoch ms)
+    for _exp, row in _search_traces_all_experiments(client):
+        meta = row.get("trace_metadata")
+        if not isinstance(meta, dict) or "mlflow.trace.session" not in meta:
+            continue
+        sid = _clean_meta(meta["mlflow.trace.session"])
+        if not sid:
+            continue
+        try:
+            ts = int(float(row.get("request_time")))
+        except (TypeError, ValueError):
+            ts = 0
+        if sid not in latest or ts > latest[sid]:
+            latest[sid] = ts
     return [sid for sid, _ in sorted(latest.items(), key=lambda kv: kv[1], reverse=True)]
 
 
@@ -497,6 +512,309 @@ def download_profiling(tracking_uri: str, run_id: str, session_id: str):
     return mlflow.artifacts.download_artifacts(
         run_id=run_id, artifact_path=ARTIFACT_DIR, dst_path=session_dir
     )
+
+
+# ---------------------------------------------------------------------------
+# CPU / GPU from Prometheus (per-turn, merged into session-level CSVs)
+# ---------------------------------------------------------------------------
+# hermes-otel exports CPU/GPU as OTel *metrics*, not files - there is no
+# profiling/ artifact for them anymore (see host_metrics.py / tracer.py's
+# observable gauges). For each turn (trace) in the session, we query Prometheus
+# over that turn's own [start, end] window - derived from the trace's own
+# spans, the same wall-clock reference the old per-tool CSV used - and merge
+# every turn's samples into one session-level CSV. This keeps every other
+# function below (read_csv, parse_timestamps, build_figure, start_hermes_analysis)
+# working unchanged, since they only care about the CSV files existing in
+# local_dir with the legacy column names.
+
+_PROM_MAX_POINTS = 10_000
+_PROM_MIN_STEP = 0.1
+
+_TOOL_CSV_HEADER = [
+    "turn", "tool_name", "input", "output", "timestamp", "start_time_unix_nano",
+    "elapsed_s", "duration_s", "cpu_avg_pct", "cpu_peak_pct", "gpu_avg_pct", "gpu_peak_pct",
+]
+
+
+def _prom_safe_step(duration_s: float, requested_step: float = _PROM_MIN_STEP) -> float:
+    """Requested step wins unless the window is long enough to blow past
+    Prometheus's per-series point limit, in which case the step scales up."""
+    return round(max(requested_step, duration_s / _PROM_MAX_POINTS), 3)
+
+
+def _prom_query_range(
+    prom_url: str, metric: str, start: float, end: float, step: float, instance: str = None
+):
+    """Raw Prometheus HTTP API call. Returns the list of series, or [] on any
+    error - one turn's metrics being unavailable (e.g. it predates metrics
+    being enabled) must never break the whole Load.
+
+    ``instance`` scopes the query to one Hermes process (see
+    _resolve_session_instance). Without it, any OTHER Hermes process
+    reporting the same metric in this time window - e.g. a stale/leftover
+    process left running from earlier testing - gets silently averaged in
+    alongside the real one by _merge_gauge_rows, diluting the numbers
+    (confirmed case: an idle process at 0% GPU averaged a real 100% reading
+    down to 33%, since Prometheus has no session dimension to filter on
+    otherwise)."""
+    query = f'{metric}{{instance="{instance}"}}' if instance else metric
+    try:
+        resp = requests.get(
+            f"{prom_url.rstrip('/')}/api/v1/query_range",
+            params={"query": query, "start": start, "end": end, "step": step},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("status") != "success":
+            return []
+        return body["data"]["result"]
+    except Exception:
+        return []
+
+
+def _trace_instance(trace: dict):
+    """The exact Prometheus `instance` label for the Hermes process that
+    produced this trace, read directly off the trace itself - not guessed.
+
+    hermes-otel never sets service.instance.id explicitly (verified against
+    the plugin source: no reference anywhere in the package); it inherits the
+    OpenTelemetry Python SDK's own default Resource behavior, which mints a
+    random UUID once per process (verified directly against the installed
+    SDK: Resource.create() always includes a fresh "service.instance.id").
+    That resource attribute is exported as a *tag* on every trace MLflow
+    stores (info.tags["service.instance.id"]) - the SAME opaque id that
+    becomes Prometheus's `instance` label for every metric that same process
+    exports. So a session's own trace already carries the exact answer to
+    "which Prometheus instance is mine" - confirmed by direct inspection: a
+    real trace's tag matched, character for character, the instance Prometheus
+    was found to be reporting 100% GPU under, while an unrelated idle process
+    (a different instance, left running from earlier testing) was reporting
+    0% at the same timestamps and diluting the naive cross-instance average.
+    Filtering on this exact id removes the dilution with no guessing at all.
+    Returns None if the tag is absent for any reason (caller falls back to an
+    unfiltered query, same as if no instance were known)."""
+    return (trace.get("info", {}) or {}).get("tags", {}).get("service.instance.id")
+
+
+def _turn_window(trace: dict, pad_s: float = 1.0):
+    """(turn_number, start_epoch, end_epoch) for one trace, padded by pad_s on
+    each side, derived from the trace's own spans (not MLflow's
+    request_time/execution_duration) so it lines up with what the plugin
+    actually sampled. None if the trace has no usable span timestamps."""
+    spans = _norm_spans(trace)
+    starts = [s["start"] for s in spans if s["start"] is not None]
+    ends = [s["end"] for s in spans if s["end"] is not None]
+    if not starts or not ends:
+        return None
+    return _turn_of_trace(trace), min(starts) / 1e9 - pad_s, max(ends) / 1e9 + pad_s
+
+
+def _merge_gauge_rows(series, scale: float = 100.0, combine: str = "sum"):
+    """Merge a metric's series (one per label combo - e.g. cpu_mode=user/system,
+    or one per GPU device) into a single [(ts, value), ...] list, matching how
+    the old in-process sampler already combined multi-mode/multi-device
+    readings before writing one CSV row: CPU modes summed into a total, GPU
+    utilization averaged across devices, GPU power/memory summed across
+    devices (see host_metrics.py's Sample.process_cpu_total / gpu_utilization
+    and the old csv_dump.py's _on_sample)."""
+    if not series:
+        return []
+    buckets = {}
+    for s in series:
+        for ts, v in s["values"]:
+            buckets.setdefault(ts, []).append(float(v))
+    out = []
+    for ts, vals in sorted(buckets.items()):
+        val = sum(vals) if combine == "sum" else sum(vals) / len(vals)
+        out.append((ts, val * scale))
+    return out
+
+
+def _ts_to_str(ts) -> str:
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def fetch_turn_cpu_gpu(
+    prom_url: str, start: float, end: float, step: float = _PROM_MIN_STEP, instance: str = None
+):
+    """Query all host metrics for one turn's [start, end] window and return
+    three DataFrames matching the legacy CSV schemas exactly. ``instance``
+    scopes every query to the one real Hermes process for this session (see
+    _resolve_session_instance) - without it, any other process reporting in
+    this window gets silently averaged in alongside it."""
+    step = _prom_safe_step(end - start, step)
+
+    proc_cpu = _merge_gauge_rows(
+        _prom_query_range(prom_url, "process_cpu_utilization_ratio", start, end, step, instance),
+        combine="sum",
+    )
+    sys_cpu = _merge_gauge_rows(
+        _prom_query_range(prom_url, "system_cpu_utilization_ratio", start, end, step, instance),
+        combine="sum",
+    )
+    gpu_util = _merge_gauge_rows(
+        _prom_query_range(prom_url, "hw_gpu_utilization_ratio", start, end, step, instance),
+        combine="avg",
+    )
+    gpu_power = dict(_merge_gauge_rows(
+        _prom_query_range(prom_url, "hw_power_watts", start, end, step, instance),
+        scale=1.0, combine="sum",
+    ))
+    gpu_mem = dict(_merge_gauge_rows(
+        _prom_query_range(prom_url, "hw_gpu_memory_usage_bytes", start, end, step, instance),
+        scale=1.0 / (1024 * 1024), combine="sum",
+    ))
+
+    cpu_hermes_df = pd.DataFrame([
+        {"timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9), "cpu_pct": round(v, 2)}
+        for ts, v in proc_cpu
+    ])
+    cpu_system_df = pd.DataFrame([
+        {"timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9), "cpu_pct": round(v, 2)}
+        for ts, v in sys_cpu
+    ])
+    gpu_df = pd.DataFrame([
+        {
+            "timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9),
+            "gfx_busy_pct": round(v, 2),
+            "power_w": round(gpu_power.get(ts, 0.0), 2),
+            "vram_mb": round(gpu_mem.get(ts, 0.0), 2),
+        }
+        for ts, v in gpu_util
+    ])
+    return cpu_hermes_df, cpu_system_df, gpu_df
+
+
+def fetch_session_cpu_gpu(prom_url: str, full_traces, step: float = _PROM_MIN_STEP):
+    """Per-turn fetch + merge across a whole session. One Prometheus query per
+    turn per metric (not one big session-wide query), since a session can span
+    long idle gaps between turns that would otherwise blow past Prometheus's
+    per-series point limit at fine resolution. Turns whose window returns
+    nothing (e.g. they predate metrics being enabled) are skipped, not fatal.
+
+    Every query is scoped to the exact Prometheus instance each trace's own
+    service.instance.id tag names (see _trace_instance) - without this, any
+    OTHER Hermes process reporting in the same time window gets silently
+    averaged in alongside the real one (confirmed case: a stale idle process
+    diluted a real 100% GPU reading down to 33%). Resolved per turn, not once
+    for the whole session, so it stays correct even in the edge case where a
+    session's turns ran under more than one process."""
+    cpu_hermes_parts, cpu_system_parts, gpu_parts = [], [], []
+    for trace in (full_traces or []):
+        win = _turn_window(trace)
+        if win is None:
+            continue
+        _turn, start, end = win
+        instance = _trace_instance(trace)
+        ch, cs, gp = fetch_turn_cpu_gpu(prom_url, start, end, step, instance)
+        if not ch.empty:
+            cpu_hermes_parts.append(ch)
+        if not cs.empty:
+            cpu_system_parts.append(cs)
+        if not gp.empty:
+            gpu_parts.append(gp)
+
+    def _combine(parts):
+        if not parts:
+            return pd.DataFrame()
+        df = pd.concat(parts, ignore_index=True)
+        # Adjacent turns' padded windows can overlap by ~1s; de-dupe on the
+        # exact sample timestamp so a merged session never double-counts a point.
+        return (
+            df.drop_duplicates(subset=["start_time_unix_nano"])
+            .sort_values("start_time_unix_nano")
+            .reset_index(drop=True)
+        )
+
+    return _combine(cpu_hermes_parts), _combine(cpu_system_parts), _combine(gpu_parts)
+
+
+def build_tool_execution_df(full_traces):
+    """Rebuild tool_execution.csv's rows directly from each tool span's own
+    hermes.tool.* attributes - already computed by the plugin from the same
+    sampler Prometheus's metrics come from, so no Prometheus query is needed
+    for this file; the numbers are embedded in the trace."""
+    if not full_traces:
+        return pd.DataFrame(columns=_TOOL_CSV_HEADER)
+
+    session_starts = [
+        sp["start"] for trace in full_traces for sp in _norm_spans(trace)
+        if sp["start"] is not None
+    ]
+    session_start_ns = min(session_starts) if session_starts else 0
+
+    def _f(v, default=0.0):
+        try:
+            return float(_clean_attr(v))
+        except (TypeError, ValueError):
+            return default
+
+    rows = []
+    for trace in full_traces:
+        turn = _turn_of_trace(trace)
+        for sp in _trace_spans(trace):
+            name = str(sp.get("name", ""))
+            # Identify tool spans structurally (name prefix), NOT by whether
+            # hermes.tool.cpu.utilization.avg happened to attach - right after
+            # `hermes --resume`, the host-metrics sampler is a brand new
+            # thread with no reading yet. A tool call in the resumed
+            # process's first ~100ms (host_metrics_interval_ms) can complete
+            # before the sampler's first tick, leaving sampler.window() with
+            # nothing and the attribute never stamped - even though it's a
+            # completely real tool call. Missing avg/peak still default to
+            # 0.0 below via _f(), so the row is no longer silently dropped.
+            if not name.startswith("tool."):
+                continue
+            attrs = _span_attrs(sp)
+            start = sp.get("start_time_unix_nano") or sp.get("start_time_ns") or sp.get("start_time")
+            end = sp.get("end_time_unix_nano") or sp.get("end_time_ns") or sp.get("end_time")
+            try:
+                start, end = int(start), int(end)
+            except (TypeError, ValueError):
+                continue
+            rows.append({
+                "turn": turn if turn is not None else 0,
+                "tool_name": name[len("tool."):],
+                "input": _clean_attr(attrs.get("input.value", "")),
+                "output": _clean_attr(attrs.get("output.value", "")),
+                "timestamp": _ts_to_str(start / 1e9),
+                "start_time_unix_nano": start,
+                "elapsed_s": round((start - session_start_ns) / 1e9, 3),
+                "duration_s": round((end - start) / 1e9, 3),
+                "cpu_avg_pct": round(_f(attrs.get("hermes.tool.cpu.utilization.avg")) * 100, 2),
+                "cpu_peak_pct": round(_f(attrs.get("hermes.tool.cpu.utilization.peak")) * 100, 2),
+                "gpu_avg_pct": round(_f(attrs.get("hermes.tool.gpu.utilization.avg")) * 100, 2),
+                "gpu_peak_pct": round(_f(attrs.get("hermes.tool.gpu.utilization.peak")) * 100, 2),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=_TOOL_CSV_HEADER)
+    return (
+        pd.DataFrame(rows, columns=_TOOL_CSV_HEADER)
+        .sort_values("start_time_unix_nano")
+        .reset_index(drop=True)
+    )
+
+
+def save_session_cpu_gpu(local_dir: str, prom_url: str, full_traces):
+    """Fetch + merge this session's CPU/GPU from Prometheus (per turn) and its
+    tool breakdown from the traces themselves, and write all three CSVs into
+    local_dir using the exact legacy filenames/schemas."""
+    os.makedirs(local_dir, exist_ok=True)
+    cpu_hermes_df, cpu_system_df, gpu_df = fetch_session_cpu_gpu(prom_url, full_traces)
+    tool_df = build_tool_execution_df(full_traces)
+
+    cpu_hermes_df.to_csv(os.path.join(local_dir, "cpu_hermes_trace.csv"), index=False)
+    cpu_system_df.to_csv(os.path.join(local_dir, "cpu_system_wide.csv"), index=False)
+    gpu_df.to_csv(os.path.join(local_dir, "gpu_system_wide.csv"), index=False)
+    tool_df.to_csv(os.path.join(local_dir, "tool_execution.csv"), index=False)
+
+    return {
+        "cpu_hermes_points": len(cpu_hermes_df),
+        "gpu_points": len(gpu_df),
+        "tool_rows": len(tool_df),
+    }
 
 
 def traces_cache_path(session_id: str) -> str:
@@ -1946,6 +2264,13 @@ with st.sidebar:
     st.header("Connection")
     ip = st.text_input("MLflow server IP / host", value="127.0.0.1")
     port = st.text_input("MLflow server port", value="5004")
+    prom_url = st.text_input(
+        "Prometheus URL (CPU/GPU metrics)",
+        value=os.environ.get("PROM_URL", "http://127.0.0.1:9090"),
+        help="Where hermes-otel's host-metrics (CPU/GPU) land as OTel metrics "
+             "(e.g. the Grafana LGTM backend). Traces still come from the "
+             "MLflow server above.",
+    )
 
     # Session ID selector with a Fetch button to its right. The button column is
     # handled first in code so a fetch updates the list before the selectbox below
@@ -2008,26 +2333,21 @@ if load:
             pass
 
     tracking_uri = build_tracking_uri(ip, port)
-    with st.spinner("Resolving session → run …"):
+    with st.spinner("Resolving session → experiment …"):
         try:
             info = resolve_run(tracking_uri, session_id.strip())
         except Exception as e:
             st.error(f"Could not reach MLflow at {tracking_uri}: {e}")
             st.stop()
     if not info:
-        st.error(f"No run found with session_id = '{session_id}'.")
+        st.error(f"No traces found with session_id = '{session_id}'.")
         st.stop()
 
-    with st.spinner("Downloading profiling artifacts …"):
-        try:
-            local_dir = download_profiling(tracking_uri, info["run_id"], session_id.strip())
-        except Exception as e:
-            st.error(f"Could not download '{ARTIFACT_DIR}' artifacts: {e}")
-            st.stop()
-
-    # Pre-fetch this session's full traces (JSON with all spans) up front so both
-    # the Tab-1 timeline waterfall and the Analysis tab have them ready without an
-    # extra click. Traces are optional telemetry, so any failure is non-fatal.
+    # Pre-fetch this session's full traces (JSON with all spans) up front: they
+    # drive the Tab-1 timeline waterfall / Analysis tab AND, now, the per-turn
+    # windows used to pull this session's CPU/GPU from Prometheus below. There
+    # is no more profiling/ MLflow artifact to download for CPU/GPU - hermes-otel
+    # exports them as OTel metrics, not files (see fetch_session_cpu_gpu).
     full_traces = None
     turn_count = 0
     total_latency_ms = 0.0
@@ -2055,6 +2375,29 @@ if load:
     full_traces = load_traces_json(_sid)
     if full_traces and not turn_count:
         turn_count = len(full_traces)
+
+    # For each turn (trace) in this session, fetch its CPU/GPU from Prometheus
+    # over that turn's own [start, end] window and merge every turn into one
+    # session-level CSV - same technique as fetch_session_metrics.py, just run
+    # per-turn instead of once for the whole session, so long idle gaps between
+    # turns never blow past Prometheus's per-query point limit. tool_execution.csv
+    # is rebuilt straight from the traces' own hermes.tool.* span attributes
+    # (no Prometheus query needed for that one).
+    local_dir = os.path.join(PROFILING_CACHE_DIR, _sid, ARTIFACT_DIR)
+    with st.spinner("Fetching CPU/GPU from Prometheus, per turn …"):
+        try:
+            _stats = save_session_cpu_gpu(local_dir, prom_url, full_traces)
+            if not full_traces:
+                st.warning("No traces to derive turn windows from — CPU/GPU will be empty.")
+            elif _stats["cpu_hermes_points"] == 0 and _stats["gpu_points"] == 0:
+                st.warning(
+                    "No CPU/GPU samples found for this session's turn windows in "
+                    f"Prometheus at {prom_url}. This session may predate metrics "
+                    "being enabled (flush_interval_ms/metrics backend), or the "
+                    "Prometheus URL doesn't point at the right server."
+                )
+        except Exception as e:
+            st.warning(f"Could not fetch CPU/GPU from Prometheus at {prom_url}: {e}")
 
     st.session_state["loaded"] = {
         "tracking_uri": tracking_uri,
@@ -2103,7 +2446,7 @@ total_latency_ms = _data.get("total_latency_ms", 0.0)
 metrics = _data.get("metrics")
 
 st.write(f"**Tracking URI:** `{tracking_uri}`")
-st.success(f"Found run `{info['run_id']}` in experiment `{info['experiment']}`.")
+st.success(f"Found session `{sess_id}` in experiment `{info['experiment']}`.")
 
 # Session-wide summary strip: total turns and their combined latency (the sum of
 # each turn's MLflow trace execution_duration, computed once in
@@ -2126,16 +2469,12 @@ with m3:
             format_latency_ms(total_latency_ms) if turn_count else "n/a",
         )
 
-art_uri = info["artifact_uri"] or ""
-if not art_uri.startswith("mlflow-artifacts:"):
-    st.warning(
-        f"Artifact URI is `{art_uri}` - this looks like a direct/local path, not a "
-        "server-proxied `mlflow-artifacts:/…` URI. Remote download may fail. If so, "
-        "start the server with `--serve-artifacts --artifacts-destination <path>`."
-    )
-
 if cpu_df.empty and gpu_df.empty:
-    st.warning("No CPU/GPU timeline data found in the downloaded artifacts.")
+    st.warning(
+        "No CPU/GPU timeline data found for this session's turns in Prometheus. "
+        "This session may predate metrics being enabled, or the Prometheus URL "
+        "in the sidebar doesn't point at the right server."
+    )
     st.stop()
 
 (tab_overview, tab_separate, tab_efficiency, tab_traces,
