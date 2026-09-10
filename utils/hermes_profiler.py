@@ -14,13 +14,16 @@ port), pick a session id, and it will:
      fetch_session_cpu_gpu / save_session_cpu_gpu) - there is no MLflow
      artifact for CPU/GPU anymore, hermes-otel exports them as OTel metrics.
 
-The UI is organized into four tabs:
+The UI is organized into five tabs:
 
   * Overview          - CPU% + GPU% timeline with tool-execution spans; a toggle
                         swaps to a full-session span waterfall correlated with
                         CPU/GPU on one shared wall-clock axis.
   * CPU / GPU separate - the two utilization signals on their own charts, with an
                         optional side-by-side raw-CSV panel.
+  * Context & tools   - how the agent's context grew call by call across the
+                        whole session, per-turn step counts and time-to-first-
+                        tool, and every tool outcome including the failures.
   * Traces            - one row per turn (timestamp, latency, tokens, status) with
                         a deep link back into the MLflow trace UI.
   * Analysis          - runs the local ``hermes`` CLI to analyze the session's
@@ -1583,7 +1586,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
     return style_figure(fig, axes=False)
 
 # ---------------------------------------------------------------------------
-# Agent efficiency metrics
+# Context & tool metrics
 # ---------------------------------------------------------------------------
 # Four metrics derived from the span tree the dashboard already downloads at
 # Load: agent steps, time-to-first-tool, context growth per step, and tool
@@ -1598,7 +1601,7 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
 # handler stashes its result in st.session_state, which survives a code reload,
 # so a dict built by an older version would otherwise be read by newer render
 # code and raise KeyError on a key that did not exist yet.
-METRICS_SCHEMA = 3
+METRICS_SCHEMA = 4
 
 NS_PER_S = 1_000_000_000
 
@@ -1832,7 +1835,7 @@ def compute_turn_metrics(trace):
     """
     spans = _metric_spans(trace)
     result = {
-        "turn": None, "wall_s": None,
+        "turn": None, "wall_s": None, "start_ns": None,
         "time_to_first_tool_s": None, "time_to_first_tool_pct": None,
         "agent_steps": 0, "agent_steps_reported": None,
         "context_series": [], "context_first": None, "context_last": None,
@@ -1857,6 +1860,9 @@ def compute_turn_metrics(trace):
                    default=turn_start)
     wall_s = (turn_end - turn_start) / NS_PER_S
     result["wall_s"] = wall_s
+    # Kept so turns can be ordered even when hermes.turn.number is missing --
+    # the session-wide context curve is only meaningful in turn order.
+    result["start_ns"] = turn_start
 
     for span in spans:
         if "hermes.turn.number" in span["attrs"]:
@@ -2061,68 +2067,324 @@ def compute_session_metrics(traces):
 
 
 # ---------------------------------------------------------------------------
-# Session flow diagram (Graphviz)
+# Continuous context-growth curve
 # ---------------------------------------------------------------------------
-# Ported from aug_25/hermes_profiler.py. Renders the session's control flow as
-# a DOT graph via st.graphviz_chart: one cluster per turn (hermes.turn.number),
-# each turn's spans drawn as the agent->LLM->tool call tree, colored by span
-# type. Reuses this file's own _turn_of_trace / _norm_spans / _order_spans /
-# _fmt_dur rather than redefining them.
+# The context an agent carries into turn N+1 is the context it left turn N with,
+# so this is one curve for the whole session rather than one line per turn.
+# Every LLM call in the session gets a step index that keeps counting across turn
+# boundaries (turn 1 -> 1..3, turn 2 -> 4..6, turn 3 -> 7..10), consecutive turns
+# are bridged, and the turn-local step number moves into the hover box.
 
-def _safe_id(v) -> str:
-    """Alphanumeric-only token safe as a Graphviz node/cluster id."""
-    return "".join(ch if ch.isalnum() else "_" for ch in str(v)) or "x"
-
-
-def _dot_escape(v, limit=40) -> str:
-    """Sanitize a string for a quoted DOT label (drop quotes/backslashes, cap)."""
-    s = str(v).replace("\\", " ").replace('"', "'").replace("\n", " ").strip()
-    s = " ".join(s.split())
-    return (s[:limit] + "…") if len(s) > limit else s
+# Line color per turn, cycled. The turn label in the hover box (not the color)
+# is what identifies a point, so repeating after eight turns costs nothing.
+TURN_COLORS = [BLUE, ORANGE, TEAL, AMD_RED, GREEN, "#7A5AF8", AMD_RED_DK, SUBINK]
 
 
-# Node fill/border per span type, keyed to the AMD palette (matches the waterfall
-# bar colors): model work blue, tool work orange, retrieval/chain teal, parsing
-# red, everything else grey.
-_DOT_TYPE_STYLE = {
-    "LLM": (BLUE, "#EFF4FB"), "CHAT_MODEL": (BLUE, "#EFF4FB"),
-    "AGENT": (BLUE, "#EFF4FB"),
-    "TOOL": (ORANGE, "#FFF2E6"),
-    "CHAIN": (TEAL, "#E9F7F8"), "RETRIEVER": (TEAL, "#E9F7F8"),
-    "PARSER": (AMD_RED, "#FDE7E8"), "RERANKER": (AMD_RED, "#FDE7E8"),
-}
-_DOT_DEFAULT_STYLE = (SUBINK, "#F4F5F7")
+def _ordered_turn_metrics(per_turn):
+    """per_turn in wall-clock order, by turn start.
+
+    Sorting by hermes.turn.number looks right and is wrong: the agent restarts
+    its turn counter after a `--resume`, so ONE session can hold turn 1 several
+    times (observed: turns 1,1,2,3,4,5,6,1,2 in a single 9-trace session).
+    Ordering by that number then drags a late turn-1 trace back next to the
+    first one and renumbers the session away from the order it actually ran in,
+    which drew a curve that climbed to 29k and dropped back to 19k at the turn-2
+    boundary. start_ns is monotonic whatever the agent calls its turns, so the
+    curve reads left-to-right in execution order and never steps backwards.
+    """
+    def _key(item):
+        i, turn = item
+        start = turn.get("start_ns")
+        return (0, start, i) if start is not None else (1, 0, i)
+
+    return [t for _, t in sorted(enumerate(per_turn or []), key=_key)]
 
 
-# Shared DOT preamble (everything after the `digraph {` opener). Kept in one place
-# so the whole-session graph and the per-turn graph render identically.
-#
-# `size` caps the rendered drawing at fit_h INCHES tall (width left effectively
-# unbounded), and Graphviz only ever scales DOWN to honor it - so a graph taller
-# than the box is zoomed out to fit its height instead of overflowing/scrolling.
-# The chart is drawn with use_container_width=False so this absolute size is
-# respected (use_container_width would restretch to the container width and
-# reintroduce the vertical overflow). ~1.55in ~= 150px keeps a turn inside the
-# 180px box with a little padding.
-def _dot_header(fit_h=1.55):
-    return [
-        "  rankdir=TB;",
-        "  compound=true;",
-        f'  size="1000,{fit_h}";',
-        f'  graph [fontname="Segoe UI", fontsize=12, labeljust=l, '
-        f'style="rounded", color="{LINE}", fontcolor="{SUBINK}"];',
-        f'  node [shape=box, style="rounded,filled", fontname="Segoe UI", '
-        f'fontsize=11, penwidth=1.4];',
-        f'  edge [color="{SUBINK}", arrowsize=0.7];',
-    ]
+def context_growth_points(per_turn):
+    """Flatten every turn's LLM calls into one continuously-numbered series.
 
+    Each point carries `x`, a session-wide step index that keeps counting across
+    turns, alongside `step`, the step number within its own turn -- so the curve
+    is continuous while the hover box can still say "Turn 2 - step 1".
+
+    `delta` is measured against the previous point in the SESSION rather than in
+    the turn, so the first step of a turn reports the jump carried over from the
+    turn before it instead of a blank. `new_turn` marks exactly those points, so
+    the hover can name where the jump came from.
+    """
+    points = []
+    prev = None
+    # Turns are numbered by their POSITION in the session, 1..N, not by the
+    # agent's own hermes.turn.number: that counter restarts after a `--resume`,
+    # so one session can report turn 1 three times. Renumbering keeps the
+    # legend and the bands reading 1,2,3,... in the order the turns actually
+    # ran, and keeps every turn its own group -- a repeated number would
+    # otherwise merge two separate runs of points into a single line and draw
+    # the curve stepping backwards.
+    for i, turn in enumerate(_ordered_turn_metrics(per_turn)):
+        label = f"Turn {i + 1}"
+        for stp in (turn.get("context_steps") or []):
+            tokens = stp.get("input_tokens")
+            if tokens is None:
+                continue
+            point = {
+                "x": len(points) + 1,
+                "turn": label,
+                "step": stp.get("step"),
+                "input_tokens": tokens,
+                "output_tokens": stp.get("output_tokens"),
+                # The final call of a turn requests no tool (finish_reason
+                # "stop"); naming it the answer keeps the hover honest.
+                "tool": stp.get("tool") or "final answer",
+                "llm_s": stp.get("llm_s"),
+                "delta": (tokens - prev["input_tokens"]) if prev else None,
+                "prev_label": (f"{prev['turn']} - step {prev['step']}"
+                               if prev else None),
+                "new_turn": bool(prev) and prev["turn"] != label,
+            }
+            points.append(point)
+            prev = point
+    return points
+
+
+def _context_hover(point):
+    """Hover text for one point on the continuous context curve.
+
+    Carries everything the old on-plot label said and more: the turn-local step
+    number, so a point sitting at session step 4 still reads as "Turn 2 - step
+    1", plus the tool that call asked for -- the rise to the next point is that
+    tool's result landing in the prompt.
+    """
+    delta = ""
+    if point["delta"] is not None:
+        across = " (carried over from the previous turn)" if point["new_turn"] else ""
+        delta = (f"{point['delta']:+,} tok since {point['prev_label']}"
+                 f"{across}<br>")
+    out = point["output_tokens"]
+    return (
+        f"<b>{point['turn']} - step {point['step']}</b> "
+        f"(session step {point['x']})<br>"
+        f"{point['input_tokens']:,} input tokens<br>{delta}"
+        f"requested: <b>{point['tool']}</b><br>"
+        f"LLM call: {point['llm_s']}s, "
+        f"{out if out is not None else 'n/a'} output tokens"
+    )
+
+
+def build_context_growth_figure(points, window=None) -> go.Figure:
+    """One continuous input-token curve for the whole session.
+
+    Turns stay separate traces so the legend can isolate or hide one, but each
+    turn is bridged to the next by a dotted connector in the incoming turn's
+    color. The old chart restarted every turn at x=1, which drew the session's
+    context climb as a set of disconnected short lines and hid the one thing the
+    chart exists to show.
+
+    Point labels are deliberately absent. One tool name per marker meant a
+    session-length axis carrying dozens of overlapping annotations; the name now
+    lives in the hover box, where it stays readable however long the session runs.
+
+    `window` caps how many steps are visible, so a long session shows a moving
+    window over its newest steps instead of compressing everything into the
+    panel width. Drag on the plot to pan back through the rest; there is no
+    range slider under the axis -- the mini-map read as a second chart and cost
+    vertical space the curve itself wanted.
+    """
+    fig = go.Figure()
+    if not points:
+        return fig
+
+    # Group consecutive points by turn. They are already consecutive by
+    # construction, so this also survives a turn label repeating (it cannot
+    # today, but a run of points is the thing being drawn, not the label).
+    groups = []
+    for point in points:
+        if groups and groups[-1]["label"] == point["turn"]:
+            groups[-1]["points"].append(point)
+        else:
+            groups.append({"label": point["turn"], "points": [point]})
+
+    # Beyond this many turns the band labels collide into unreadable mush; the
+    # legend and the hover box still name every turn.
+    label_bands = len(groups) <= 12
+
+    for gi, group in enumerate(groups):
+        color = TURN_COLORS[gi % len(TURN_COLORS)]
+        pts = group["points"]
+        # A faint band per turn, labelled once. This is what replaces the
+        # per-point tool names: turn boundaries stay visible at a glance without
+        # writing anything on the curve itself.
+        fig.add_vrect(
+            x0=pts[0]["x"] - 0.5, x1=pts[-1]["x"] + 0.5,
+            fillcolor=color, opacity=0.05, line_width=0, layer="below",
+            annotation_text=(group["label"] if label_bands else ""),
+            annotation_position="top left",
+            annotation_font=dict(size=10, color=SUBINK),
+        )
+        if gi:
+            # The bridge across the turn boundary. Dotted so it still reads as a
+            # new turn starting, drawn without hover so the two points it joins
+            # keep their own hover boxes.
+            prev_pt = groups[gi - 1]["points"][-1]
+            fig.add_trace(go.Scatter(
+                x=[prev_pt["x"], pts[0]["x"]],
+                y=[prev_pt["input_tokens"], pts[0]["input_tokens"]],
+                mode="lines", line=dict(width=2, color=color, dash="dot"),
+                showlegend=False, hoverinfo="skip",
+            ))
+        fig.add_trace(go.Scatter(
+            x=[p["x"] for p in pts],
+            y=[p["input_tokens"] for p in pts],
+            name=group["label"], mode="lines+markers",
+            line=dict(width=2, color=color), marker=dict(size=8, color=color),
+            hovertext=[_context_hover(p) for p in pts], hoverinfo="text",
+        ))
+
+    n = len(points)
+    lo, hi = 0.5, n + 0.5
+    if window and n > window:
+        lo = n - window + 0.5
+    # Integer ticks whatever the length: a step axis has no half steps, and
+    # Plotly's autoticks happily produce 2.5 on a short session.
+    dtick = max(1, -(-n // 25))
+    fig.update_layout(
+        title="Input tokens at each agent step (whole session)",
+        xaxis=dict(
+            title="Agent step(LLM Call+Tool Use)",
+            dtick=dtick, range=[lo, hi],
+        ),
+        yaxis=dict(title="Input tokens"),
+        height=430,
+    )
+    if lo > 0.5:
+        # With an explicit x range Plotly still autoscales y over ALL points, so
+        # a moving window would sit squashed against the top of the panel. Fit y
+        # to what is actually in view instead.
+        ys = [p["input_tokens"] for p in points if lo <= p["x"] <= hi]
+        if ys:
+            pad = max(1.0, (max(ys) - min(ys)) * 0.15)
+            fig.update_layout(yaxis=dict(title="Input tokens",
+                                         range=[min(ys) - pad, max(ys) + pad]))
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Live trace polling (for the continuous curve)
+# ---------------------------------------------------------------------------
+
+def _trace_id_of(trace) -> str:
+    """Trace id from a full-trace dict, whichever key this MLflow build used."""
+    info = trace.get("info") if isinstance(trace, dict) else None
+    if isinstance(info, dict):
+        for key in ("trace_id", "request_id"):
+            if info.get(key):
+                return str(info[key])
+    for span in _trace_spans(trace):
+        if isinstance(span, dict) and span.get("trace_id"):
+            return str(span["trace_id"])
+    return ""
+
+
+def _download_trace(trace_id: str):
+    """One full trace as a plain dict, or None if it cannot be fetched.
+
+    The same conversion fetch_full_traces does, minus the caching: the live poll
+    downloads each trace exactly once and keeps it in session_state, so a second
+    cache layer keyed on the id would only duplicate the memory.
+    """
+    try:
+        tr = mlflow.get_trace(trace_id)
+    except Exception:
+        return None
+    for convert in (lambda t: json.loads(t.to_json()), lambda t: t.to_dict()):
+        try:
+            return convert(tr)
+        except Exception:
+            continue
+    return None
+
+
+def poll_live_traces(tracking_uri: str, session_id: str, experiment_id=None):
+    """Re-scan MLflow for this session's traces; return (traces, error).
+
+    Called on a timer by the Context & tools tab's live curve, so it is
+    incremental: one search_traces call to see which trace ids exist now, then a
+    download of only the ids not already in hand. A poll on a session that has
+    not advanced costs the search and nothing else.
+
+    Traces accumulate in session_state, seeded from whatever Load already
+    fetched, and are written back to the session's traces.json -- the file the
+    rest of the dashboard renders from -- whenever a new turn lands, so the live
+    curve and the other tabs cannot drift apart by more than one rerun.
+
+    Note that a turn's spans reach MLflow when that TURN ends, not when each
+    step ends: the curve extends a turn at a time while the agent works, which
+    is as live as this telemetry gets.
+
+    (Uses ordered_turns, defined below in the turn-ordering section -- a
+    module-level name resolved when this runs, long after import.)
+    """
+    if not session_id:
+        return [], "no session id"
+
+    store = st.session_state.setdefault("live_traces", {})
+    by_id = store.get(session_id)
+    if by_id is None:
+        by_id = {}
+        for tr in ((st.session_state.get("loaded") or {}).get("full_traces") or []):
+            tid = _trace_id_of(tr)
+            if tid:
+                by_id[tid] = tr
+        store[session_id] = by_id
+
+    mlflow.set_tracking_uri(tracking_uri)
+    # The summary fetch is @st.cache_data; without clearing it, every poll would
+    # be answered from the first poll's cached trace-id list and the curve would
+    # never grow.
+    try:
+        fetch_session_traces.clear()
+    except Exception:
+        pass
+    try:
+        summary, err = fetch_session_traces(tracking_uri, session_id, experiment_id)
+    except Exception as e:
+        return list(by_id.values()), f"MLflow poll failed: {e}"
+    if err:
+        return list(by_id.values()), err
+
+    ids = []
+    if not summary.empty and "trace_id" in summary.columns:
+        ids = [str(t) for t in summary["trace_id"].dropna().tolist()]
+    fetched = 0
+    for tid in ids:
+        if tid in by_id:
+            continue
+        trace = _download_trace(tid)
+        if trace is not None:
+            by_id[tid] = trace
+            fetched += 1
+
+    traces = [tr for _, tr in ordered_turns(list(by_id.values()))]
+    if fetched:
+        save_traces_json(session_id, traces)
+    return traces, ""
+
+
+# ---------------------------------------------------------------------------
+# Turn ordering
+# ---------------------------------------------------------------------------
+# All that remains of the Graphviz flow-diagram section. The diagram was
+# removed from the Analysis tab, and with it _safe_id / _dot_escape /
+# _dot_header / _DOT_TYPE_STYLE / _turn_dot_lines / build_turn_flowchart /
+# build_session_flowchart, none of which had another caller. ordered_turns
+# stays: poll_live_traces uses it to merge freshly polled traces back into
+# turn order.
 
 def ordered_turns(traces):
     """Return [(turn_label, trace), ...] ordered by hermes.turn.number then start.
 
     turn_label is the printable turn number (a plain string); traces with no turn
-    attribute fall back to their 1-based position. Shared by the whole-session
-    builder and the per-turn dropdown so both agree on turn identity and order.
+    attribute fall back to their 1-based position.
     """
     def _key(tr):
         t = _turn_of_trace(tr)
@@ -2140,86 +2402,6 @@ def ordered_turns(traces):
             lbl = str(t) if t is not None else str(ti + 1)
         out.append((lbl, tr))
     return out
-
-
-def _turn_dot_lines(trace, turn_lbl):
-    """DOT lines for ONE turn's span tree, wrapped in its `cluster_<turn>` box.
-
-    Returns (lines, root_node_id); lines is empty when the trace has no spans.
-    root_node_id is the turn's first root span, used to chain turns in the
-    whole-session view.
-    """
-    spans = [s for s in _order_spans(_norm_spans(trace)) if s["span_id"]]
-    if not spans:
-        return [], None
-    ids = {s["span_id"] for s in spans}
-    pref = f"t{_safe_id(turn_lbl)}_"
-
-    lines = [
-        f"  subgraph cluster_{_safe_id(turn_lbl)} {{",
-        f'    label="Turn {turn_lbl}"; labelloc=t; bgcolor="{WHITE}";',
-    ]
-    root_id = None
-    for s in spans:
-        nid = pref + _safe_id(s["span_id"])
-        name = _dot_escape(s["name"])
-        if s["start"] is not None and s["end"] is not None:
-            dtxt = _fmt_dur(max((s["end"] - s["start"]) / 1e9, 0))
-            label = f"{name}\\n{dtxt}"
-        else:
-            label = name
-        border, fill = _DOT_TYPE_STYLE.get((s["type"] or "").upper(), _DOT_DEFAULT_STYLE)
-        lines.append(f'    "{nid}" [label="{label}", color="{border}", '
-                     f'fillcolor="{fill}"];')
-        pid = s["parent_id"]
-        if pid and pid in ids:
-            lines.append(f'    "{pref + _safe_id(pid)}" -> "{nid}";')
-        elif root_id is None:
-            root_id = nid
-    lines.append("  }")
-    return lines, root_id
-
-
-def build_turn_flowchart(trace, turn_lbl) -> str:
-    """Graphviz DOT for a single turn's span tree (one readable diagram)."""
-    body, _ = _turn_dot_lines(trace, turn_lbl)
-    if not body:
-        return ""
-    return "\n".join(["digraph turn {"] + _dot_header() + body + ["}"])
-
-
-def build_session_flowchart(traces) -> str:
-    """Build a Graphviz DOT flow of the WHOLE session from its MLflow traces.
-
-    One cluster per turn (ordered by hermes.turn.number, else by first span
-    start), each turn's spans drawn as a parent->child call tree in execution
-    order, colored by span type and labelled with duration. Consecutive turns are
-    linked by a dashed edge so the whole session reads top-to-bottom. Returns ""
-    when the traces carry no spans to draw.
-    """
-    turns = ordered_turns(traces)
-    if not turns:
-        return ""
-
-    lines = ["digraph session {"] + _dot_header()
-    prev_root = None
-    any_span = False
-    for turn_lbl, tr in turns:
-        body, root_id = _turn_dot_lines(tr, turn_lbl)
-        if not body:
-            continue
-        any_span = True
-        lines += body
-        # Dashed link from the previous turn's root into this one's, so turns read
-        # in order without forcing them into one rigid column (constraint=false).
-        if prev_root and root_id:
-            lines.append(f'  "{prev_root}" -> "{root_id}" '
-                         f'[style=dashed, color="{LINE}", constraint=false];')
-        if root_id:
-            prev_root = root_id
-
-    lines.append("}")
-    return "\n".join(lines) if any_span else ""
 
 
 # ---------------------------------------------------------------------------
@@ -2477,9 +2659,9 @@ if cpu_df.empty and gpu_df.empty:
     )
     st.stop()
 
-(tab_overview, tab_separate, tab_efficiency, tab_traces,
+(tab_overview, tab_separate, tab_context_tools, tab_traces,
  tab_analysis) = st.tabs(
-    ["Overview", "CPU / GPU separate", "Efficiency", "Traces", "Analysis"]
+    ["Overview", "CPU / GPU separate", "Context & tools", "Traces", "Analysis"]
 )
 
 with tab_overview:
@@ -2584,8 +2766,8 @@ with tab_separate:
     else:
         _render_graphs()
 
-with tab_efficiency:
-    st.subheader("Agent efficiency")
+with tab_context_tools:
+    st.subheader("Context & tools")
     st.caption(
         "Derived from this session's span trees. Nothing here needs new "
         "instrumentation -- it is arithmetic over telemetry the patched "
@@ -2617,74 +2799,122 @@ with tab_efficiency:
         # each says which it is. A bare mean hides the worst turn, which is the
         # one worth investigating, so the extremum is named alongside.
         section("Context growth per step")
-        # One line per turn: input tokens against step index. The intercept is
-        # the fixed prompt cost (system message + tool schemas); the slope is
-        # what the agent adds to its own context as it works.
-        fig = go.Figure()
-        for i, t in enumerate(per_turn):
-            pts = [stp for stp in (t.get("context_steps") or [])
-                   if stp["input_tokens"] is not None]
-            if len(pts) < 2:
-                continue
-            label = f"Turn {t['turn']}" if t["turn"] is not None else f"Trace {i + 1}"
-            # Label each point with the tool that LLM call asked for -- the jump
-            # to the NEXT point is that tool's result landing in the prompt, so
-            # naming it is what makes a step change explainable. The final call
-            # requests no tool (finish_reason "stop"); mark it as the answer.
-            #
-            # Loop variable is `stp`, not `st`: `st` is the Streamlit module and
-            # shadowing it here breaks every st.* call later in the script.
-            marks, hovers = [], []
-            for stp in pts:
-                tool = stp["tool"] or "final answer"
-                marks.append(tool)
-                delta = (f"+{stp['delta']:,} tok since previous step<br>"
-                         if stp["delta"] is not None else "")
-                hovers.append(
-                    f"<b>{label} · step {stp['step']}</b><br>"
-                    f"{stp['input_tokens']:,} input tokens<br>{delta}"
-                    f"requested: <b>{tool}</b><br>"
-                    f"LLM call: {stp['llm_s']}s, {stp['output_tokens']} output tokens"
+        # One continuous curve for the whole session: input tokens against a
+        # step index that keeps counting across turns, with consecutive turns
+        # bridged. The intercept is the fixed prompt cost (system message + tool
+        # schemas); the slope is what the agent adds to its own context as it
+        # works -- across the session, not just inside one turn.
+        #
+        # These two sit OUTSIDE the fragment because they set its poll timer,
+        # and run_every is fixed when the fragment is declared -- changing them
+        # has to re-run the page for the new timer to take effect. Everything
+        # that does not touch the timer lives inside the fragment instead.
+        _c_live, _c_every, _ = st.columns([1.2, 1, 2])
+        with _c_live:
+            ctx_live = st.toggle(
+                "Live follow", value=False, key="ctx_live",
+                help="Re-poll MLflow for this session and extend the curve as "
+                     "the agent works. A turn's spans reach MLflow when that "
+                     "turn ends, so the curve grows a turn at a time.",
+            )
+        with _c_every:
+            ctx_every = st.number_input(
+                "Refresh (s)", min_value=2, max_value=60, value=5, step=1,
+                key="ctx_every", disabled=not ctx_live,
+                help="How often to poll while Live follow is on.",
+            )
+
+        # The chart lives in a fragment so Live follow reruns ONLY the chart on
+        # its timer. A page-level rerun would also reset st.tabs() back to
+        # Overview every few seconds (the same trap the Analysis poller
+        # documents), which would make live mode unusable.
+        @st.fragment(run_every=(int(ctx_every) if ctx_live else None))
+        def _render_context_growth():
+            # Inside the fragment: moving the window redraws the chart alone,
+            # without re-running the page.
+            _c_window, _ = st.columns([1.6, 2.4])
+            with _c_window:
+                ctx_window = st.slider(
+                    "Steps in view", min_value=10, max_value=200, value=40,
+                    step=5, key="ctx_window",
+                    help="Width of the moving window. Once the session has more "
+                         "steps than this the chart follows the newest ones; "
+                         "drag on the chart itself to pan back to earlier steps.",
                 )
-            fig.add_trace(go.Scatter(
-                x=[stp["step"] for stp in pts],
-                y=[stp["input_tokens"] for stp in pts],
-                name=label, mode="lines+markers+text",
-                line=dict(width=2), marker=dict(size=8),
-                text=marks, textposition="top center",
-                textfont=dict(size=10, color=SUBINK),
-                hovertext=hovers, hoverinfo="text", cliponaxis=False,
-            ))
-        if fig.data:
-            fig.update_layout(
-                title="Input tokens at each agent step",
-                xaxis=dict(title="Agent step", dtick=1),
-                yaxis=dict(title="Input tokens"),
-                height=400,
-            )
-            st.plotly_chart(style_figure(fig), width="stretch")
-            st.caption(
-                "Each point is labelled with the tool that LLM call requested, "
-                "so the rise to the next point is that tool's result landing in "
-                "the prompt. Hover for the exact token delta. The y-intercept is "
-                "fixed overhead paid on every call (system prompt plus tool "
-                "schemas); the slope is context the agent accumulates as it works."
-            )
-        else:
-            st.info(
-                "Context growth needs at least two LLM calls in a turn; this "
-                "session's turns are all single-step."
-            )
+
+            turns_now, poll_err = per_turn, ""
+            if ctx_live:
+                traces_now, poll_err = poll_live_traces(
+                    tracking_uri, sess_id, info.get("experiment_id"))
+                if traces_now:
+                    fresh = compute_session_metrics(traces_now)
+                    turns_now = fresh.get("per_turn", per_turn)
+                    # Keep the rest of the page in step: the tables below this
+                    # chart read `metrics` off session_state, so they catch up
+                    # on the next rerun instead of contradicting the curve.
+                    _data["full_traces"] = traces_now
+                    _data["metrics"] = fresh
+                    _data["turn_count"] = fresh.get("turns", 0)
+
+            points = context_growth_points(turns_now)
+            if len(points) < 2:
+                st.info(
+                    "Context growth needs at least two LLM calls in the "
+                    "session; only one has been recorded so far."
+                )
+            else:
+                st.plotly_chart(
+                    style_figure(build_context_growth_figure(
+                        points, window=int(ctx_window))),
+                    width="stretch",
+                )
+                turn_n = len({p["turn"] for p in points})
+                # Only describe the turn bridges when there is more than one
+                # turn to bridge.
+                across = (
+                    "The x axis runs continuously across turns: turn 2's first "
+                    "step follows turn 1's last, and the dotted segment between "
+                    "them is the context carried into the new turn. "
+                    if turn_n > 1 else
+                    "The x axis will keep counting into turn 2 rather than "
+                    "restarting, so the whole session reads as one curve. "
+                )
+                st.caption(
+                    f"{len(points)} agent steps across {turn_n} turn(s). "
+                    + across +
+                    "Hover any point for the turn it belongs to, its step "
+                    "within that turn, the exact token delta, and the tool that "
+                    "call requested -- the rise to the next point is that "
+                    "tool's result landing in the prompt. The y-intercept is "
+                    "fixed overhead paid on every call (system prompt plus tool "
+                    "schemas); the slope is context the agent accumulates as it "
+                    "works."
+                )
+            if ctx_live:
+                stamp = datetime.now().strftime("%H:%M:%S")
+                if poll_err:
+                    st.caption(f"Live follow at {stamp} - MLflow poll: {poll_err}")
+                else:
+                    st.caption(
+                        f"Live follow on - polled at {stamp}, every "
+                        f"{int(ctx_every)}s. New turns extend the curve as they "
+                        "finish."
+                    )
+
+        _render_context_growth()
 
         section("Per-turn breakdown")
         rows = []
-        for i, t in enumerate(per_turn):
+        # Wall-clock order and the same 1..N numbering the curve above uses, so
+        # table row N is the curve's turn N. Not the agent's own
+        # hermes.turn.number: it restarts after a `--resume`, which printed this
+        # column as 1,1,2,3,4,5,6,1,2 for a single session.
+        for i, t in enumerate(_ordered_turn_metrics(per_turn)):
             rows.append({
-                "turn": t["turn"] if t["turn"] is not None else f"?{i + 1}",
+                "turn": i + 1,
                 "wall_s": round(t["wall_s"], 2) if t["wall_s"] else None,
                 "steps": t["agent_steps"],
                 "time_to_first_tool_s": t["time_to_first_tool_s"],
-                "ttft_pct_of_turn": t["time_to_first_tool_pct"],
                 "first_tool": t["first_tool_name"],
                 "ctx_first": t["context_first"],
                 "ctx_last": t["context_last"],
@@ -2694,13 +2924,7 @@ with tab_efficiency:
         tdf = pd.DataFrame(rows)
         tdf.index = range(1, len(tdf) + 1)
         show_left_table(tdf)
-        st.caption(
-            "`first_tool` is listed next to the timing on purpose. A metadata "
-            "call like `tool_describe` counts as the first tool while taking "
-            "~10 ms, so it can hide the real wait before the tool that does the "
-            "work. If `first_tool` is an introspection call, treat the number "
-            "as a floor."
-        )
+    
 
         section("Tool outcomes")
         if metrics.get("hidden_failure_turns", 0):
@@ -2747,13 +2971,7 @@ with tab_efficiency:
                 for f in metrics["failed_calls"]])
             fdf.index = range(1, len(fdf) + 1)
             show_left_table(fdf)
-            st.caption(
-                "`at_s` is the offset from the start of that turn, so you can "
-                "find the call in the Overview waterfall. `error` is the last "
-                "line of the failure -- for a traceback that is the exception "
-                "itself. Repeated entries for the same tool usually mean the "
-                "agent retried without changing its approach."
-            )
+    
 
         with st.expander("What these four metrics mean", expanded=False):
             st.markdown(
@@ -2955,36 +3173,6 @@ with tab_analysis:
 
     result = st.session_state.get("analysis_result")
     if result:
-        # Session flow diagram, shown together with the report - only once hermes
-        # has actually finished, not immediately when the tab opens. Built from
-        # the loaded MLflow traces, so it needs no data from the hermes run itself.
-        if loaded_full_traces:
-            section("Session flow")
-            _turns = ordered_turns(loaded_full_traces)
-            if not _turns:
-                st.info("No spans found in this session's traces to diagram.")
-            else:
-                _opts = ["All turns"] + [f"Turn {lbl}" for lbl, _ in _turns]
-                _scope = st.selectbox(
-                    "Diagram scope", _opts, index=0,
-                    help="Draw the whole session in one graph, or pick a single "
-                         "turn to focus on it.",
-                    key="flow_diagram_scope",
-                )
-                if _scope == "All turns":
-                    flow_dot = build_session_flowchart(loaded_full_traces)
-                else:
-                    _sel = _scope[len("Turn "):]
-                    _tr = next((tr for lbl, tr in _turns if lbl == _sel), None)
-                    flow_dot = build_turn_flowchart(_tr, _sel) if _tr is not None else ""
-                if flow_dot:
-                    # The DOT `size` cap (see _dot_header) already zooms the graph
-                    # down to fit, so use_container_width=False keeps that
-                    # absolute size instead of restretching it.
-                    st.graphviz_chart(flow_dot, use_container_width=False)
-                else:
-                    st.info("No spans found for this selection to diagram.")
-
         if result["ok"]:
             st.markdown(result["text"])
         else:
