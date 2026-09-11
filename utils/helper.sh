@@ -933,8 +933,8 @@ fi
 
 echo -e "\n========================================================================="
 echo "[OK] Setup complete."
-echo "  vLLM endpoint (API):  http://${SYSTEM_IP}:$VLLM_HERMES_PORT"
-echo "  Kokoro TTS (API):     http://${SYSTEM_IP}:$KOKORO_PORT"
+echo "  vLLM endpoint (API):  $(service_url "$VLLM_HERMES_PORT")v1"
+echo "  Kokoro TTS (API):     $(service_url "$KOKORO_PORT")"
 echo "  MLflow tracking:      $(service_url 5004)"
 echo "  Grafana (CPU/GPU):    $(service_url 3000)"
 echo "  Telemetry dashboard:  $(service_url 8501)"
