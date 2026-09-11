@@ -2432,12 +2432,16 @@ def session_overview_figure(session_id=None, ip="127.0.0.1", port="5004",
     uri = build_tracking_uri(ip, port)
 
     if not session_id:
+        fetch_session_ids.clear()
         ids = fetch_session_ids(uri)
         if not ids:
             raise RuntimeError(f"No sessions found on the MLflow server at {uri}.")
         session_id = ids[0]
     if verbose:
         print(f"Session: {session_id}")
+
+    for _cache in (resolve_run, fetch_session_traces, fetch_full_traces):
+        _cache.clear()
 
     info = resolve_run(uri, session_id)
     if not info:
@@ -2510,6 +2514,7 @@ def session_detail_links(session_id=None, ip="127.0.0.1", port="5004",
 
     uri = build_tracking_uri(ip, port)
     if not session_id:
+        fetch_session_ids.clear()
         ids = fetch_session_ids(uri)
         session_id = ids[0] if ids else None
     info = resolve_run(uri, session_id) if session_id else None
@@ -2558,6 +2563,7 @@ def show_session_overview(session_id=None, ip="127.0.0.1", port="5004",
 
     uri = build_tracking_uri(ip, port)
     if not session_id:
+        fetch_session_ids.clear()
         ids = fetch_session_ids(uri)
         if not ids:
             raise RuntimeError(f"No sessions found on the MLflow server at {uri}.")
