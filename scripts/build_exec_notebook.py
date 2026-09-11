@@ -2,18 +2,16 @@
 """
 Rebuild tts_executed.ipynb = the current tts.ipynb, with executed outputs.
 
-Alignment strategy (no fabrication):
-  * STRUCTURE comes wholesale from tts.ipynb, so prose, images, captions and
-    ordering always match the canonical notebook.
-  * OUTPUTS are REAL. They are matched to code cells by exact source text:
-      - Cells whose source is unchanged keep the genuine outputs captured on the
-        MI300X workshop machine (carried over from the previous executed
-        notebook).
-      - The Matplotlib chart cell is re-executed locally right here, because it
-        is pure presentation and needs no GPU, so its output is freshly real.
-  * Any code cell with no genuine matching output is left UNEXECUTED rather than
-    given an invented one. The script reports exactly which, so the gap is
-    visible instead of hidden.
+Alignment strategy:
+  * Structure comes from tts.ipynb, so prose, images, captions and ordering match
+    the canonical notebook.
+  * Outputs are matched to code cells by exact source text:
+      - Cells whose source is unchanged keep their captured outputs from
+        captured_outputs.json.
+      - The Matplotlib chart cell is re-executed locally, since it is pure
+        presentation and needs no GPU.
+  * A code cell with no matching captured output is left unexecuted, and the
+    script reports which ones.
 
 Run:  python scripts/build_exec_notebook.py
 """
@@ -30,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 NB = os.path.join(ROOT, "tts.ipynb")
 EXEC_NB = os.path.join(ROOT, "tts_executed.ipynb")
-# Genuine captured outputs from the workshop machine.
+# Captured code-cell outputs, matched to cells by exact source text.
 CAPTURED = os.path.join(HERE, "captured_outputs.json")
 
 
@@ -60,7 +58,7 @@ def run_chart_cell(source):
     workdir = tempfile.mkdtemp()
     runner = os.path.join(workdir, "_run.py")
     png_out = os.path.join(workdir, "chart.png")
-    with open(runner, "w") as f:
+    with open(runner, "w", encoding="utf-8") as f:
         f.write(
             "import matplotlib\nmatplotlib.use('Agg')\n"
             + source
@@ -77,9 +75,9 @@ def run_chart_cell(source):
 
 
 def main():
-    with open(NB) as f:
+    with open(NB, encoding="utf-8") as f:
         nb = json.load(f)
-    with open(CAPTURED) as f:
+    with open(CAPTURED, encoding="utf-8") as f:
         captured = json.load(f)   # {source_text: [output, ...]}
 
     out_nb = copy.deepcopy(nb)
@@ -134,7 +132,7 @@ def main():
             cell["outputs"] = []
             report.append(("NO OUTPUT      ", s[:55]))
 
-    with open(EXEC_NB, "w") as f:
+    with open(EXEC_NB, "w", encoding="utf-8") as f:
         json.dump(out_nb, f, indent=1, ensure_ascii=False)
         f.write("\n")
 

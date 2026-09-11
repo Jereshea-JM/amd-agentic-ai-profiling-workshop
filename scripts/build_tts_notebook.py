@@ -2,17 +2,11 @@
 """
 Regenerate tts.ipynb for the AMD Agentic AI Profiling Workshop.
 
-Design decisions (see illustrated-notebook-authoring skill):
-  * The notebook is GENERATED from this script so it is reproducible and diffable.
+The notebook is generated from this script so it stays reproducible and diffable:
   * Backend-driving code cells (the `!hermes ...` calls and the dashboard-link
-    helper) are reused BYTE-IDENTICAL from the committed notebook via orig(),
-    so improving the prose can never change what the workshop actually runs.
-    The only code cell rewritten is the pure-presentation matplotlib chart,
-    which is AMD-branded here.
-  * The repo is PRIVATE, so every image is embedded as an inline base64 data URI
-    (relative-path refs render broken on GitHub for private repos). Bytes and
-    reference live in one string, so they cannot desync.
-  * Every image carries descriptive alt text (accessibility) and an italic caption.
+    helper) are reused verbatim from the source notebooks via orig() / orig_exec().
+  * The matplotlib chart cell is rewritten here with AMD branding.
+  * Images are embedded as inline base64 data URIs, each with alt text and a caption.
 
 Run:  python scripts/build_tts_notebook.py
 """
@@ -26,11 +20,9 @@ NB_PATH = os.path.join(ROOT, "tts.ipynb")
 DIAGRAMS = os.path.join(ROOT, "assets", "diagrams")
 OUTPUTS = os.path.join(ROOT, "assets", "outputs")
 
-# The pristine committed notebook is the parity SOURCE for reused code cells.
-# It is snapshotted separately so re-running this generator (which overwrites
-# NB_PATH) never remaps the orig() indices onto our own output.
+# Source notebook for cells reused unchanged via orig().
 SOURCE_NB = os.path.join(HERE, "tts_original.ipynb")
-with open(SOURCE_NB) as f:
+with open(SOURCE_NB, encoding="utf-8") as f:
     ORIG = json.load(f)
 
 
@@ -39,17 +31,9 @@ def orig(idx):
     return ORIG["cells"][idx]["source"]
 
 
-# Some cells are taken from the EXECUTED workshop notebook instead of the
-# upstream one, when the executed variant is the prompt that actually has a
-# genuine captured output. Keeping the prompt and its real output tied to the
-# same source of truth means they cannot drift apart.
-#
-# This snapshot is the MI300X run captured on 2026-08-21 (PR #4). Every code
-# cell below that drives the backend is sourced from it, so the prompts the
-# workshop runs, the outputs tts_executed.ipynb shows, and the timings quoted
-# in the chart all describe ONE real session rather than three different ones.
+# Source notebook for cells taken from the executed run, reused via orig_exec().
 EXEC_SNAPSHOT = os.path.join(HERE, "tts_exec_source.ipynb")
-with open(EXEC_SNAPSHOT) as f:
+with open(EXEC_SNAPSHOT, encoding="utf-8") as f:
     ORIG_EXEC = json.load(f)
 
 
@@ -93,6 +77,38 @@ def img(name, alt, caption, width="88%", subdir="diagrams"):
             f'src="data:image/png;base64,{data}" width="{width}">\n</p>\n\n'
             f'<p align="center"><sub><i>{caption}</i></sub></p>')
     md(html)
+
+
+# Overview cells shown after each profiling run. The Step 2 cell exposes the
+# link-base dropdown and sets HERMES_PROXY_BASE; the kokoro cells reuse it.
+_OVERVIEW_EDGE = '''# Overview graph + two "detailed view" links, with a dropdown to choose where the
+# links point. Reuses hermes_profiler.py (its Streamlit UI is guarded, so importing
+# it here runs only its functions).
+import importlib, sys, os, logging
+sys.path.insert(0, os.path.abspath("utils"))
+logging.disable(logging.WARNING)          # mute Streamlit's import-time warnings
+import hermes_profiler
+importlib.reload(hermes_profiler)          # pick up edits without a kernel restart
+logging.disable(logging.NOTSET)
+
+# Pick the link base in the dropdown below (default: AMD hosted proxy). Choose
+# "Local - 127.0.0.1" for direct links, or "Custom" to type your own base
+# ("" = 127.0.0.1, "10.0.0.5" = that host, "https://my-proxy" = a proxy). Your
+# choice is saved to HERMES_PROXY_BASE, so the sequential and batched Kokoro
+# approaches shown in the upcoming cells reuse it.
+SESSION_ID = None   # a run id, or None to auto-fetch the latest session
+hermes_profiler.overview_selector(SESSION_ID)'''
+
+_OVERVIEW_RUN = '''# Overview graph + two "detailed view" links for the run above (its own session).
+# Reuses the HERMES_PROXY_BASE you set in the Step 2 cell (run that cell first).
+import importlib, sys, os, logging
+sys.path.insert(0, os.path.abspath("utils"))
+logging.disable(logging.WARNING)
+import hermes_profiler
+importlib.reload(hermes_profiler)
+logging.disable(logging.NOTSET)
+
+hermes_profiler.show_session_overview()   # None -> newest session (the run above)'''
 
 
 # =============================================================================
@@ -200,89 +216,33 @@ amd-smi
 > **Note.** For ROCm 6.4 and earlier, use `rocm-smi` instead.
 
 **vLLM ROCm image.** The agent's model is served with vLLM, using AMD's prebuilt
-`vllm/vllm-openai-rocm:nightly` image as the base. Muse-Glimmer-30B support is not
-yet in a released vLLM, so on the first run `utils/helper.sh` overlays the vLLM code from
-[pull request #51655](https://github.com/vllm-project/vllm/pull/51655) (a
-Python-only change that adds Muse-Glimmer) onto the nightly image and commits the
-result as a local image, `vllm-muse-glimmer:rocm`, which then serves the model.
-This build runs automatically and only once. AMD also provides other prebuilt ROCm
-images (PyTorch, Ubuntu 22.04 / 24.04) you can reuse for ROCm work.
+`vllm/vllm-openai-rocm:v0.28.0` release image, which includes Muse-Glimmer-30B
+support. AMD also provides other prebuilt ROCm images (PyTorch, Ubuntu 22.04 /
+24.04) you can reuse for ROCm work.
 
 **Python 3.12** (with `venv` and `pip`) runs the Kokoro server, MLflow, and this
 notebook.
 """
 )
 
-# ---- 2. Before you begin ----------------------------------------------------
-md(
-"""---
-
-## Before you begin
-
-A single script starts everything for you. Open a **separate terminal** and run:
-
-```bash
-bash utils/helper.sh
-```
-
-Leave that terminal open for the whole tutorial. The script starts the services and
-then stays alive to keep them running. If you close it, the backend shuts down.
-
-> **Run this in a separate terminal, not in a notebook cell.** The script runs
-> continuously, so a notebook cell would sit blocked and never finish.
-"""
-)
-
-# Upstream tts-aug18 added two screenshots showing how to open a terminal from
-# JupyterLab, because attendees kept trying to run helper.sh in a notebook cell.
-# Upstream embedded them with `attachment:` references, which only resolve when
-# the notebook carries matching attachment blobs and silently render as broken
-# alt text otherwise. We inline them as base64 data URIs, the same convention as
-# every other image here, and tuck them in a <details> so the flow stays clean.
-md(
-"""<details>
-<summary><b>New to JupyterLab? How to open a terminal</b></summary>
-
-<br>
-
-<b>1.</b> In the JupyterLab tab bar, click the <b>+</b> button to open the Launcher.
-
-<p align="center">
-<img alt="JupyterLab with tts.ipynb open. The plus button in the tab bar, which
-opens the Launcher, is highlighted." src="data:image/png;base64,"""
-+ _b64(os.path.join(ROOT, "assets", "images", "terminal_guide_1.png")) +
-"""" width="88%">
-</p>
-
-<b>2.</b> In the Launcher, under <b>Other</b>, click the <b>Terminal</b> tile. Then
-run <code>bash utils/helper.sh</code> in the terminal that opens.
-
-<p align="center">
-<img alt="The JupyterLab Launcher. Under the Other heading, the Terminal tile is
-highlighted." src="data:image/png;base64,"""
-+ _b64(os.path.join(ROOT, "assets", "images", "terminal_guide_2.png")) +
-"""" width="88%">
-</p>
-
-</details>
-"""
-)
-
 # ---- 3. What utils/helper.sh does -------------------------------------------------
 md(
-"""## What `utils/helper.sh` starts
+"""## What `utils/helper.sh` sets up
 
-You do not need to configure anything by hand. `utils/helper.sh` launches the full
-backend so you can focus entirely on profiling instead of installation.
+The backend is already running: `utils/helper.sh` (which you start per the README, or
+which the container image runs automatically) handles the whole setup. It installs the
+dependencies, starts the services below, and configures the `hermes-otel` plugin for
+fine-grained profiling (a 100 ms CPU/GPU sampling interval, much finer than the
+plugin's default, so the timelines can resolve per-tool activity).
 """
 )
 
 img("02_architecture.png",
     "Architecture of the backend that utils/helper.sh starts: the Hermes Agent runtime "
     "(vLLM, Muse-Glimmer-30B) calls the Kokoro TTS server on the MI300X; "
-    "hermes-otel instruments the run and records to the MLflow tracking server; "
-    "the Streamlit telemetry dashboard reads MLflow and the Kokoro server to show "
-    "one clear view.",
+    "hermes-otel sends execution traces to the MLflow tracking server and CPU/GPU "
+    "metrics to Grafana otel-lgtm; the Streamlit telemetry dashboard reads traces "
+    "from MLflow and metrics from otel-lgtm to show one clear view.",
     "One command brings up the whole observability stack.",
     width="94%")
 
@@ -292,20 +252,19 @@ md(
 | Service | Role |
 | :--- | :--- |
 | **Hermes backend** (vLLM &middot; Muse-Glimmer-30B) | The agent's "brain": the model that plans and picks tools. |
-| **Hermes OTel** (patched) | The plugin that emits the OpenTelemetry traces MLflow visualizes. We patch it because the stock plugin shows *which* tool ran and in what order, but not *how much* CPU/GPU that tool or LLM call used. Our patch polls `psutil` for the CPU% of the Hermes process and its children (vLLM runs in its own container and is intentionally excluded), and scrapes the AMD Device Metrics Exporter for GPU utilization, both every 0.1 seconds. |
-| **MLflow tracking server** | Records every run, including timings and hardware metrics. |
-| **Telemetry dashboard** | A custom Streamlit page that gives a clean overview of the telemetry by pulling detail from MLflow. |
+| **Hermes OTel** | The plugin that instruments the agent. `utils/helper.sh` writes its config file with two OpenTelemetry backends: it sends execution **traces** (spans, timings, tokens) to the MLflow tracking server, and hardware **metrics** to Grafana `otel-lgtm`. `utils/helper.sh` sets it to sample `psutil` (CPU) and `amdsmi` (GPU) every 100 ms (much finer than the plugin's default), so the timelines have the resolution to see per-tool activity. |
+| **MLflow tracking server** | Stores the execution **traces** the dashboard visualizes. |
+| **Grafana `otel-lgtm`** | Receives the CPU/GPU **metrics** over OTLP and stores them (Prometheus), which the dashboard queries for the utilization timelines: system-wide GPU%, the Hermes process (plus children) CPU%, and per-tool CPU/GPU%. |
+| **Telemetry dashboard** | A custom Streamlit page that reads traces from MLflow and metrics from `otel-lgtm` to give one clear view of each run. |
 | **Kokoro TTS server** | The local TTS engine used here as a faster, self-hosted alternative to the default cloud (Edge) TTS provider, avoiding the network round-trip and per-request cost. |
-| **Supporting services** | GPU metrics collection and the other pieces Hermes needs. |
 
 > **About the model.** **Muse-Glimmer-30B** is a dense vision-language model built
 > for agentic work: a 52-layer text decoder (hidden size 6656) plus a ~1.8B
 > ViT-G/14 perception encoder, 128K trained context, BF16. Apache 2.0, knowledge
 > cutoff January 4 2026, trained on 100+ languages.
 
-When the script finishes starting up, it prints a set of URLs in that terminal. We
-use those URLs in this notebook to visualize the telemetry, so keep the terminal
-visible.
+The cells further down in this notebook visualize this telemetry directly, reading
+the traces from MLflow and the CPU/GPU metrics from `otel-lgtm`.
 """
 )
 
@@ -328,16 +287,10 @@ this notebook's environment. The cell below adds the usual install locations to
 > from the same environment.
 """
 )
-# NOTE: this code cell is NOT taken byte-identical from orig(5) any more. Upstream
-# tts-aug18 added the PATH fix-up above the `which` call because the kernel does
-# not inherit the login shell's PATH. That is a real functional fix, so it is
-# reproduced here rather than reused from the pristine snapshot.
-#
-# Corrected after a real MI300X run on 2026-08-20: upstream only added
-# ~/.local/bin, but on the workshop image `hermes` actually resolves from
-# /usr/local/bin. The cell passed there by luck (the kernel already inherited
-# /usr/local/bin), and would have printed nothing on any kernel that did not.
-# Both locations are now added explicitly.
+# This cell adds a PATH fix-up above the `which` call because a JupyterLab kernel
+# does not always inherit the login shell's PATH. Both /usr/local/bin (container /
+# root installs) and ~/.local/bin (per-user pip installs) are added explicitly,
+# since `hermes` can resolve from either depending on how it was installed.
 code(
 """import os
 
@@ -365,9 +318,8 @@ synthesize. In the cell below we let Hermes itself write the input passage and s
 it to `input_text.txt`, which is then passed to the TTS tool.
 """
 )
-# The input-passage prompt from the 2026-08-21 MI300X run (~8,450 characters).
-# A longer passage than the earlier 4,000-character variant, chosen because it
-# makes the batching win later in the notebook far more visible.
+# The input-passage prompt (~8,450 characters). A longer passage makes the
+# batching improvement later in the notebook more visible.
 code(orig_exec(11))
 
 md(
@@ -390,11 +342,10 @@ The command below asks the agent to read the generated `input_text.txt` and spea
 it.
 """
 )
-# Edge TTS baseline, from the 2026-08-21 MI300X run. This is the terser prompt
-# ("convert the text and save the audio") rather than a step-by-step one. It is
-# deliberate: leaving the agent to work out HOW is what produces the messy,
-# repeated tool calls the "Edge TTS observations" section below discusses, which
-# is the behaviour this step exists to demonstrate.
+# Edge TTS baseline. The terser prompt ("convert the text and save the audio")
+# is deliberate: leaving the agent to work out how is what produces the repeated
+# tool calls the "Edge TTS observations" section below discusses, which is the
+# behaviour this step exists to demonstrate.
 code(orig_exec(14))
 
 # ---- 7. Step 2: Profiling ---------------------------------------------------
@@ -411,9 +362,10 @@ md(
 [hermes-otel] Registered 13 hooks
 ```
 
-This appears because `utils/helper.sh` connects the stock-plus-patched hermes-otel plugin
-directly to the MLflow server, so all profiled telemetry is recorded in MLflow. The
-telemetry dashboard in the next section is built on these same traces.
+This appears because `utils/helper.sh` configures the hermes-otel plugin to send this
+session's execution **traces** to the MLflow server (its CPU/GPU **metrics** go to
+Grafana `otel-lgtm` separately). The telemetry dashboard in the next section reads
+both: traces from MLflow and metrics from `otel-lgtm`.
 
 The three steps below open the raw MLflow interface. Skip them if you only want the
 high-level overview the dashboard gives you.
@@ -452,12 +404,9 @@ server address and gives you a direct link.
    the length of the traces this can take around five minutes.
 """
 )
-# Upstream tts-aug18 changed this cell's single link from localhost to
-# f"http://{system_ip}:8501/". That is right for an attendee on a remote MI300X
-# box, but it BREAKS the SSH-port-forward and container paths that our README
-# documents, where only localhost resolves. Rather than trade one broken case
-# for another, we print BOTH and say which is which. system_ip was already being
-# computed and then thrown away in the original cell.
+# This cell prints both the localhost link (for the SSH-port-forward and
+# container paths, where only localhost resolves) and the server-IP link (for an
+# attendee hitting a remote box directly), and labels which is which.
 code(
 '''import socket
 from IPython.display import display, Markdown
@@ -501,6 +450,7 @@ else:
           "use the localhost link or your known server address.")
 '''
 )
+code(_OVERVIEW_EDGE)
 
 # ---- 8. Step 3: Analyzing the logs -----------------------------------------
 md(
@@ -511,8 +461,8 @@ md(
 After each Hermes execution, review the telemetry to understand where time was
 spent and which tool drove the latency. Here is how the pieces fit together:
 
-- Every Hermes run is recorded as a **session** with a unique session id and logged
-  to MLflow with its timings and hardware metrics.
+- Every Hermes run is recorded as a **session** with a unique session id: its
+  execution traces are logged to MLflow and its CPU/GPU metrics to `otel-lgtm`.
 - In the dashboard, click **Fetch** to load the recorded runs. The **most recent
   run appears at the top**, followed by older ones.
 - **Select** the run you want (usually the latest), then click **Load / Reload**.
@@ -547,8 +497,9 @@ md(
 
 <br>
 
-These diagnostics come directly from the MLflow trace. The dashboard parses the raw
-OTLP trace JSONs and compiles them into a clean, human-readable summary.
+The dashboard builds this view from two sources: the session's spans come from the
+MLflow traces, and the CPU/GPU timeline is queried from the metrics stored in
+`otel-lgtm` (Prometheus). It compiles both into one human-readable summary.
 
 </details>
 """
@@ -623,12 +574,11 @@ message to explain why. The cell locates the real package and verifies the tool
 registers, rather than assuming the copy worked.
 """
 )
-# Ported from upstream tts-aug18, which added a %%bash cell that copies the tool
-# into $HOME/.hermes/hermes-agent/tools. That hard-coded path is wrong in the
-# container image, where Hermes installs to /usr/local/lib/hermes-agent (a trap
-# already documented in utils/Dockerfile). This version resolves the tools
-# package for both layouts and asserts registration instead of printing [OK] on
-# a bare `cp`.
+# A %%bash cell that copies the custom tool into the Hermes tools package. It
+# resolves the package for both layouts - a per-user install
+# ($HOME/.hermes/hermes-agent/tools) and the container image
+# (/usr/local/lib/hermes-agent/tools) - and asserts the tool registers rather
+# than trusting a bare `cp`.
 code(
 '''%%bash
 set -uo pipefail
@@ -641,9 +591,8 @@ fi
 
 # Resolve the Hermes installation, whichever layout this machine uses:
 # a per-user install (~/.hermes/hermes-agent) or a system one (/usr/local).
-# Require BOTH tools/ and venv/bin/python: the verification step below runs
-# that interpreter, so a root with tools/ but no venv/ would be selected here
-# and then fail on the next command with a confusing "no such file" error.
+# Require both tools/ and venv/bin/python, since the verification step below
+# runs that interpreter.
 HERMES_ROOT=""
 for cand in "$HOME/.hermes/hermes-agent" /usr/local/lib/hermes-agent; do
     if [ -x "$cand/venv/bin/python" ] && [ -d "$cand/tools" ]; then
@@ -662,8 +611,7 @@ echo "[INFO] Deploying custom Kokoro TTS tool to $HERMES_ROOT/tools ..."
 cp "$SRC" "$HERMES_ROOT/tools/"
 echo "[OK] Copied kokoro_tts_tool.py -> $HERMES_ROOT/tools/"
 
-# Prove the tool actually registers. A successful copy is not proof the agent
-# can call it.
+# Verify the tool registers, not just that the file copied.
 "$HERMES_ROOT/venv/bin/python" -c "
 import sys; sys.path.insert(0, '$HERMES_ROOT')
 from tools.registry import registry
@@ -692,6 +640,7 @@ The tool is defined in `custom_tools/kokoro_tts_tool.py` and backed by
 """
 )
 code(orig_exec(26))
+code(_OVERVIEW_RUN)
 
 md(
 """### How `kokoro_tts` works, and why the first run is slow
@@ -749,6 +698,7 @@ compare.
 """
 )
 code(orig_exec(32))
+code(_OVERVIEW_RUN)
 
 md(
 """Load this run in the dashboard the same way as before: click **Fetch**, select
@@ -815,12 +765,11 @@ three approaches side by side, so the cloud-to-local move and the
 sequential-to-batched optimization show up in a single view.
 
 > **Use your own numbers.** `edge_time`, `seq_time` and `batched_time` are
-> pre-filled with the values measured on the MI300X workshop machine, so the chart
-> renders meaningfully before you run anything. Replace them with the **execution
-> seconds** from your own runs (each tool's output line and the profiling
-> dashboard). Note that for long text Edge **truncates** its output, so its time is
-> shown to give context for the cloud baseline rather than as a like-for-like
-> comparison.
+> pre-filled with example values so the chart renders meaningfully before you run
+> anything. Replace them with the **execution seconds** from your own runs (each
+> tool's output line and the profiling dashboard). Note that for long text Edge
+> **truncates** its output, so its time is shown to give context for the cloud
+> baseline rather than as a like-for-like comparison.
 """
 )
 
@@ -831,11 +780,8 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 # --- Tool execution time (seconds) for each approach ---
-# Defaults are the numbers measured on the MI300X workshop machine on
-# 2026-08-21, for the ~8,450-character passage this notebook generates. They
-# are the same run that tts_executed.ipynb captures. Replace them with the
-# execution seconds from your OWN runs, taken from each tool's output line and
-# the profiling dashboard.
+# Default values; replace them with the execution seconds from your own runs,
+# taken from each tool's output line and the profiling dashboard.
 edge_time = 24.4      # Edge TTS (cloud) - note: truncates long text (~5 min cap)
 seq_time = 106.1      # Kokoro, sequential mode (local, unoptimized)
 batched_time = 9.7    # Kokoro, batched mode (local, optimized)
@@ -1053,7 +999,7 @@ nb = {
     "nbformat_minor": 5,
 }
 
-with open(NB_PATH, "w") as f:
+with open(NB_PATH, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
     f.write("\n")
 

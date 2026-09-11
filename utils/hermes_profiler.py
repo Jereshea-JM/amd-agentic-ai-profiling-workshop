@@ -141,9 +141,8 @@ def style_figure(fig, height=None, axes=True):
     if height:
         fig.update_layout(height=height)
     # Titles read as panel headings rather than chart furniture. Style the title
-    # only when the figure actually HAS one: passing a title dict with no `text`
-    # makes Plotly render the literal string "undefined" on untitled figures
-    # (this bit the span waterfall).
+    # only when the figure actually has one: passing a title dict with no `text`
+    # makes Plotly render the literal string "undefined" on untitled figures.
     existing = getattr(fig.layout.title, "text", None)
     if existing:
         fig.update_layout(
@@ -381,10 +380,15 @@ def section(label: str):
 
 ARTIFACT_DIR = "profiling"
 
-# Downloaded artifacts live under a stable cache dir in $HOME (not the system
-# temp dir) so they sit in one predictable place that a shutdown/cleanup step can
-# purge.
-PROFILING_CACHE_DIR = os.path.join(os.path.expanduser("~"), "profiling_cache")
+# Cache for a session's downloaded/derived artifacts (CPU/GPU CSVs, traces.json).
+# Defaults to profiling_cache/ at the repo root (one level up from this file), so
+# it stays inside the project and the dashboard and notebook resolve to the same
+# path. Override with the HERMES_PROFILING_CACHE_DIR environment variable.
+PROFILING_CACHE_DIR = os.environ.get(
+    "HERMES_PROFILING_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "profiling_cache"),
+)
 
 # Sidebar logo. The file lives at the REPO ROOT (assets/images/), while this
 # module sits in utils/, so a path built only from __file__ + "assets" misses it
@@ -449,14 +453,13 @@ def _search_traces_all_experiments(client: "MlflowClient", max_results: int = 20
 def resolve_run(tracking_uri: str, session_id: str):
     """Find the experiment holding this session's traces, across all experiments.
 
-    hermes-otel's plain OTLP backend never creates an MLflow "run" (no
-    mlflow.start_run()/log_param() anywhere upstream) - a session lives purely
-    as trace_metadata["mlflow.trace.session"] on each trace it sends. So this
-    resolves a session_id by searching TRACES, not runs.
+    hermes-otel's plain OTLP backend does not create an MLflow "run"; a session
+    lives purely as trace_metadata["mlflow.trace.session"] on each trace it
+    sends, so this resolves a session_id by searching traces, not runs.
 
     Returns dict(experiment, experiment_id), or None if no trace has that
-    session_id. There is no run_id/artifact_uri anymore - nothing downloads
-    MLflow artifacts; CPU/GPU comes from Prometheus (see fetch_session_cpu_gpu).
+    session_id. There is no run_id / artifact_uri: nothing downloads MLflow
+    artifacts, and CPU/GPU comes from Prometheus (see fetch_session_cpu_gpu).
     """
     mlflow.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
@@ -549,17 +552,14 @@ def _prom_query_range(
     prom_url: str, metric: str, start: float, end: float, step: float, instance: str = None
 ):
     """Raw Prometheus HTTP API call. Returns the list of series, or [] on any
-    error - one turn's metrics being unavailable (e.g. it predates metrics
-    being enabled) must never break the whole Load.
+    error, so one turn's metrics being unavailable (e.g. it predates metrics
+    being enabled) does not break the whole Load.
 
-    ``instance`` scopes the query to one Hermes process (see
-    _resolve_session_instance). Without it, any OTHER Hermes process
-    reporting the same metric in this time window - e.g. a stale/leftover
-    process left running from earlier testing - gets silently averaged in
-    alongside the real one by _merge_gauge_rows, diluting the numbers
-    (confirmed case: an idle process at 0% GPU averaged a real 100% reading
-    down to 33%, since Prometheus has no session dimension to filter on
-    otherwise)."""
+    ``instance`` scopes the query to one Hermes process. Without it, any other
+    Hermes process reporting the same metric in this time window (for example a
+    stale, idle process) is averaged in alongside the real one by
+    _merge_gauge_rows, diluting the numbers, because Prometheus has no session
+    dimension to filter on otherwise."""
     query = f'{metric}{{instance="{instance}"}}' if instance else metric
     try:
         resp = requests.get(
@@ -577,26 +577,19 @@ def _prom_query_range(
 
 
 def _trace_instance(trace: dict):
-    """The exact Prometheus `instance` label for the Hermes process that
-    produced this trace, read directly off the trace itself - not guessed.
+    """The Prometheus `instance` label for the Hermes process that produced this
+    trace, read directly off the trace itself.
 
-    hermes-otel never sets service.instance.id explicitly (verified against
-    the plugin source: no reference anywhere in the package); it inherits the
-    OpenTelemetry Python SDK's own default Resource behavior, which mints a
-    random UUID once per process (verified directly against the installed
-    SDK: Resource.create() always includes a fresh "service.instance.id").
-    That resource attribute is exported as a *tag* on every trace MLflow
-    stores (info.tags["service.instance.id"]) - the SAME opaque id that
-    becomes Prometheus's `instance` label for every metric that same process
-    exports. So a session's own trace already carries the exact answer to
-    "which Prometheus instance is mine" - confirmed by direct inspection: a
-    real trace's tag matched, character for character, the instance Prometheus
-    was found to be reporting 100% GPU under, while an unrelated idle process
-    (a different instance, left running from earlier testing) was reporting
-    0% at the same timestamps and diluting the naive cross-instance average.
-    Filtering on this exact id removes the dilution with no guessing at all.
-    Returns None if the tag is absent for any reason (caller falls back to an
-    unfiltered query, same as if no instance were known)."""
+    hermes-otel does not set service.instance.id explicitly; it inherits the
+    OpenTelemetry Python SDK's default Resource behavior, which assigns a random
+    UUID once per process (Resource.create() always includes a fresh
+    "service.instance.id"). That resource attribute is exported as a tag on every
+    trace MLflow stores (info.tags["service.instance.id"]) - the same id that
+    becomes Prometheus's `instance` label for every metric that process exports.
+    So a session's own trace already identifies its Prometheus instance, and
+    filtering on it removes the cross-instance dilution described in
+    _prom_query_range. Returns None if the tag is absent, in which case the
+    caller falls back to an unfiltered query."""
     return (trace.get("info", {}) or {}).get("tags", {}).get("service.instance.id")
 
 
@@ -634,6 +627,19 @@ def _merge_gauge_rows(series, scale: float = 100.0, combine: str = "sum"):
     return out
 
 
+def _merge_cpu_by_mode(series, scale: float = 100.0):
+    out = {}
+    for s in series:
+        mode = s["metric"].get("cpu_mode", "")
+        for ts, v in s["values"]:
+            entry = out.setdefault(ts, {"user": 0.0, "system": 0.0, "total": 0.0})
+            fv = float(v) * scale
+            entry["total"] += fv
+            if mode in ("user", "system"):
+                entry[mode] += fv
+    return out
+
+
 def _ts_to_str(ts) -> str:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
@@ -648,13 +654,11 @@ def fetch_turn_cpu_gpu(
     this window gets silently averaged in alongside it."""
     step = _prom_safe_step(end - start, step)
 
-    proc_cpu = _merge_gauge_rows(
-        _prom_query_range(prom_url, "process_cpu_utilization_ratio", start, end, step, instance),
-        combine="sum",
+    proc_cpu = _merge_cpu_by_mode(
+        _prom_query_range(prom_url, "process_cpu_utilization_ratio", start, end, step, instance)
     )
-    sys_cpu = _merge_gauge_rows(
-        _prom_query_range(prom_url, "system_cpu_utilization_ratio", start, end, step, instance),
-        combine="sum",
+    sys_cpu = _merge_cpu_by_mode(
+        _prom_query_range(prom_url, "system_cpu_utilization_ratio", start, end, step, instance)
     )
     gpu_util = _merge_gauge_rows(
         _prom_query_range(prom_url, "hw_gpu_utilization_ratio", start, end, step, instance),
@@ -670,12 +674,16 @@ def fetch_turn_cpu_gpu(
     ))
 
     cpu_hermes_df = pd.DataFrame([
-        {"timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9), "cpu_pct": round(v, 2)}
-        for ts, v in proc_cpu
+        {"timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9),
+         "cpu_pct": round(m["total"], 2), "cpu_user_pct": round(m["user"], 2),
+         "cpu_system_pct": round(m["system"], 2)}
+        for ts, m in sorted(proc_cpu.items())
     ])
     cpu_system_df = pd.DataFrame([
-        {"timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9), "cpu_pct": round(v, 2)}
-        for ts, v in sys_cpu
+        {"timestamp": _ts_to_str(ts), "start_time_unix_nano": int(float(ts) * 1e9),
+         "cpu_pct": round(m["total"], 2), "cpu_user_pct": round(m["user"], 2),
+         "cpu_system_pct": round(m["system"], 2)}
+        for ts, m in sorted(sys_cpu.items())
     ])
     gpu_df = pd.DataFrame([
         {
@@ -696,13 +704,12 @@ def fetch_session_cpu_gpu(prom_url: str, full_traces, step: float = _PROM_MIN_ST
     per-series point limit at fine resolution. Turns whose window returns
     nothing (e.g. they predate metrics being enabled) are skipped, not fatal.
 
-    Every query is scoped to the exact Prometheus instance each trace's own
-    service.instance.id tag names (see _trace_instance) - without this, any
-    OTHER Hermes process reporting in the same time window gets silently
-    averaged in alongside the real one (confirmed case: a stale idle process
-    diluted a real 100% GPU reading down to 33%). Resolved per turn, not once
-    for the whole session, so it stays correct even in the edge case where a
-    session's turns ran under more than one process."""
+    Every query is scoped to the Prometheus instance each trace's own
+    service.instance.id tag names (see _trace_instance); without this, any other
+    Hermes process reporting in the same time window is averaged in alongside the
+    real one. The instance is resolved per turn, not once for the whole session,
+    so it stays correct even when a session's turns ran under more than one
+    process."""
     cpu_hermes_parts, cpu_system_parts, gpu_parts = [], [], []
     for trace in (full_traces or []):
         win = _turn_window(trace)
@@ -2404,19 +2411,262 @@ def ordered_turns(traces):
     return out
 
 
+def session_overview_figure(session_id=None, ip="127.0.0.1", port="5004",
+                            prom_url=None, verbose=True):
+    """Build the Overview span-waterfall + CPU/GPU figure for one session, headless.
+
+    Mirrors the dashboard's Load handler without any Streamlit UI: resolve the
+    session's experiment, fetch its full traces, pull per-turn CPU/GPU from
+    Prometheus, then hand it all to build_session_waterfall_figure. Importing
+    this module does NOT launch the dashboard (the UI below is guarded by
+    _running_under_streamlit), so a notebook can call this directly:
+
+        import hermes_profiler
+        hermes_profiler.session_overview_figure().show()
+
+    session_id=None uses the newest session on the MLflow server, exactly the
+    "Fetch -> newest first" the dashboard's Fetch button does. Returns a Plotly
+    Figure; call .show() on it to render inline.
+    """
+    prom_url = prom_url or os.environ.get("PROM_URL", "http://127.0.0.1:9090")
+    uri = build_tracking_uri(ip, port)
+
+    if not session_id:
+        ids = fetch_session_ids(uri)
+        if not ids:
+            raise RuntimeError(f"No sessions found on the MLflow server at {uri}.")
+        session_id = ids[0]
+    if verbose:
+        print(f"Session: {session_id}")
+
+    info = resolve_run(uri, session_id)
+    if not info:
+        raise RuntimeError(f"No traces found for session_id={session_id!r} at {uri}.")
+
+    summary_df, _err = fetch_session_traces(uri, session_id, info.get("experiment_id"))
+    trace_ids = (
+        tuple(str(t) for t in summary_df["trace_id"].dropna())
+        if not summary_df.empty and "trace_id" in summary_df.columns else ()
+    )
+    full_traces, _ = fetch_full_traces(uri, trace_ids)
+
+    save_traces_json(session_id, full_traces)
+    full_traces = load_traces_json(session_id)
+
+    local_dir = os.path.join(PROFILING_CACHE_DIR, session_id, ARTIFACT_DIR)
+    save_session_cpu_gpu(local_dir, prom_url, full_traces)
+
+    cpu_df = parse_timestamps(read_csv(os.path.join(local_dir, "cpu_hermes_trace.csv")))
+    gpu_df = parse_timestamps(read_csv(os.path.join(local_dir, "gpu_system_wide.csv")))
+    tool_df = parse_timestamps(read_csv(os.path.join(local_dir, "tool_execution.csv")))
+
+    fig = build_session_waterfall_figure(full_traces, cpu_df, gpu_df, tool_df)
+    # The span names are the row-1 y tick labels. The dashboard's tight left
+    # margin (l=10) is fine in its wide layout but clips them in a notebook.
+    # Size the left margin to the longest (monospace) label, ~6.5 px/char, and
+    # also turn on automargin so Plotly can widen it further if needed.
+    labels = fig.layout.yaxis.ticktext or ()
+    maxlen = max((len(str(t)) for t in labels), default=12)
+    m = fig.layout.margin
+    fig.update_layout(margin=dict(l=min(360, max(90, int(maxlen * 6.5) + 24)),
+                                  r=m.r, t=m.t, b=m.b))
+    fig.update_yaxes(automargin=True, row=1, col=1)
+    return fig
+
+
+def session_detail_links(session_id=None, ip="127.0.0.1", port="5004",
+                         dashboard_port=8501, host=None,
+                         proxy_base="https://notebooks.amd.com"):
+    """Markdown with two 'detailed view' links for a session:
+
+      1. the Streamlit telemetry dashboard (port dashboard_port), and
+      2. the MLflow UI trace view for this session's experiment (port port).
+
+    By default builds AMD hosted-notebook proxy links, matching
+    video_generation_workshop.ipynb:
+
+        {proxy_base}/{hostname}/proxy/{service_port}/
+
+    where hostname is socket.gethostname(). The base is one knob (argument, or the
+    HERMES_PROXY_BASE env var which wins) interpreted two ways:
+
+        "https://notebooks.amd.com"  (has "://")  -> proxy: {base}/<hostname>/proxy/<port>/
+        ""                            (empty)      -> direct: http://127.0.0.1:<port>/
+        "10.0.0.5"                    (bare host)  -> direct: http://10.0.0.5:<port>/
+
+    On the AMD hosted platform a direct http://host:port link does not work
+    (127.0.0.1 / the container IP is not reachable from the browser), so the proxy
+    path is the default; use "" when the browser is on the same machine or you
+    SSH-forward the port.
+
+    The MLflow link points at the experiment's Traces PAGE in the MLflow UI, not
+    the OTLP ingest endpoint (/v1/traces), which is not browsable.
+    """
+    # The HERMES_PROXY_BASE env var, when set, overrides the argument so the base
+    # can be chosen once (in one cell or the shell) for every call.
+    env_base = os.environ.get("HERMES_PROXY_BASE")
+    if env_base is not None:
+        proxy_base = env_base
+
+    uri = build_tracking_uri(ip, port)
+    if not session_id:
+        ids = fetch_session_ids(uri)
+        session_id = ids[0] if ids else None
+    info = resolve_run(uri, session_id) if session_id else None
+    exp_id = info.get("experiment_id") if info else None
+    frag = f"#/experiments/{exp_id}/traces" if exp_id else ""
+
+    # One knob, two shapes:
+    #   value WITH "://"  -> a proxy base; build {base}/<hostname>/proxy/<port>/
+    #   value WITHOUT it   -> a direct host ("" means 127.0.0.1); build http://<host>:<port>/
+    if proxy_base and "://" in proxy_base:
+        base = proxy_base.rstrip("/")
+        hostname = socket.gethostname()
+        dash_url = f"{base}/{hostname}/proxy/{dashboard_port}/"
+        mlflow_url = f"{base}/{hostname}/proxy/{port}/{frag}"
+        where = f"the notebook proxy (`{base}/{hostname}/proxy/<port>/`)"
+    else:
+        h = (proxy_base or "").strip() or host or ip
+        dash_url = f"http://{h}:{dashboard_port}/"
+        mlflow_url = f"http://{h}:{port}/{frag}"
+        where = f"`http://{h}:<port>/` directly (no proxy)"
+
+    return (
+        f"**Detailed views for session `{session_id}`:**\n\n"
+        f"1. [Open the telemetry dashboard (Streamlit, port {dashboard_port})]({dash_url}) "
+        f"— then click **Fetch → Load** and select this session.\n"
+        f"2. [Open the MLflow trace view (port {port})]({mlflow_url})\n\n"
+        f"<sub>Links use {where}.</sub>"
+    )
+
+
+def show_session_overview(session_id=None, ip="127.0.0.1", port="5004",
+                          prom_url=None, dashboard_port=8501, host=None,
+                          proxy_base="https://notebooks.amd.com"):
+    """Notebook helper: render the Overview graph, then the two detail links.
+
+    Resolves the session id ONCE (newest when session_id is None) so the graph
+    and the links describe the SAME run. Links default to the AMD notebook proxy
+    (see session_detail_links); pass proxy_base=None for direct host:port links.
+    IPython is imported lazily so importing this module elsewhere never needs it.
+    """
+    import logging
+    for _n in list(logging.root.manager.loggerDict):
+        if _n.startswith("streamlit"):
+            logging.getLogger(_n).setLevel(logging.ERROR)
+    from IPython.display import display, Markdown
+
+    uri = build_tracking_uri(ip, port)
+    if not session_id:
+        ids = fetch_session_ids(uri)
+        if not ids:
+            raise RuntimeError(f"No sessions found on the MLflow server at {uri}.")
+        session_id = ids[0]
+
+    fig = session_overview_figure(session_id, ip=ip, port=port, prom_url=prom_url,
+                                  verbose=False)
+    fig.show()
+    display(Markdown(session_detail_links(session_id, ip=ip, port=port,
+                                          dashboard_port=dashboard_port, host=host,
+                                          proxy_base=proxy_base)))
+
+
+# Preset choices for the link-base dropdown. Each is (label, value); the value is
+# what session_detail_links interprets (has "://" -> proxy, else a direct host,
+# "" -> 127.0.0.1). "__custom__" reveals a free-text box so any base can be typed.
+_PROXY_PRESETS = [
+    ("AMD hosted proxy (notebooks.amd.com)", "https://notebooks.amd.com"),
+    ("Local - 127.0.0.1 direct links", ""),
+    ("Custom (type below)…", "__custom__"),
+]
+
+
+def overview_selector(session_id=None, ip="127.0.0.1", port="5004", prom_url=None,
+                      dashboard_port=8501):
+    """Notebook UI: an editable dropdown to choose where the links point, then the
+    Overview graph + detail links, re-rendered whenever you click the button.
+
+    The dropdown defaults to the AMD hosted proxy and offers 127.0.0.1 plus a
+    Custom option with a text box (type anything: "" for 127.0.0.1, a bare host
+    like "10.0.0.5", or a proxy URL like "https://my-proxy"). The choice is stored
+    in HERMES_PROXY_BASE, so the other overview cells pick it up too.
+
+    Requires ipywidgets. If it is not installed, this transparently falls back to
+    show_session_overview() using whatever HERMES_PROXY_BASE / default is set.
+    """
+    try:
+        import ipywidgets as W
+    except Exception:
+        print("(ipywidgets not installed — showing the overview with the current "
+              "HERMES_PROXY_BASE; `pip install ipywidgets` to get the dropdown.)")
+        return show_session_overview(session_id, ip=ip, port=port, prom_url=prom_url,
+                                     dashboard_port=dashboard_port)
+    from IPython.display import display
+
+    current = os.environ.get("HERMES_PROXY_BASE", "https://notebooks.amd.com")
+    preset_values = [v for _, v in _PROXY_PRESETS if v != "__custom__"]
+    initial = current if current in preset_values else "__custom__"
+
+    dd = W.Dropdown(options=_PROXY_PRESETS, value=initial, description="Link base:",
+                    style={"description_width": "initial"},
+                    layout=W.Layout(width="520px"))
+    custom = W.Text(value=("" if current in preset_values else current),
+                    placeholder='"" = 127.0.0.1  |  "10.0.0.5"  |  "https://my-proxy"',
+                    description="Custom:", style={"description_width": "initial"},
+                    layout=W.Layout(width="520px"))
+    custom.layout.display = "" if initial == "__custom__" else "none"
+    btn = W.Button(description="Show overview", button_style="primary")
+    out = W.Output()
+
+    def _on_dd(_):
+        custom.layout.display = "" if dd.value == "__custom__" else "none"
+
+    def _base():
+        return custom.value.strip() if dd.value == "__custom__" else dd.value
+
+    def _render(_):
+        os.environ["HERMES_PROXY_BASE"] = _base()
+        with out:
+            out.clear_output(wait=True)
+            show_session_overview(session_id, ip=ip, port=port, prom_url=prom_url,
+                                  dashboard_port=dashboard_port)
+
+    dd.observe(_on_dd, names="value")
+    btn.on_click(_render)
+    display(W.VBox([dd, custom, btn]), out)
+    _render(None)   # render once with the initial selection
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
-# A bare hostname like "0" (common inside a container) is noise, so the chip
-# only appears when the host name carries real information.
-_host = socket.gethostname()
-host_chip = (
-    f'<span class="amd-chip">{_host}</span>' if len(_host) > 2 else ""
-)
+def _running_under_streamlit():
+    """True only when launched via `streamlit run`, not on a plain import.
 
-st.markdown(
-    f"""
+    streamlit.runtime.exists() is True only inside a live Streamlit runtime, so
+    importing this module from a notebook kernel skips the dashboard UI below and
+    exposes just the functions above. (A Streamlit server running in another
+    process does not count: exists() is per-process.) Falls back to the __main__
+    check on old Streamlit builds that predate the runtime API.
+    """
+    try:
+        from streamlit.runtime import exists as _st_runtime_exists
+        return _st_runtime_exists()
+    except Exception:
+        return __name__ == "__main__"
+
+
+if _running_under_streamlit():
+    # A bare hostname like "0" (common inside a container) is noise, so the chip
+    # only appears when the host name carries real information.
+    _host = socket.gethostname()
+    host_chip = (
+        f'<span class="amd-chip">{_host}</span>' if len(_host) > 2 else ""
+    )
+
+    st.markdown(
+        f"""
     <div class="amd-hero">
       <div class="amd-hero-title">Hermes <span class="accent">Telemetry</span> Dashboard</div>
       <p class="amd-hero-sub">
@@ -2432,715 +2682,715 @@ st.markdown(
       </div>
     </div>
     """,
-    unsafe_allow_html=True,
-)
-
-with st.sidebar:
-    # AMD branding + telemetry header. Machine name is the host running Streamlit.
-    if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=132)
-    st.markdown("### Agent Telemetry")
-    st.caption(f"{socket.gethostname()} | Hermes Orchestration")
-    st.divider()
-
-    st.header("Connection")
-    ip = st.text_input("MLflow server IP / host", value="127.0.0.1")
-    port = st.text_input("MLflow server port", value="5004")
-    prom_url = st.text_input(
-        "Prometheus URL (CPU/GPU metrics)",
-        value=os.environ.get("PROM_URL", "http://127.0.0.1:9090"),
-        help="Where hermes-otel's host-metrics (CPU/GPU) land as OTel metrics "
-             "(e.g. the Grafana LGTM backend). Traces still come from the "
-             "MLflow server above.",
+        unsafe_allow_html=True,
     )
 
-    # Session ID selector with a Fetch button to its right. The button column is
-    # handled first in code so a fetch updates the list before the selectbox below
-    # reads it (same run, no extra rerun). columns render left→right regardless of
-    # code order, so the button still sits to the right of the box.
-    # 3:1 clipped the Fetch label to "Fetc" in the narrow sidebar; 2:1 plus
-    # width="stretch" on the button keeps the word intact.
-    c_sel, c_btn = st.columns([2, 1], vertical_alignment="bottom")
-    with c_btn:
-        do_fetch = st.button(
-            "Fetch", width="stretch",
-            help="List all session IDs on this MLflow server.",
+    with st.sidebar:
+        # AMD branding + telemetry header. Machine name is the host running Streamlit.
+        if os.path.exists(LOGO_PATH):
+            st.image(LOGO_PATH, width=132)
+        st.markdown("### Agent Telemetry")
+        st.caption(f"{socket.gethostname()} | Hermes Orchestration")
+        st.divider()
+
+        st.header("Connection")
+        ip = st.text_input("MLflow server IP / host", value="127.0.0.1")
+        port = st.text_input("MLflow server port", value="5004")
+        prom_url = st.text_input(
+            "Prometheus URL (CPU/GPU metrics)",
+            value=os.environ.get("PROM_URL", "http://127.0.0.1:9090"),
+            help="Where hermes-otel's host-metrics (CPU/GPU) land as OTel metrics "
+                 "(e.g. the Grafana LGTM backend). Traces still come from the "
+                 "MLflow server above.",
         )
-    if do_fetch:
-        _uri = build_tracking_uri(ip, port)
-        with st.spinner("Fetching session IDs …"):
-            try:
-                fetch_session_ids.clear()
-                st.session_state["session_ids"] = fetch_session_ids(_uri)
-                st.session_state["session_ids_uri"] = _uri
-            except Exception as e:
-                st.session_state["session_ids"] = []
-                st.error(f"Could not fetch sessions from {_uri}: {e}")
 
-    _sids = st.session_state.get("session_ids", [])
-    with c_sel:
-        # One box that is both a dropdown and a text field: pick a fetched session
-        # or type any session id (accept_new_options makes the selectbox editable).
-        session_id = st.selectbox(
-            "Session ID",
-            options=_sids,
-            index=None,
-            accept_new_options=True,
-            placeholder="Select a fetched session or type a Session ID…",
-            help="Pick a session on the server, or type any session ID. "
-                 "Click Fetch to populate the list.",
-        ) or ""
-    if not _sids:
-        st.caption("Click **Fetch** to list session IDs, or just type one in above.")
+        # Session ID selector with a Fetch button to its right. The button column is
+        # handled first in code so a fetch updates the list before the selectbox below
+        # reads it (same run, no extra rerun). columns render left→right regardless of
+        # code order, so the button still sits to the right of the box.
+        # 3:1 clipped the Fetch label to "Fetc" in the narrow sidebar; 2:1 plus
+        # width="stretch" on the button keeps the word intact.
+        c_sel, c_btn = st.columns([2, 1], vertical_alignment="bottom")
+        with c_btn:
+            do_fetch = st.button(
+                "Fetch", width="stretch",
+                help="List all session IDs on this MLflow server.",
+            )
+        if do_fetch:
+            _uri = build_tracking_uri(ip, port)
+            with st.spinner("Fetching session IDs …"):
+                try:
+                    fetch_session_ids.clear()
+                    st.session_state["session_ids"] = fetch_session_ids(_uri)
+                    st.session_state["session_ids_uri"] = _uri
+                except Exception as e:
+                    st.session_state["session_ids"] = []
+                    st.error(f"Could not fetch sessions from {_uri}: {e}")
 
-    load = st.button("Load / Reload", type="primary", width="stretch",
-                     help="Fetch this session's latest run. Click again after "
-                          "running more queries to pull the new data.")
+        _sids = st.session_state.get("session_ids", [])
+        with c_sel:
+            # One box that is both a dropdown and a text field: pick a fetched session
+            # or type any session id (accept_new_options makes the selectbox editable).
+            session_id = st.selectbox(
+                "Session ID",
+                options=_sids,
+                index=None,
+                accept_new_options=True,
+                placeholder="Select a fetched session or type a Session ID…",
+                help="Pick a session on the server, or type any session ID. "
+                     "Click Fetch to populate the list.",
+            ) or ""
+        if not _sids:
+            st.caption("Click **Fetch** to list session IDs, or just type one in above.")
 
-# On Load: fetch everything and stash it in session_state. All rendering below
-# reads from session_state, so later widget clicks (radio, download, tab switch)
-# rerun the script without re-triggering Load or resetting the view.
-if load:
-    if not session_id.strip():
-        st.warning("Please enter a session ID.")
-        st.stop()
+        load = st.button("Load / Reload", type="primary", width="stretch",
+                         help="Fetch this session's latest run. Click again after "
+                              "running more queries to pull the new data.")
 
-    # Fetch everything fresh: drop the @st.cache_data caches BEFORE fetching so a
-    # resumed session's newly-added turns are pulled (and rewritten to the cache
-    # file) on the first Load click, not the second.
-    for _cache in (resolve_run, download_profiling, fetch_session_traces, fetch_full_traces):
-        try:
-            _cache.clear()
-        except Exception:
-            pass
-
-    tracking_uri = build_tracking_uri(ip, port)
-    with st.spinner("Resolving session → experiment …"):
-        try:
-            info = resolve_run(tracking_uri, session_id.strip())
-        except Exception as e:
-            st.error(f"Could not reach MLflow at {tracking_uri}: {e}")
+    # On Load: fetch everything and stash it in session_state. All rendering below
+    # reads from session_state, so later widget clicks (radio, download, tab switch)
+    # rerun the script without re-triggering Load or resetting the view.
+    if load:
+        if not session_id.strip():
+            st.warning("Please enter a session ID.")
             st.stop()
-    if not info:
-        st.error(f"No traces found with session_id = '{session_id}'.")
+
+        # Fetch everything fresh: drop the @st.cache_data caches BEFORE fetching so a
+        # resumed session's newly-added turns are pulled (and rewritten to the cache
+        # file) on the first Load click, not the second.
+        for _cache in (resolve_run, download_profiling, fetch_session_traces, fetch_full_traces):
+            try:
+                _cache.clear()
+            except Exception:
+                pass
+
+        tracking_uri = build_tracking_uri(ip, port)
+        with st.spinner("Resolving session → experiment …"):
+            try:
+                info = resolve_run(tracking_uri, session_id.strip())
+            except Exception as e:
+                st.error(f"Could not reach MLflow at {tracking_uri}: {e}")
+                st.stop()
+        if not info:
+            st.error(f"No traces found with session_id = '{session_id}'.")
+            st.stop()
+
+        # Pre-fetch this session's full traces (JSON with all spans) up front: they
+        # drive the Tab-1 timeline waterfall / Analysis tab AND, now, the per-turn
+        # windows used to pull this session's CPU/GPU from Prometheus below. There
+        # is no more profiling/ MLflow artifact to download for CPU/GPU - hermes-otel
+        # exports them as OTel metrics, not files (see fetch_session_cpu_gpu).
+        full_traces = None
+        turn_count = 0
+        total_latency_ms = 0.0
+        with st.spinner("Fetching session traces …"):
+            try:
+                _summary_df, _summary_err = fetch_session_traces(
+                    tracking_uri, session_id.strip(), info.get("experiment_id")
+                )
+                if not _summary_err and not _summary_df.empty:
+                    turn_count = len(_summary_df)
+                    total_latency_ms = _summary_df.attrs.get("total_latency_ms", 0.0)
+                    if "trace_id" in _summary_df.columns:
+                        _tids = tuple(str(t) for t in _summary_df["trace_id"].dropna().tolist())
+                        full_traces, _ = fetch_full_traces(tracking_uri, _tids)
+            except Exception:
+                full_traces = None
+
+        # Overwrite the profiling-cache file with the freshly-fetched traces (so a
+        # resumed session's later Load reflects ALL its turns), then read them back:
+        # the on-disk file under profiling_cache is the ONLY source the dashboard
+        # renders from - no in-memory fallback.
+        _sid = session_id.strip()
+        if full_traces:
+            save_traces_json(_sid, full_traces)
+        full_traces = load_traces_json(_sid)
+        if full_traces and not turn_count:
+            turn_count = len(full_traces)
+
+        # For each turn (trace) in this session, fetch its CPU/GPU from Prometheus
+        # over that turn's own [start, end] window and merge every turn into one
+        # session-level CSV - same technique as fetch_session_metrics.py, just run
+        # per-turn instead of once for the whole session, so long idle gaps between
+        # turns never blow past Prometheus's per-query point limit. tool_execution.csv
+        # is rebuilt straight from the traces' own hermes.tool.* span attributes
+        # (no Prometheus query needed for that one).
+        local_dir = os.path.join(PROFILING_CACHE_DIR, _sid, ARTIFACT_DIR)
+        with st.spinner("Fetching CPU/GPU from Prometheus, per turn …"):
+            try:
+                _stats = save_session_cpu_gpu(local_dir, prom_url, full_traces)
+                if not full_traces:
+                    st.warning("No traces to derive turn windows from — CPU/GPU will be empty.")
+                elif _stats["cpu_hermes_points"] == 0 and _stats["gpu_points"] == 0:
+                    st.warning(
+                        "No CPU/GPU samples found for this session's turn windows in "
+                        f"Prometheus at {prom_url}. This session may predate metrics "
+                        "being enabled (flush_interval_ms/metrics backend), or the "
+                        "Prometheus URL doesn't point at the right server."
+                    )
+            except Exception as e:
+                st.warning(f"Could not fetch CPU/GPU from Prometheus at {prom_url}: {e}")
+
+        st.session_state["loaded"] = {
+            "tracking_uri": tracking_uri,
+            "info": info,
+            "session_id": session_id.strip(),
+            "local_dir": local_dir,
+            "full_traces": full_traces,
+            "turn_count": turn_count,
+            "total_latency_ms": total_latency_ms,
+            "cpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "cpu_hermes_trace.csv"))),
+            "gpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "gpu_system_wide.csv"))),
+            "tool_df": parse_timestamps(read_csv(os.path.join(local_dir, "tool_execution.csv"))),
+            "metrics": compute_session_metrics(full_traces) if full_traces else None,
+        }
+        # Loading a session invalidates per-session tab state from any previous one -
+        # clear cached traces & analysis so those tabs don't show stale data. (The
+        # @st.cache_data fetch caches are already cleared at the top of this handler.)
+        for _k in ("traces_result", "analysis_result", "analysis_run"):
+            st.session_state.pop(_k, None)
+
+    # Nothing loaded yet → prompt and stop.
+    # Require a fresh Load if nothing is cached, or if the cache predates the current
+    # schema (missing newer keys like local_dir/session_id from an older run).
+    _data = st.session_state.get("loaded")
+    _cached_metrics = (_data or {}).get("metrics")
+    # A cached dict from an older METRICS_SCHEMA is stale even though its key
+    # exists; reading it with newer render code raises KeyError on a key that did
+    # not exist yet, so force a fresh Load instead.
+    _metrics_stale = bool(_cached_metrics) and _cached_metrics.get("schema") != METRICS_SCHEMA
+    if (not _data or "local_dir" not in _data or "session_id" not in _data
+            or "metrics" not in _data or _metrics_stale):
+        st.info("Enter the MLflow server IP, port, and a session ID in the sidebar, then click **Load**.")
         st.stop()
 
-    # Pre-fetch this session's full traces (JSON with all spans) up front: they
-    # drive the Tab-1 timeline waterfall / Analysis tab AND, now, the per-turn
-    # windows used to pull this session's CPU/GPU from Prometheus below. There
-    # is no more profiling/ MLflow artifact to download for CPU/GPU - hermes-otel
-    # exports them as OTel metrics, not files (see fetch_session_cpu_gpu).
-    full_traces = None
-    turn_count = 0
-    total_latency_ms = 0.0
-    with st.spinner("Fetching session traces …"):
-        try:
-            _summary_df, _summary_err = fetch_session_traces(
-                tracking_uri, session_id.strip(), info.get("experiment_id")
+    # Pull the persisted data (survives radio/download/tab interactions).
+    tracking_uri = _data["tracking_uri"]
+    info = _data["info"]
+    cpu_df = _data["cpu_df"]
+    gpu_df = _data["gpu_df"]
+    tool_df = _data["tool_df"]
+    local_dir = _data["local_dir"]
+    sess_id = _data["session_id"]
+    loaded_full_traces = _data.get("full_traces")
+    turn_count = _data.get("turn_count", 0)
+    total_latency_ms = _data.get("total_latency_ms", 0.0)
+    metrics = _data.get("metrics")
+
+    st.write(f"**Tracking URI:** `{tracking_uri}`")
+    st.success(f"Found session `{sess_id}` in experiment `{info['experiment']}`.")
+
+    # Session-wide summary strip: total turns and their combined latency (the sum of
+    # each turn's MLflow trace execution_duration, computed once in
+    # fetch_session_traces and carried through from the Load click). Each metric sits
+    # in its own bordered card - a bare st.metric has no visual separation from the
+    # page background, so this reads more like a dashboard KPI row. The metric value's
+    # font size is normalized in the app-wide style block near set_page_config so it
+    # stays inside the card.
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        with st.container(border=True):
+            st.metric("Session ID", sess_id)
+    with m2:
+        with st.container(border=True):
+            st.metric("Turns", turn_count or "n/a")
+    with m3:
+        with st.container(border=True):
+            st.metric(
+                "Total Latency",
+                format_latency_ms(total_latency_ms) if turn_count else "n/a",
             )
-            if not _summary_err and not _summary_df.empty:
-                turn_count = len(_summary_df)
-                total_latency_ms = _summary_df.attrs.get("total_latency_ms", 0.0)
-                if "trace_id" in _summary_df.columns:
-                    _tids = tuple(str(t) for t in _summary_df["trace_id"].dropna().tolist())
-                    full_traces, _ = fetch_full_traces(tracking_uri, _tids)
-        except Exception:
-            full_traces = None
 
-    # Overwrite the profiling-cache file with the freshly-fetched traces (so a
-    # resumed session's later Load reflects ALL its turns), then read them back:
-    # the on-disk file under profiling_cache is the ONLY source the dashboard
-    # renders from - no in-memory fallback.
-    _sid = session_id.strip()
-    if full_traces:
-        save_traces_json(_sid, full_traces)
-    full_traces = load_traces_json(_sid)
-    if full_traces and not turn_count:
-        turn_count = len(full_traces)
-
-    # For each turn (trace) in this session, fetch its CPU/GPU from Prometheus
-    # over that turn's own [start, end] window and merge every turn into one
-    # session-level CSV - same technique as fetch_session_metrics.py, just run
-    # per-turn instead of once for the whole session, so long idle gaps between
-    # turns never blow past Prometheus's per-query point limit. tool_execution.csv
-    # is rebuilt straight from the traces' own hermes.tool.* span attributes
-    # (no Prometheus query needed for that one).
-    local_dir = os.path.join(PROFILING_CACHE_DIR, _sid, ARTIFACT_DIR)
-    with st.spinner("Fetching CPU/GPU from Prometheus, per turn …"):
-        try:
-            _stats = save_session_cpu_gpu(local_dir, prom_url, full_traces)
-            if not full_traces:
-                st.warning("No traces to derive turn windows from — CPU/GPU will be empty.")
-            elif _stats["cpu_hermes_points"] == 0 and _stats["gpu_points"] == 0:
-                st.warning(
-                    "No CPU/GPU samples found for this session's turn windows in "
-                    f"Prometheus at {prom_url}. This session may predate metrics "
-                    "being enabled (flush_interval_ms/metrics backend), or the "
-                    "Prometheus URL doesn't point at the right server."
-                )
-        except Exception as e:
-            st.warning(f"Could not fetch CPU/GPU from Prometheus at {prom_url}: {e}")
-
-    st.session_state["loaded"] = {
-        "tracking_uri": tracking_uri,
-        "info": info,
-        "session_id": session_id.strip(),
-        "local_dir": local_dir,
-        "full_traces": full_traces,
-        "turn_count": turn_count,
-        "total_latency_ms": total_latency_ms,
-        "cpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "cpu_hermes_trace.csv"))),
-        "gpu_df": parse_timestamps(read_csv(os.path.join(local_dir, "gpu_system_wide.csv"))),
-        "tool_df": parse_timestamps(read_csv(os.path.join(local_dir, "tool_execution.csv"))),
-        "metrics": compute_session_metrics(full_traces) if full_traces else None,
-    }
-    # Loading a session invalidates per-session tab state from any previous one -
-    # clear cached traces & analysis so those tabs don't show stale data. (The
-    # @st.cache_data fetch caches are already cleared at the top of this handler.)
-    for _k in ("traces_result", "analysis_result", "analysis_run"):
-        st.session_state.pop(_k, None)
-
-# Nothing loaded yet → prompt and stop.
-# Require a fresh Load if nothing is cached, or if the cache predates the current
-# schema (missing newer keys like local_dir/session_id from an older run).
-_data = st.session_state.get("loaded")
-_cached_metrics = (_data or {}).get("metrics")
-# A cached dict from an older METRICS_SCHEMA is stale even though its key
-# exists; reading it with newer render code raises KeyError on a key that did
-# not exist yet, so force a fresh Load instead.
-_metrics_stale = bool(_cached_metrics) and _cached_metrics.get("schema") != METRICS_SCHEMA
-if (not _data or "local_dir" not in _data or "session_id" not in _data
-        or "metrics" not in _data or _metrics_stale):
-    st.info("Enter the MLflow server IP, port, and a session ID in the sidebar, then click **Load**.")
-    st.stop()
-
-# Pull the persisted data (survives radio/download/tab interactions).
-tracking_uri = _data["tracking_uri"]
-info = _data["info"]
-cpu_df = _data["cpu_df"]
-gpu_df = _data["gpu_df"]
-tool_df = _data["tool_df"]
-local_dir = _data["local_dir"]
-sess_id = _data["session_id"]
-loaded_full_traces = _data.get("full_traces")
-turn_count = _data.get("turn_count", 0)
-total_latency_ms = _data.get("total_latency_ms", 0.0)
-metrics = _data.get("metrics")
-
-st.write(f"**Tracking URI:** `{tracking_uri}`")
-st.success(f"Found session `{sess_id}` in experiment `{info['experiment']}`.")
-
-# Session-wide summary strip: total turns and their combined latency (the sum of
-# each turn's MLflow trace execution_duration, computed once in
-# fetch_session_traces and carried through from the Load click). Each metric sits
-# in its own bordered card - a bare st.metric has no visual separation from the
-# page background, so this reads more like a dashboard KPI row. The metric value's
-# font size is normalized in the app-wide style block near set_page_config so it
-# stays inside the card.
-m1, m2, m3 = st.columns(3)
-with m1:
-    with st.container(border=True):
-        st.metric("Session ID", sess_id)
-with m2:
-    with st.container(border=True):
-        st.metric("Turns", turn_count or "n/a")
-with m3:
-    with st.container(border=True):
-        st.metric(
-            "Total Latency",
-            format_latency_ms(total_latency_ms) if turn_count else "n/a",
+    if cpu_df.empty and gpu_df.empty:
+        st.warning(
+            "No CPU/GPU timeline data found for this session's turns in Prometheus. "
+            "This session may predate metrics being enabled, or the Prometheus URL "
+            "in the sidebar doesn't point at the right server."
         )
+        st.stop()
 
-if cpu_df.empty and gpu_df.empty:
-    st.warning(
-        "No CPU/GPU timeline data found for this session's turns in Prometheus. "
-        "This session may predate metrics being enabled, or the Prometheus URL "
-        "in the sidebar doesn't point at the right server."
+    (tab_overview, tab_separate, tab_context_tools, tab_traces,
+     tab_analysis) = st.tabs(
+        ["Overview", "CPU / GPU separate", "Context & tools", "Traces", "Analysis"]
     )
-    st.stop()
 
-(tab_overview, tab_separate, tab_context_tools, tab_traces,
- tab_analysis) = st.tabs(
-    ["Overview", "CPU / GPU separate", "Context & tools", "Traces", "Analysis"]
-)
-
-with tab_overview:
-    # Toggle: ON shows the full-session span waterfall correlated with CPU/GPU on
-    # a shared wall-clock axis; OFF shows the standalone per-session CPU/GPU chart.
-    show_timeline = st.toggle(
-        "Show trace timeline (full-session span waterfall)",
-        value=False,
-        help="Render every turn's spans on one absolute wall-clock axis, stacked "
-             "over the CPU/GPU timeline so the two correlate directly. Idle time "
-             "between prompts appears as the same gap in both. Traces are fetched "
-             "when you click Load.",
-    )
-    if show_timeline:
-        if not loaded_full_traces:
-            st.info(
-                "No traces were fetched for this session. Re-click **Load** (the "
-                "traces are pulled then), or confirm MLflow tracing is enabled."
-            )
+    with tab_overview:
+        # Toggle: ON shows the full-session span waterfall correlated with CPU/GPU on
+        # a shared wall-clock axis; OFF shows the standalone per-session CPU/GPU chart.
+        show_timeline = st.toggle(
+            "Show trace timeline (full-session span waterfall)",
+            value=False,
+            help="Render every turn's spans on one absolute wall-clock axis, stacked "
+                 "over the CPU/GPU timeline so the two correlate directly. Idle time "
+                 "between prompts appears as the same gap in both. Traces are fetched "
+                 "when you click Load.",
+        )
+        if show_timeline:
+            if not loaded_full_traces:
+                st.info(
+                    "No traces were fetched for this session. Re-click **Load** (the "
+                    "traces are pulled then), or confirm MLflow tracing is enabled."
+                )
+            else:
+                st.plotly_chart(
+                    build_session_waterfall_figure(loaded_full_traces, cpu_df, gpu_df, tool_df),
+                    width="stretch",
+                )
+                # If the waterfall looks empty/misaligned, the span field names in this
+                # MLflow build may differ - inspect the raw traces here to confirm.
+                with st.expander("Debug: raw trace JSON (all turns)", expanded=False):
+                    # loaded_full_traces was read from this file at Load.
+                    st.caption(f"Read from `{traces_cache_path(sess_id)}`")
+                    st.download_button(
+                        "⬇ Download traces.json",
+                        data=json.dumps(loaded_full_traces, indent=2, default=str),
+                        file_name="traces.json", mime="application/json",
+                        key="dl_traces_json",
+                    )
+                    st.json(loaded_full_traces)
         else:
+            st.plotly_chart(build_figure(cpu_df, gpu_df, tool_df), width="stretch")
+
+        with st.expander("Tool breakdown table", expanded=True):
+            if tool_df.empty:
+                st.write("No tool_execution.csv data.")
+            else:
+                # Show the row number starting at 1 instead of the 0-based index.
+                _disp = tool_df.copy()
+                _disp.index = range(1, len(_disp) + 1)
+                show_left_table(_disp)
+
+    with tab_separate:
+        sources = {
+            "CPU Usage": ("cpu_hermes_trace.csv", cpu_df),
+            "GPU usage": ("gpu_system_wide.csv", gpu_df),
+            "Tool Track": ("tool_execution.csv", tool_df),
+        }
+
+        show_panel = st.toggle("Show CSV panel (compare live)", value=False,
+                               help="Open a side panel with the raw CSV next to the graphs.")
+
+        def _render_graphs():
+            st.subheader("CPU utilization")
             st.plotly_chart(
-                build_session_waterfall_figure(loaded_full_traces, cpu_df, gpu_df, tool_df),
+                build_single_figure(cpu_df, "cpu_pct", "CPU %", BLUE, tool_df=tool_df,
+                                     y_range=[0, 102],
+                                     y_title="CPU % (hermes + children)"),
                 width="stretch",
             )
-            # If the waterfall looks empty/misaligned, the span field names in this
-            # MLflow build may differ - inspect the raw traces here to confirm.
-            with st.expander("Debug: raw trace JSON (all turns)", expanded=False):
-                # loaded_full_traces was read from this file at Load.
-                st.caption(f"Read from `{traces_cache_path(sess_id)}`")
-                st.download_button(
-                    "⬇ Download traces.json",
-                    data=json.dumps(loaded_full_traces, indent=2, default=str),
-                    file_name="traces.json", mime="application/json",
-                    key="dl_traces_json",
-                )
-                st.json(loaded_full_traces)
-    else:
-        st.plotly_chart(build_figure(cpu_df, gpu_df, tool_df), width="stretch")
-
-    with st.expander("Tool breakdown table", expanded=True):
-        if tool_df.empty:
-            st.write("No tool_execution.csv data.")
-        else:
-            # Show the row number starting at 1 instead of the 0-based index.
-            _disp = tool_df.copy()
-            _disp.index = range(1, len(_disp) + 1)
-            show_left_table(_disp)
-
-with tab_separate:
-    sources = {
-        "CPU Usage": ("cpu_hermes_trace.csv", cpu_df),
-        "GPU usage": ("gpu_system_wide.csv", gpu_df),
-        "Tool Track": ("tool_execution.csv", tool_df),
-    }
-
-    show_panel = st.toggle("Show CSV panel (compare live)", value=False,
-                           help="Open a side panel with the raw CSV next to the graphs.")
-
-    def _render_graphs():
-        st.subheader("CPU utilization")
-        st.plotly_chart(
-            build_single_figure(cpu_df, "cpu_pct", "CPU %", BLUE, tool_df=tool_df,
-                                 y_range=[0, 102],
-                                 y_title="CPU % (hermes + children)"),
-            width="stretch",
-        )
-        st.subheader("GPU utilization")
-        st.plotly_chart(
-            build_single_figure(gpu_df, "gfx_busy_pct", "GPU %", AMD_RED,
-                                 y_range=[0, 102], tool_df=tool_df),
-            width="stretch",
-        )
-
-    def _render_csv_panel():
-        st.markdown("#### Raw data")
-        choice = st.radio("View data", list(sources.keys()),
-                          label_visibility="collapsed", horizontal=True)
-        fname, df = sources[choice]
-        st.caption(f"`{fname}`")
-        if df is None or df.empty:
-            st.info(f"No data in {fname}.")
-        else:
-            show_left_table(df, height=430)
-            st.download_button(
-                label=f"⬇ Download {fname}",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name=fname, mime="text/csv", key=f"dl_{fname}",
+            st.subheader("GPU utilization")
+            st.plotly_chart(
+                build_single_figure(gpu_df, "gfx_busy_pct", "GPU %", AMD_RED,
+                                     y_range=[0, 102], tool_df=tool_df),
+                width="stretch",
             )
 
-    if show_panel:
-        # Split view: graphs on the left, CSV panel on the right. Each column is
-        # a fixed-height scrollable container so they stay top-aligned and scroll
-        # independently (otherwise the two stacked graphs push the GPU chart far
-        # below the CSV panel).
-        left, right = st.columns([3, 2], gap="large")
-        with left:
-            with st.container(height=620):
-                _render_graphs()
-        with right:
-            with st.container(height=620):
-                _render_csv_panel()
-    else:
-        _render_graphs()
+        def _render_csv_panel():
+            st.markdown("#### Raw data")
+            choice = st.radio("View data", list(sources.keys()),
+                              label_visibility="collapsed", horizontal=True)
+            fname, df = sources[choice]
+            st.caption(f"`{fname}`")
+            if df is None or df.empty:
+                st.info(f"No data in {fname}.")
+            else:
+                show_left_table(df, height=430)
+                st.download_button(
+                    label=f"⬇ Download {fname}",
+                    data=df.to_csv(index=False).encode("utf-8"),
+                    file_name=fname, mime="text/csv", key=f"dl_{fname}",
+                )
 
-with tab_context_tools:
-    st.subheader("Context & tools")
-    st.caption(
-        "Derived from this session's span trees. Nothing here needs new "
-        "instrumentation -- it is arithmetic over telemetry the patched "
-        "hermes-otel plugin already emits."
-    )
+        if show_panel:
+            # Split view: graphs on the left, CSV panel on the right. Each column is
+            # a fixed-height scrollable container so they stay top-aligned and scroll
+            # independently (otherwise the two stacked graphs push the GPU chart far
+            # below the CSV panel).
+            left, right = st.columns([3, 2], gap="large")
+            with left:
+                with st.container(height=620):
+                    _render_graphs()
+            with right:
+                with st.container(height=620):
+                    _render_csv_panel()
+        else:
+            _render_graphs()
 
-    def _fmt(value, suffix="", nd=1):
-        """Render a metric, distinguishing 'not applicable' from zero.
+    with tab_context_tools:
+        st.subheader("Context & tools")
+        st.caption(
+            "Derived from this session's span trees. Nothing here needs new "
+            "instrumentation -- it is arithmetic over telemetry the patched "
+            "hermes-otel plugin already emits."
+        )
+
+        def _fmt(value, suffix="", nd=1):
+            """Render a metric, distinguishing 'not applicable' from zero.
 
         A turn that called no tools has no time-to-first-tool; showing 0 there
         would read as 'instant' rather than 'never happened'.
         """
-        if value is None:
-            return "n/a"
-        if isinstance(value, float):
-            return f"{value:.{nd}f}{suffix}"
-        return f"{value}{suffix}"
+            if value is None:
+                return "n/a"
+            if isinstance(value, float):
+                return f"{value:.{nd}f}{suffix}"
+            return f"{value}{suffix}"
 
-    if not metrics or not metrics.get("per_turn", []):
-        st.info(
-            "No traces loaded for this session, so these metrics cannot be "
-            "derived. Click **Load / Reload** in the sidebar."
-        )
-    else:
-        per_turn = metrics.get("per_turn", [])
-        n_turns = metrics.get("turns", 0)
-
-        # Each card aggregates differently -- total, mean, mean, pooled -- so
-        # each says which it is. A bare mean hides the worst turn, which is the
-        # one worth investigating, so the extremum is named alongside.
-        section("Context growth per step")
-        # One continuous curve for the whole session: input tokens against a
-        # step index that keeps counting across turns, with consecutive turns
-        # bridged. The intercept is the fixed prompt cost (system message + tool
-        # schemas); the slope is what the agent adds to its own context as it
-        # works -- across the session, not just inside one turn.
-        #
-        # These two sit OUTSIDE the fragment because they set its poll timer,
-        # and run_every is fixed when the fragment is declared -- changing them
-        # has to re-run the page for the new timer to take effect. Everything
-        # that does not touch the timer lives inside the fragment instead.
-        _c_live, _c_every, _ = st.columns([1.2, 1, 2])
-        with _c_live:
-            ctx_live = st.toggle(
-                "Live follow", value=False, key="ctx_live",
-                help="Re-poll MLflow for this session and extend the curve as "
-                     "the agent works. A turn's spans reach MLflow when that "
-                     "turn ends, so the curve grows a turn at a time.",
+        if not metrics or not metrics.get("per_turn", []):
+            st.info(
+                "No traces loaded for this session, so these metrics cannot be "
+                "derived. Click **Load / Reload** in the sidebar."
             )
-        with _c_every:
-            ctx_every = st.number_input(
-                "Refresh (s)", min_value=2, max_value=60, value=5, step=1,
-                key="ctx_every", disabled=not ctx_live,
-                help="How often to poll while Live follow is on.",
-            )
+        else:
+            per_turn = metrics.get("per_turn", [])
+            n_turns = metrics.get("turns", 0)
 
-        # The chart lives in a fragment so Live follow reruns ONLY the chart on
-        # its timer. A page-level rerun would also reset st.tabs() back to
-        # Overview every few seconds (the same trap the Analysis poller
-        # documents), which would make live mode unusable.
-        @st.fragment(run_every=(int(ctx_every) if ctx_live else None))
-        def _render_context_growth():
-            # Inside the fragment: moving the window redraws the chart alone,
-            # without re-running the page.
-            _c_window, _ = st.columns([1.6, 2.4])
-            with _c_window:
-                ctx_window = st.slider(
-                    "Steps in view", min_value=10, max_value=200, value=40,
-                    step=5, key="ctx_window",
-                    help="Width of the moving window. Once the session has more "
-                         "steps than this the chart follows the newest ones; "
-                         "drag on the chart itself to pan back to earlier steps.",
+            # Each card aggregates differently -- total, mean, mean, pooled -- so
+            # each says which it is. A bare mean hides the worst turn, which is the
+            # one worth investigating, so the extremum is named alongside.
+            section("Context growth per step")
+            # One continuous curve for the whole session: input tokens against a
+            # step index that keeps counting across turns, with consecutive turns
+            # bridged. The intercept is the fixed prompt cost (system message + tool
+            # schemas); the slope is what the agent adds to its own context as it
+            # works -- across the session, not just inside one turn.
+            #
+            # These two sit OUTSIDE the fragment because they set its poll timer,
+            # and run_every is fixed when the fragment is declared -- changing them
+            # has to re-run the page for the new timer to take effect. Everything
+            # that does not touch the timer lives inside the fragment instead.
+            _c_live, _c_every, _ = st.columns([1.2, 1, 2])
+            with _c_live:
+                ctx_live = st.toggle(
+                    "Live follow", value=False, key="ctx_live",
+                    help="Re-poll MLflow for this session and extend the curve as "
+                         "the agent works. A turn's spans reach MLflow when that "
+                         "turn ends, so the curve grows a turn at a time.",
+                )
+            with _c_every:
+                ctx_every = st.number_input(
+                    "Refresh (s)", min_value=2, max_value=60, value=5, step=1,
+                    key="ctx_every", disabled=not ctx_live,
+                    help="How often to poll while Live follow is on.",
                 )
 
-            turns_now, poll_err = per_turn, ""
-            if ctx_live:
-                traces_now, poll_err = poll_live_traces(
-                    tracking_uri, sess_id, info.get("experiment_id"))
-                if traces_now:
-                    fresh = compute_session_metrics(traces_now)
-                    turns_now = fresh.get("per_turn", per_turn)
-                    # Keep the rest of the page in step: the tables below this
-                    # chart read `metrics` off session_state, so they catch up
-                    # on the next rerun instead of contradicting the curve.
-                    _data["full_traces"] = traces_now
-                    _data["metrics"] = fresh
-                    _data["turn_count"] = fresh.get("turns", 0)
-
-            points = context_growth_points(turns_now)
-            if len(points) < 2:
-                st.info(
-                    "Context growth needs at least two LLM calls in the "
-                    "session; only one has been recorded so far."
-                )
-            else:
-                st.plotly_chart(
-                    style_figure(build_context_growth_figure(
-                        points, window=int(ctx_window))),
-                    width="stretch",
-                )
-                turn_n = len({p["turn"] for p in points})
-                # Only describe the turn bridges when there is more than one
-                # turn to bridge.
-                across = (
-                    "The x axis runs continuously across turns: turn 2's first "
-                    "step follows turn 1's last, and the dotted segment between "
-                    "them is the context carried into the new turn. "
-                    if turn_n > 1 else
-                    "The x axis will keep counting into turn 2 rather than "
-                    "restarting, so the whole session reads as one curve. "
-                )
-                st.caption(
-                    f"{len(points)} agent steps across {turn_n} turn(s). "
-                    + across +
-                    "Hover any point for the turn it belongs to, its step "
-                    "within that turn, the exact token delta, and the tool that "
-                    "call requested -- the rise to the next point is that "
-                    "tool's result landing in the prompt. The y-intercept is "
-                    "fixed overhead paid on every call (system prompt plus tool "
-                    "schemas); the slope is context the agent accumulates as it "
-                    "works."
-                )
-            if ctx_live:
-                stamp = datetime.now().strftime("%H:%M:%S")
-                if poll_err:
-                    st.caption(f"Live follow at {stamp} - MLflow poll: {poll_err}")
-                else:
-                    st.caption(
-                        f"Live follow on - polled at {stamp}, every "
-                        f"{int(ctx_every)}s. New turns extend the curve as they "
-                        "finish."
+            # The chart lives in a fragment so Live follow reruns ONLY the chart on
+            # its timer. A page-level rerun would also reset st.tabs() back to
+            # Overview every few seconds (the same trap the Analysis poller
+            # documents), which would make live mode unusable.
+            @st.fragment(run_every=(int(ctx_every) if ctx_live else None))
+            def _render_context_growth():
+                # Inside the fragment: moving the window redraws the chart alone,
+                # without re-running the page.
+                _c_window, _ = st.columns([1.6, 2.4])
+                with _c_window:
+                    ctx_window = st.slider(
+                        "Steps in view", min_value=10, max_value=200, value=40,
+                        step=5, key="ctx_window",
+                        help="Width of the moving window. Once the session has more "
+                             "steps than this the chart follows the newest ones; "
+                             "drag on the chart itself to pan back to earlier steps.",
                     )
 
-        _render_context_growth()
+                turns_now, poll_err = per_turn, ""
+                if ctx_live:
+                    traces_now, poll_err = poll_live_traces(
+                        tracking_uri, sess_id, info.get("experiment_id"))
+                    if traces_now:
+                        fresh = compute_session_metrics(traces_now)
+                        turns_now = fresh.get("per_turn", per_turn)
+                        # Keep the rest of the page in step: the tables below this
+                        # chart read `metrics` off session_state, so they catch up
+                        # on the next rerun instead of contradicting the curve.
+                        _data["full_traces"] = traces_now
+                        _data["metrics"] = fresh
+                        _data["turn_count"] = fresh.get("turns", 0)
 
-        section("Per-turn breakdown")
-        rows = []
-        # Wall-clock order and the same 1..N numbering the curve above uses, so
-        # table row N is the curve's turn N. Not the agent's own
-        # hermes.turn.number: it restarts after a `--resume`, which printed this
-        # column as 1,1,2,3,4,5,6,1,2 for a single session.
-        for i, t in enumerate(_ordered_turn_metrics(per_turn)):
-            rows.append({
-                "turn": i + 1,
-                "wall_s": round(t["wall_s"], 2) if t["wall_s"] else None,
-                "steps": t["agent_steps"],
-                "time_to_first_tool_s": t["time_to_first_tool_s"],
-                "first_tool": t["first_tool_name"],
-                "ctx_first": t["context_first"],
-                "ctx_last": t["context_last"],
-                "tool_calls": t["tool_calls"],
-                "tool_failures": t["tool_failures"],
-            })
-        tdf = pd.DataFrame(rows)
-        tdf.index = range(1, len(tdf) + 1)
-        show_left_table(tdf)
+                points = context_growth_points(turns_now)
+                if len(points) < 2:
+                    st.info(
+                        "Context growth needs at least two LLM calls in the "
+                        "session; only one has been recorded so far."
+                    )
+                else:
+                    st.plotly_chart(
+                        style_figure(build_context_growth_figure(
+                            points, window=int(ctx_window))),
+                        width="stretch",
+                    )
+                    turn_n = len({p["turn"] for p in points})
+                    # Only describe the turn bridges when there is more than one
+                    # turn to bridge.
+                    across = (
+                        "The x axis runs continuously across turns: turn 2's first "
+                        "step follows turn 1's last, and the dotted segment between "
+                        "them is the context carried into the new turn. "
+                        if turn_n > 1 else
+                        "The x axis will keep counting into turn 2 rather than "
+                        "restarting, so the whole session reads as one curve. "
+                    )
+                    st.caption(
+                        f"{len(points)} agent steps across {turn_n} turn(s). "
+                        + across +
+                        "Hover any point for the turn it belongs to, its step "
+                        "within that turn, the exact token delta, and the tool that "
+                        "call requested -- the rise to the next point is that "
+                        "tool's result landing in the prompt. The y-intercept is "
+                        "fixed overhead paid on every call (system prompt plus tool "
+                        "schemas); the slope is context the agent accumulates as it "
+                        "works."
+                    )
+                if ctx_live:
+                    stamp = datetime.now().strftime("%H:%M:%S")
+                    if poll_err:
+                        st.caption(f"Live follow at {stamp} - MLflow poll: {poll_err}")
+                    else:
+                        st.caption(
+                            f"Live follow on - polled at {stamp}, every "
+                            f"{int(ctx_every)}s. New turns extend the curve as they "
+                            "finish."
+                        )
+
+            _render_context_growth()
+
+            section("Per-turn breakdown")
+            rows = []
+            # Wall-clock order and the same 1..N numbering the curve above uses, so
+            # table row N is the curve's turn N. Not the agent's own
+            # hermes.turn.number: it restarts after a `--resume`, which printed this
+            # column as 1,1,2,3,4,5,6,1,2 for a single session.
+            for i, t in enumerate(_ordered_turn_metrics(per_turn)):
+                rows.append({
+                    "turn": i + 1,
+                    "wall_s": round(t["wall_s"], 2) if t["wall_s"] else None,
+                    "steps": t["agent_steps"],
+                    "time_to_first_tool_s": t["time_to_first_tool_s"],
+                    "first_tool": t["first_tool_name"],
+                    "ctx_first": t["context_first"],
+                    "ctx_last": t["context_last"],
+                    "tool_calls": t["tool_calls"],
+                    "tool_failures": t["tool_failures"],
+                })
+            tdf = pd.DataFrame(rows)
+            tdf.index = range(1, len(tdf) + 1)
+            show_left_table(tdf)
     
 
-        section("Tool outcomes")
-        if metrics.get("hidden_failure_turns", 0):
-            st.warning(
-                f"**The failure rate below is a lower bound.** "
-                f"{metrics['hidden_failure_turns']} of {n_turns} turn(s) report "
-                "a failed tool call in `hermes.turn.tool_outcomes` that no tool "
-                "span and no `tool_execution.csv` row captured. The plugin keys "
-                "both on `f\"{tool_name}:{task_id}\"`, so a failed call retried "
-                "inside the same step overwrites itself and only one attempt "
-                "survives. The retry is visible in the agent's console output as "
-                "a repeated `preparing tool_call…` line."
-            )
-        oc = metrics.get("outcome_counts", {})
-        if not oc:
-            st.info("No tool calls in this session.")
-        else:
-            odf = pd.DataFrame(
-                [{"outcome": k, "calls": v,
-                  "counts_as": ("failure" if k in FAILURE_OUTCOMES
-                                else "neutral" if k in NEUTRAL_OUTCOMES
-                                else "success")}
-                 for k, v in sorted(oc.items(), key=lambda kv: -kv[1])])
-            odf.index = range(1, len(odf) + 1)
-            c_left, c_right = st.columns([1, 1])
-            with c_left:
-                show_left_table(odf)
-            with c_right:
-                st.metric(
-                    "Wall time in failed calls",
-                    f"{metrics.get('tool_time_failed_s', 0.0):.2f}s",
-                    help="Time spent on tool calls that failed. Separates a "
-                         "reliability problem from a latency problem: many "
-                         "cheap failures cost little wall time but still burn "
-                         "agent steps, each of which costs a full LLM round trip.",
+            section("Tool outcomes")
+            if metrics.get("hidden_failure_turns", 0):
+                st.warning(
+                    f"**The failure rate below is a lower bound.** "
+                    f"{metrics['hidden_failure_turns']} of {n_turns} turn(s) report "
+                    "a failed tool call in `hermes.turn.tool_outcomes` that no tool "
+                    "span and no `tool_execution.csv` row captured. The plugin keys "
+                    "both on `f\"{tool_name}:{task_id}\"`, so a failed call retried "
+                    "inside the same step overwrites itself and only one attempt "
+                    "survives. The retry is visible in the agent's console output as "
+                    "a repeated `preparing tool_call…` line."
+                )
+            oc = metrics.get("outcome_counts", {})
+            if not oc:
+                st.info("No tool calls in this session.")
+            else:
+                odf = pd.DataFrame(
+                    [{"outcome": k, "calls": v,
+                      "counts_as": ("failure" if k in FAILURE_OUTCOMES
+                                    else "neutral" if k in NEUTRAL_OUTCOMES
+                                    else "success")}
+                     for k, v in sorted(oc.items(), key=lambda kv: -kv[1])])
+                odf.index = range(1, len(odf) + 1)
+                c_left, c_right = st.columns([1, 1])
+                with c_left:
+                    show_left_table(odf)
+                with c_right:
+                    st.metric(
+                        "Wall time in failed calls",
+                        f"{metrics.get('tool_time_failed_s', 0.0):.2f}s",
+                        help="Time spent on tool calls that failed. Separates a "
+                             "reliability problem from a latency problem: many "
+                             "cheap failures cost little wall time but still burn "
+                             "agent steps, each of which costs a full LLM round trip.",
+                    )
+
+            if metrics.get("failed_calls", []):
+                section("Failed calls")
+                fdf = pd.DataFrame([
+                    {"turn": f["turn"], "tool": f["tool"], "at_s": f["offset_s"],
+                     "duration_s": f["duration_s"], "outcome": f["outcome"],
+                     "error": f["error"]}
+                    for f in metrics["failed_calls"]])
+                fdf.index = range(1, len(fdf) + 1)
+                show_left_table(fdf)
+    
+
+            with st.expander("What these four metrics mean", expanded=False):
+                st.markdown(
+                    "- **Agent steps** -- LLM round trips before a terminal answer. "
+                    "In a serial agent this is the dominant latency term, because "
+                    "each step costs a full request plus its generated tokens.\n"
+                    "- **Time to first tool** -- how long the agent thinks before "
+                    "acting. High is not automatically bad; it also describes a "
+                    "turn where the model produced the answer itself.\n"
+                    "- **Context growth per step** -- slope of input tokens across "
+                    "steps. Cheap in latency when prefix caching is working, but it "
+                    "sets KV-cache pressure and token cost.\n"
+                    "- **Tool failure rate** -- failed calls over total, pooled "
+                    "across turns. Read alongside *wall time in failed calls*: a "
+                    "20% failure rate costing 0.2s is a correctness annoyance, "
+                    "while one costing 40s is a latency bug."
                 )
 
-        if metrics.get("failed_calls", []):
-            section("Failed calls")
-            fdf = pd.DataFrame([
-                {"turn": f["turn"], "tool": f["tool"], "at_s": f["offset_s"],
-                 "duration_s": f["duration_s"], "outcome": f["outcome"],
-                 "error": f["error"]}
-                for f in metrics["failed_calls"]])
-            fdf.index = range(1, len(fdf) + 1)
-            show_left_table(fdf)
-    
 
-        with st.expander("What these four metrics mean", expanded=False):
-            st.markdown(
-                "- **Agent steps** -- LLM round trips before a terminal answer. "
-                "In a serial agent this is the dominant latency term, because "
-                "each step costs a full request plus its generated tokens.\n"
-                "- **Time to first tool** -- how long the agent thinks before "
-                "acting. High is not automatically bad; it also describes a "
-                "turn where the model produced the answer itself.\n"
-                "- **Context growth per step** -- slope of input tokens across "
-                "steps. Cheap in latency when prefix caching is working, but it "
-                "sets KV-cache pressure and token cost.\n"
-                "- **Tool failure rate** -- failed calls over total, pooled "
-                "across turns. Read alongside *wall time in failed calls*: a "
-                "20% failure rate costing 0.2s is a correctness annoyance, "
-                "while one costing 40s is a latency bug."
-            )
+    with tab_traces:
+        st.subheader("MLflow traces for this session")
+        st.caption("Every prompt/turn in this session, as recorded in MLflow tracing.")
 
-
-with tab_traces:
-    st.subheader("MLflow traces for this session")
-    st.caption("Every prompt/turn in this session, as recorded in MLflow tracing.")
-
-    if st.button("Load traces", key="load_traces"):
-        with st.spinner("Fetching traces …"):
-            tr_df, tr_err = fetch_session_traces(
-                tracking_uri, sess_id, info.get("experiment_id")
-            )
-        st.session_state["traces_result"] = {"df": tr_df, "err": tr_err}
-
-    tr = st.session_state.get("traces_result")
-    if tr is None:
-        st.info("Click **Load traces** to fetch this session's traces from MLflow.")
-    elif tr["err"]:
-        st.warning(tr["err"])
-    elif tr["df"].empty:
-        st.info("No traces found for this session.")
-    else:
-        st.write(f"Found **{len(tr['df'])}** trace(s).")
-        tdf = tr["df"]
-        # Surface the raw column names search_traces returned, to help map
-        # latency/token fields if any display empty.
-        raw_cols = tdf.attrs.get("raw_columns")
-        # search_traces returns newest-first (n..1); flip to oldest-first (1..n)
-        # and give a 1-based row number instead of the 0-based index.
-        tdf = tdf.iloc[::-1].reset_index(drop=True)
-        tdf.index = range(1, len(tdf) + 1)
-        if raw_cols:
-            with st.expander("Debug: raw trace columns from MLflow", expanded=False):
-                st.write(raw_cols)
-        if "open_in_mlflow" in tdf.columns:
-            # Render numeric columns as strings to left-align them (the grid
-            # right-aligns real numbers). Keep open_in_mlflow as a URL string so
-            # LinkColumn stays clickable.
-            disp = tdf.copy()
-            for col in disp.columns:
-                if col != "open_in_mlflow" and pd.api.types.is_numeric_dtype(disp[col]):
-                    disp[col] = disp[col].map(lambda v: "" if pd.isna(v) else f"{v:g}")
-            st.dataframe(
-                disp,
-                width="stretch",
-                column_config={
-                    "open_in_mlflow": st.column_config.LinkColumn(
-                        "Open in MLflow", display_text="↗ View trace"
-                    ),
-                },
-            )
-        else:
-            # Old cached result without the link column - tell the user to reload.
-            st.info("No link column found (stale cache). Click **Clear cache** in "
-                    "the ⋮ menu, then **Load traces** again.")
-            st.dataframe(tdf, width="stretch")
-
-
-with tab_analysis:
-    st.subheader("Hermes Analysis")
-    st.caption(
-        "Runs the local `hermes` CLI with a prompt that analyzes this session's "
-        "tool usage (tool_execution.csv) and suggests improvements."
-    )
-
-    include_traces = st.toggle(
-        "Include full session traces (JSON) for more accurate, per-query analysis",
-        value=True,
-        help="Downloads this session's complete MLflow traces (each user query "
-             "with its full span tree - LLM calls and tool inputs/outputs) and "
-             "sends them alongside tool_execution.csv, so hermes can attribute "
-             "tool calls to the query that triggered them and compare multiple "
-             "queries. Same data as download_session_traces.py.",
-    )
-
-    # Full traces (with spans) so the analysis sees exactly what each query did.
-    # These are pre-fetched at Load (loaded_full_traces); only fall back to
-    # downloading here if that pre-fetch came back empty.
-    full_traces = None
-    if include_traces and loaded_full_traces:
-        full_traces = loaded_full_traces
-        st.caption(f"Including **{len(full_traces)}** full trace(s) in the analysis.")
-    elif include_traces:
-        tr_cached = st.session_state.get("traces_result")
-        if tr_cached and not tr_cached.get("err") and not tr_cached["df"].empty:
-            summary_df = tr_cached["df"]
-            summary_err = ""
-        else:
-            with st.spinner("Resolving this session's traces …"):
-                summary_df, summary_err = fetch_session_traces(
+        if st.button("Load traces", key="load_traces"):
+            with st.spinner("Fetching traces …"):
+                tr_df, tr_err = fetch_session_traces(
                     tracking_uri, sess_id, info.get("experiment_id")
                 )
-            if not summary_err and not summary_df.empty:
-                st.session_state["traces_result"] = {"df": summary_df, "err": ""}
+            st.session_state["traces_result"] = {"df": tr_df, "err": tr_err}
 
-        if summary_err:
-            st.warning(f"Traces unavailable, analyzing CSV only: {summary_err}")
-        elif summary_df.empty or "trace_id" not in summary_df.columns:
-            st.warning("No trace ids for this session; analyzing CSV only.")
+        tr = st.session_state.get("traces_result")
+        if tr is None:
+            st.info("Click **Load traces** to fetch this session's traces from MLflow.")
+        elif tr["err"]:
+            st.warning(tr["err"])
+        elif tr["df"].empty:
+            st.info("No traces found for this session.")
         else:
-            trace_ids = tuple(str(t) for t in summary_df["trace_id"].dropna().tolist())
-            with st.spinner(f"Downloading {len(trace_ids)} full trace(s) with spans …"):
-                full_traces, full_err = fetch_full_traces(tracking_uri, trace_ids)
-            if full_err:
-                st.warning(f"Full-trace download failed, analyzing CSV only: {full_err}")
-                full_traces = None
+            st.write(f"Found **{len(tr['df'])}** trace(s).")
+            tdf = tr["df"]
+            # Surface the raw column names search_traces returned, to help map
+            # latency/token fields if any display empty.
+            raw_cols = tdf.attrs.get("raw_columns")
+            # search_traces returns newest-first (n..1); flip to oldest-first (1..n)
+            # and give a 1-based row number instead of the 0-based index.
+            tdf = tdf.iloc[::-1].reset_index(drop=True)
+            tdf.index = range(1, len(tdf) + 1)
+            if raw_cols:
+                with st.expander("Debug: raw trace columns from MLflow", expanded=False):
+                    st.write(raw_cols)
+            if "open_in_mlflow" in tdf.columns:
+                # Render numeric columns as strings to left-align them (the grid
+                # right-aligns real numbers). Keep open_in_mlflow as a URL string so
+                # LinkColumn stays clickable.
+                disp = tdf.copy()
+                for col in disp.columns:
+                    if col != "open_in_mlflow" and pd.api.types.is_numeric_dtype(disp[col]):
+                        disp[col] = disp[col].map(lambda v: "" if pd.isna(v) else f"{v:g}")
+                st.dataframe(
+                    disp,
+                    width="stretch",
+                    column_config={
+                        "open_in_mlflow": st.column_config.LinkColumn(
+                            "Open in MLflow", display_text="↗ View trace"
+                        ),
+                    },
+                )
             else:
-                st.caption(f"Including **{len(full_traces)}** full trace(s) in the analysis.")
+                # Old cached result without the link column - tell the user to reload.
+                st.info("No link column found (stale cache). Click **Clear cache** in "
+                        "the ⋮ menu, then **Load traces** again.")
+                st.dataframe(tdf, width="stretch")
 
-    with st.expander("Raw tool_execution.csv (sent to hermes)", expanded=False):
-        show_left_table(tool_df)
-    if full_traces:
-        with st.expander("Full traces JSON (sent to hermes)", expanded=False):
-            st.json(full_traces)
 
-    run_state = st.session_state.get("analysis_run")  # dict while running
-    running = run_state is not None and run_state.get("proc") is not None
+    with tab_analysis:
+        st.subheader("Hermes Analysis")
+        st.caption(
+            "Runs the local `hermes` CLI with a prompt that analyzes this session's "
+            "tool usage (tool_execution.csv) and suggests improvements."
+        )
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Analyze with hermes", type="primary", disabled=running):
-            proc, out_or_err = start_hermes_analysis(local_dir, sess_id, full_traces)
-            if proc is None:
-                st.session_state["analysis_result"] = {"ok": False, "text": out_or_err}
-                st.session_state.pop("analysis_run", None)
+        include_traces = st.toggle(
+            "Include full session traces (JSON) for more accurate, per-query analysis",
+            value=True,
+            help="Downloads this session's complete MLflow traces (each user query "
+                 "with its full span tree - LLM calls and tool inputs/outputs) and "
+                 "sends them alongside tool_execution.csv, so hermes can attribute "
+                 "tool calls to the query that triggered them and compare multiple "
+                 "queries. Same data as download_session_traces.py.",
+        )
+
+        # Full traces (with spans) so the analysis sees exactly what each query did.
+        # These are pre-fetched at Load (loaded_full_traces); only fall back to
+        # downloading here if that pre-fetch came back empty.
+        full_traces = None
+        if include_traces and loaded_full_traces:
+            full_traces = loaded_full_traces
+            st.caption(f"Including **{len(full_traces)}** full trace(s) in the analysis.")
+        elif include_traces:
+            tr_cached = st.session_state.get("traces_result")
+            if tr_cached and not tr_cached.get("err") and not tr_cached["df"].empty:
+                summary_df = tr_cached["df"]
+                summary_err = ""
             else:
-                st.session_state["analysis_run"] = {"proc": proc, "out_path": out_or_err}
-                st.session_state.pop("analysis_result", None)
-                st.rerun()
-    with c2:
-        if st.button("⏹ Stop", type="primary", disabled=not running):
-            rs = st.session_state.get("analysis_run")
-            if rs and rs.get("proc"):
-                try:
-                    rs["proc"].terminate()
-                    rs["proc"].wait(timeout=5)
-                except Exception:
+                with st.spinner("Resolving this session's traces …"):
+                    summary_df, summary_err = fetch_session_traces(
+                        tracking_uri, sess_id, info.get("experiment_id")
+                    )
+                if not summary_err and not summary_df.empty:
+                    st.session_state["traces_result"] = {"df": summary_df, "err": ""}
+
+            if summary_err:
+                st.warning(f"Traces unavailable, analyzing CSV only: {summary_err}")
+            elif summary_df.empty or "trace_id" not in summary_df.columns:
+                st.warning("No trace ids for this session; analyzing CSV only.")
+            else:
+                trace_ids = tuple(str(t) for t in summary_df["trace_id"].dropna().tolist())
+                with st.spinner(f"Downloading {len(trace_ids)} full trace(s) with spans …"):
+                    full_traces, full_err = fetch_full_traces(tracking_uri, trace_ids)
+                if full_err:
+                    st.warning(f"Full-trace download failed, analyzing CSV only: {full_err}")
+                    full_traces = None
+                else:
+                    st.caption(f"Including **{len(full_traces)}** full trace(s) in the analysis.")
+
+        with st.expander("Raw tool_execution.csv (sent to hermes)", expanded=False):
+            show_left_table(tool_df)
+        if full_traces:
+            with st.expander("Full traces JSON (sent to hermes)", expanded=False):
+                st.json(full_traces)
+
+        run_state = st.session_state.get("analysis_run")  # dict while running
+        running = run_state is not None and run_state.get("proc") is not None
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Analyze with hermes", type="primary", disabled=running):
+                proc, out_or_err = start_hermes_analysis(local_dir, sess_id, full_traces)
+                if proc is None:
+                    st.session_state["analysis_result"] = {"ok": False, "text": out_or_err}
+                    st.session_state.pop("analysis_run", None)
+                else:
+                    st.session_state["analysis_run"] = {"proc": proc, "out_path": out_or_err}
+                    st.session_state.pop("analysis_result", None)
+                    st.rerun()
+        with c2:
+            if st.button("⏹ Stop", type="primary", disabled=not running):
+                rs = st.session_state.get("analysis_run")
+                if rs and rs.get("proc"):
                     try:
-                        rs["proc"].kill()
+                        rs["proc"].terminate()
+                        rs["proc"].wait(timeout=5)
                     except Exception:
-                        pass
-                partial = read_analysis_output(rs.get("out_path", ""))
-                st.session_state["analysis_result"] = {
-                    "ok": False,
-                    "text": "Analysis stopped by user."
-                            + (f"\n\nPartial output:\n\n{partial}" if partial else ""),
-                }
-            st.session_state.pop("analysis_run", None)
-            st.rerun()
+                        try:
+                            rs["proc"].kill()
+                        except Exception:
+                            pass
+                    partial = read_analysis_output(rs.get("out_path", ""))
+                    st.session_state["analysis_result"] = {
+                        "ok": False,
+                        "text": "Analysis stopped by user."
+                                + (f"\n\nPartial output:\n\n{partial}" if partial else ""),
+                    }
+                st.session_state.pop("analysis_run", None)
+                st.rerun()
 
-    @st.fragment(run_every=2)
-    def _poll_analysis():
-        """Poll the running hermes subprocess on its own timer, isolated from
+        @st.fragment(run_every=2)
+        def _poll_analysis():
+            """Poll the running hermes subprocess on its own timer, isolated from
         the rest of the page.
 
         A plain time.sleep()+st.rerun() loop here reruns the WHOLE script
@@ -3151,29 +3401,29 @@ with tab_analysis:
         st.fragment reruns only this function's body on its own schedule,
         leaving tab selection (and the rest of the page) untouched.
         """
-        rs = st.session_state.get("analysis_run")
-        if rs is None:
-            return  # nothing running; cheap no-op until Analyze is clicked
-        proc = rs["proc"]
-        if proc.poll() is None:
-            st.info("Running hermes analysis … click **⏹ Stop** to cancel.")
-            return
-        # Finished - capture output, clear running state, and do ONE
-        # page-level rerun so the result renders below, outside this fragment.
-        text = read_analysis_output(rs.get("out_path", ""))
-        ok = proc.returncode == 0 or bool(text)
-        st.session_state["analysis_result"] = {
-            "ok": ok,
-            "text": text or f"hermes exited with code {proc.returncode} and no output.",
-        }
-        st.session_state.pop("analysis_run", None)
-        st.rerun()
+            rs = st.session_state.get("analysis_run")
+            if rs is None:
+                return  # nothing running; cheap no-op until Analyze is clicked
+            proc = rs["proc"]
+            if proc.poll() is None:
+                st.info("Running hermes analysis … click **⏹ Stop** to cancel.")
+                return
+            # Finished - capture output, clear running state, and do ONE
+            # page-level rerun so the result renders below, outside this fragment.
+            text = read_analysis_output(rs.get("out_path", ""))
+            ok = proc.returncode == 0 or bool(text)
+            st.session_state["analysis_result"] = {
+                "ok": ok,
+                "text": text or f"hermes exited with code {proc.returncode} and no output.",
+            }
+            st.session_state.pop("analysis_run", None)
+            st.rerun()
 
-    _poll_analysis()
+        _poll_analysis()
 
-    result = st.session_state.get("analysis_result")
-    if result:
-        if result["ok"]:
-            st.markdown(result["text"])
-        else:
-            st.error(result["text"])
+        result = st.session_state.get("analysis_result")
+        if result:
+            if result["ok"]:
+                st.markdown(result["text"])
+            else:
+                st.error(result["text"])

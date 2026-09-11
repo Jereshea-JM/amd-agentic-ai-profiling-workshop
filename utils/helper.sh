@@ -44,13 +44,37 @@ export HF_HOME="$HOME/.cache/huggingface"
 sudo chown -R $USER:$USER "$HOME/.cache/huggingface"
 HERMES_GPU="0"   # Muse-Glimmer-30B runs on GPU 0
 
-# vLLM image: the official ROCm release image. Muse-Glimmer support ships in
-# vLLM v0.28.0, so the release image is used directly with no local build or
-# source overlay.
+# vLLM image: the official ROCm release image, which includes Muse-Glimmer
+# support in v0.28.0.
 IMAGE_NAME="vllm/vllm-openai-rocm:v0.28.0"
 VLLM_HERMES_PORT=8001
 
 SYSTEM_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || ip route get 8.8.8.8 | awk '{print $7; exit}')
+
+# Base for the browser-facing links this script prints (and the same knob the
+# notebook reads for its "detailed view" hyperlinks). Honors a value you export
+# before running this script; defaults to the AMD hosted-notebook proxy.
+# Interpreted three ways, matching hermes_profiler.py:
+#   "https://host" (has "://")  -> proxy:  <base>/<hostname>/proxy/<port>/
+#   ""             (empty)      -> direct: http://127.0.0.1:<port>/
+#   "10.0.0.5"     (bare host)  -> direct: http://10.0.0.5:<port>/
+# NOTE: this export reaches processes started FROM this shell. A JupyterLab
+# kernel started separately will not see it, so for the notebook either export
+# HERMES_PROXY_BASE before launching JupyterLab or pick it in the notebook's
+# dropdown.
+export HERMES_PROXY_BASE="${HERMES_PROXY_BASE-https://notebooks.amd.com}"
+
+# Build a browser URL for a service PORT from HERMES_PROXY_BASE (see above).
+service_url() {
+    local port="$1" base="$HERMES_PROXY_BASE"
+    if [ -z "$base" ]; then
+        echo "http://127.0.0.1:${port}/"
+    elif [[ "$base" == *"://"* ]]; then
+        echo "${base%/}/$(hostname)/proxy/${port}/"
+    else
+        echo "http://${base}:${port}/"
+    fi
+}
 
 # Clear caches before starting.
 bash "$UTILS_DIR/clear_cache.sh"
@@ -98,7 +122,7 @@ cleanup() {
     sudo docker rm lgtm >/dev/null 2>&1
 
     echo "[INFO] Removing profiling artifacts cache..."
-    rm -rf "$HOME/profiling_cache" >/dev/null 2>&1
+    rm -rf "${HERMES_PROFILING_CACHE_DIR:-$WORKSPACE_DIR/profiling_cache}" >/dev/null 2>&1
     echo "[INFO] Cleanup complete. Exiting."
     exit "$exit_code"
 }
@@ -284,7 +308,7 @@ fi
 #   ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
 #          Hint: The package was installed by debian.
 #
-# mlflow 3.13.0 pulls a newer typing_extensions than the apt-shipped 4.10.0.
+# mlflow pulls a newer typing_extensions than the apt-shipped 4.10.0.
 # --ignore-installed on just the offending names lets pip shadow them in
 # site-packages without removing the apt copy. It is scoped deliberately: a
 # blanket --ignore-installed would redownload the entire dependency tree.
@@ -294,17 +318,17 @@ PIP_SHADOW_DEBIAN="--ignore-installed typing_extensions"
 # ships traces to MLflow over the OTLP/HTTP protobuf endpoint. Without it the
 # plugin loads and prints its banner but exports nothing, so the dashboard sits
 # empty with no error.
+# Tested with mlflow 3.16.0.
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN \
-  mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
+  mlflow opentelemetry-sdk==1.42.1 \
   opentelemetry-exporter-otlp-proto-http==1.42.1
 
-# Verify the install here with an accurate message rather than letting it
-# surface later as a confusing "MLflow server failed to start". Check the OTLP
-# exporter too: without it the plugin exports nothing silently.
+# Verify mlflow and the OTLP exporter imported, so a missing dependency fails
+# here with a clear message rather than later.
 if ! python3 -c "import mlflow" 2>/dev/null; then
     echo "[FATAL] mlflow did not install into $(command -v python3)."
     echo "        Re-run without -q to see the error:"
-    echo "        python3 -m pip install $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN mlflow==3.13.0"
+    echo "        python3 -m pip install $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN mlflow"
     exit 1
 fi
 if ! python3 -c "from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter" 2>/dev/null; then
@@ -315,18 +339,14 @@ fi
 echo "[OK] MLflow $(python3 -c 'import mlflow; print(mlflow.__version__)') and the OTLP exporter are installed."
 
 echo "[INFO] Launching MLflow server on port 5004..."
-# --serve-artifacts / --artifacts-destination: without a configured artifact
-# store MLflow records the RUN but cannot serve its artifacts, so the dashboard
-# and the Traces view come up with missing detail. Keep --allowed-hosts "*",
-# which the dashboard needs when it is reached over the server IP rather than
-# localhost.
-pip install --upgrade anyio starlette fastapi mlflow
+# --allowed-hosts "*" lets the dashboard reach the server over the server IP, not
+# only localhost. No artifact store is configured: the OTLP flow records traces,
+# not MLflow runs with artifacts.
+pip install --upgrade "mlflow>=3.0.0" fastapi uvicorn pydantic
 python3 -m mlflow server \
   --host 0.0.0.0 \
   --port 5004 \
   --backend-store-uri sqlite:///mlflow.db \
-  --serve-artifacts \
-  --artifacts-destination ./mlflow_artifacts \
   --allowed-hosts "*" > mlflow_server.log 2>&1 &
 
 MLFLOW_PID=$!
@@ -362,6 +382,15 @@ fi
 # written into config.yaml below (endpoint :4318, metrics: true).
 echo "[INFO] Launching Grafana LGTM (CPU/GPU metrics backend)..."
 sudo docker rm -f lgtm >/dev/null 2>&1
+
+# Pull the image if it is not already present locally.
+if [ -z "$(sudo docker images -q grafana/otel-lgtm)" ]; then
+    echo "[INFO] Image grafana/otel-lgtm not found locally. Pulling..."
+    sudo docker pull grafana/otel-lgtm
+else
+    echo "[OK] Image grafana/otel-lgtm found locally. Skipping pull."
+fi
+
 sudo docker run -d --name lgtm \
     -p 3000:3000 -p 4317:4317 -p 4318:4318 -p 9090:9090 \
     grafana/otel-lgtm
@@ -385,7 +414,7 @@ done
 if [ "$lgtm_ready" -ne 1 ]; then
     fail "Grafana LGTM" ""
 fi
-echo "[INFO] Grafana UI at http://${SYSTEM_IP}:3000/ (metrics also queryable at :9090)"
+echo "[INFO] Grafana UI at $(service_url 3000) (metrics also queryable at :9090)"
 
 # ===========================================================================
 # Hermes Installation & Configuration
@@ -501,24 +530,25 @@ fi
 # ===========================================================================
 # Hermes OpenTelemetry Plugin Setup
 # ===========================================================================
-# The per-span/per-turn CPU and GPU profiling this whole workshop is built
-# around is native on upstream main as of this commit (host_metrics.py,
-# gpu_probe.py, the host_metrics/host_metrics_gpu/host_metrics_interval_ms/
-# flush_interval_ms config keys) - no patch needed. No tagged release has it
-# yet, so this pins the exact commit rather than a bare clone left on whatever
-# `main` happens to be on the day the script runs (that drifts silently -
-# matches utils/Dockerfile, which pins the same commit for the same reason).
-echo "[INFO] Installing Hermes OpenTelemetry plugin (pinned @ ${HERMES_OTEL_COMMIT:0:7})..."
+# The per-span / per-turn CPU and GPU profiling this workshop relies on is
+# provided by the hermes-otel plugin (host_metrics.py, gpu_probe.py and the
+# host_metrics / host_metrics_gpu / host_metrics_interval_ms / flush_interval_ms
+# config keys).
+echo "[INFO] Installing Hermes OpenTelemetry plugin..."
 
 rm -rf "$HOME/.hermes/plugins/hermes_otel"
 mkdir -p "$HOME/.hermes/plugins"
+# Install the hermes-otel plugin from its latest release tag.
+# Tested on hermes-otel-v1.3.0.
 git clone https://github.com/briancaffey/hermes-otel.git "$HOME/.hermes/plugins/hermes_otel"
-
 cd "$HOME/.hermes/plugins/hermes_otel"
-git getch origin 
-# The code was tested in the below commit-id
-# HERMES_OTEL_COMMIT="7497441ccf156b9ed1f009fefe08935925bd7b42"
-# git checkout "$HERMES_OTEL_COMMIT"
+HERMES_OTEL_VERSION="$(git tag -l 'hermes-otel-v*' | sort -V | tail -1)"
+if [ -n "$HERMES_OTEL_VERSION" ]; then
+    echo "[INFO] Using latest hermes-otel release: $HERMES_OTEL_VERSION"
+    git checkout -q "$HERMES_OTEL_VERSION"
+else
+    echo "[WARN] No hermes-otel release tag found; staying on the default branch."
+fi
 
 # Install the plugin package in editable mode using standard python/pip.
 # Same PEP 668 opt-out as the MLflow install above; PIP_SYS_FLAGS is empty on
@@ -526,8 +556,7 @@ git getch origin
 echo "[INFO] Installing plugin package in editable mode..."
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN -e .
 
-# An editable install that silently no-ops leaves the agent running with no
-# telemetry plugin and no error, so assert the package actually imports.
+# Assert the plugin package actually imports after the editable install.
 if ! python3 -c "import hermes_otel" 2>/dev/null; then
     echo "[WARN] hermes_otel is not importable from $(command -v python3) after the editable install."
     echo "       Telemetry may not be exported. Check the pip output above."
@@ -592,9 +621,8 @@ if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
 fi
 echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)"
 # Dependencies for the hermes-otel plugin, inside the Hermes venv. GPU numbers
-# come from amdsmi queried directly in-process (gpu_probe.py / host_metrics.py),
-# not from scraping an external AMD Device Metrics Exporter container over
-# HTTP. CPU numbers come from `psutil`.
+# come from amdsmi queried in-process (gpu_probe.py / host_metrics.py) and CPU
+# numbers from psutil.
 #
 # amdsmi is intentionally left unpinned: it ships with the ROCm stack and
 # should match whatever ROCm version is already on this host rather than a
@@ -607,8 +635,7 @@ echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)
   opentelemetry-exporter-otlp-proto-http==1.42.1
 "$HERMES_VENV_PY" -m pip install -q --no-deps psutil
 "$HERMES_VENV_PY" -m pip install -q amdsmi
-"$HERMES_VENV_PY" -m pip install -q matplotlib
-"$HERMES_VENV_PY" -m pip install -q mlflow==3.13.0 requests
+"$HERMES_VENV_PY" -m pip install -q requests
 
 # The plugin package itself must also be importable from the Hermes venv, not
 # just from the system interpreter, or the agent loads no telemetry backend.
@@ -624,7 +651,7 @@ import sys
 missing = []
 for mod in ("opentelemetry.sdk",
             "opentelemetry.exporter.otlp.proto.http.trace_exporter",
-            "psutil", "amdsmi", "requests", "mlflow", "hermes_otel"):
+            "psutil", "amdsmi", "requests", "hermes_otel"):
     try:
         __import__(mod)
     except Exception as exc:            # noqa: BLE001
@@ -646,18 +673,12 @@ if [ $? -ne 0 ]; then
     echo "[FATAL] Aborting: Hermes telemetry dependencies are not installed."
     exit 1
 fi
-echo "[INFO] MLflow tracking available at http://${SYSTEM_IP}:5004/"
+echo "[INFO] MLflow tracking available at $(service_url 5004)"
 
-# No more ~/.hermes/.env writes here. HERMES_CSV_DUMP / HERMES_PLOT_PROFILING /
-# HERMES_VLLM_CACHE_METRICS / HERMES_VLLM_PORT / HERMES_PROFILING_OUTPUT_DIR /
-# MLFLOW_RUN_NAME / MLFLOW_TRACKING_URI / MLFLOW_EXPERIMENT_NAME all gated or
-# fed csv_dump.py / mlflow_hooks.py, neither of which exists on upstream main
-# (confirmed: no file in the plugin references any of them) - CSV output and
-# MLflow run-based metadata were specific to an old out-of-tree patch. CPU/GPU
-# now flows as OTel metrics into Grafana LGTM (config.yaml above, endpoint set
-# there directly, not via env), and traces carry their own session/turn
-# metadata without any MLflow "run" being created at all. The hermes-otel
-# plugin needs nothing from ~/.hermes/.env.
+# The hermes-otel plugin needs nothing from ~/.hermes/.env: CPU/GPU flow as OTel
+# metrics into Grafana LGTM (see config.yaml above, which sets the endpoint
+# directly), and traces carry their own session/turn metadata, so no MLflow run
+# or env-driven CSV output is involved.
 
 # ===========================================================================
 # Kokoro TTS server
@@ -685,7 +706,7 @@ if [ -f "$UTILS_DIR/requirements.txt" ]; then
     "$KOKORO_ENV/bin/pip" install -q -r "$UTILS_DIR/requirements.txt"
 else
     echo "[WARN] $UTILS_DIR/requirements.txt not found; installing known deps."
-    "$KOKORO_ENV/bin/pip" install -q 'streamlit>=1.30' 'plotly>=5.18' 'pandas>=2.0' mlflow==3.13.0
+    "$KOKORO_ENV/bin/pip" install -q 'streamlit>=1.30' 'plotly>=5.18' 'pandas>=2.0' mlflow
 fi
 
 # Assert every module the dashboard imports at top level actually resolves.
@@ -912,11 +933,12 @@ fi
 
 echo -e "\n========================================================================="
 echo "[OK] Setup complete."
-echo "  vLLM endpoint:        http://${SYSTEM_IP}:$VLLM_HERMES_PORT"
-echo "  Kokoro TTS server:    http://${SYSTEM_IP}:$KOKORO_PORT"
-echo "  MLflow tracking:      http://${SYSTEM_IP}:5004"
-echo "  Grafana (CPU/GPU):    http://${SYSTEM_IP}:3000"
-echo "  Telemetry dashboard:  http://${SYSTEM_IP}:8501"
+echo "  vLLM endpoint (API):  http://${SYSTEM_IP}:$VLLM_HERMES_PORT"
+echo "  Kokoro TTS (API):     http://${SYSTEM_IP}:$KOKORO_PORT"
+echo "  MLflow tracking:      $(service_url 5004)"
+echo "  Grafana (CPU/GPU):    $(service_url 3000)"
+echo "  Telemetry dashboard:  $(service_url 8501)"
+echo "  (browser link base: HERMES_PROXY_BASE=\"$HERMES_PROXY_BASE\" — set \"\" for 127.0.0.1, or a host/IP)"
 echo "========================================================================="
 echo "[INFO] Holding the session open. Press Ctrl+C to stop all services and exit."
 

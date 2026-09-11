@@ -9,29 +9,20 @@
 # This runs INSIDE the image during build and fails it loudly instead.
 set -euo pipefail
 
-ENV_FILE=/root/.hermes/.env
 OTEL_CFG=/root/.hermes/plugins/hermes_otel/config.yaml
 fail=0
 
 note() { printf '  %s\n' "$1"; }
 
-echo "[img-check] .env required keys"
-# HERMES_TOOL_PROFILING gates tool_profiler._enabled(). Without it the CPU/GPU
-# poller never starts, no timeline CSVs are written, and every MLflow run has
-# zero artifacts while still logging vLLM metrics, so nothing looks wrong.
-for key in \
-    MLFLOW_TRACKING_URI \
-    HERMES_PROFILING_OUTPUT_DIR \
-    HERMES_GPU_EXPORTER_URL \
-    KOKORO_SERVER_URL \
-    MLFLOW_EXPERIMENT_NAME \
-    MLFLOW_KEEP_RUN_ACTIVE \
-    HERMES_TOOL_PROFILING
-do
-    if grep -qE "^${key}=" "$ENV_FILE"; then
-        note "OK   ${key}=$(grep -m1 -E "^${key}=" "$ENV_FILE" | cut -d= -f2-)"
+echo "[img-check] hermes-otel config backends and metrics"
+# The plugin reads config.yaml (matching utils/helper.sh); no ~/.hermes/.env is
+# needed. Traces must go to the mlflow backend and CPU/GPU metrics to the lgtm
+# backend, with host metrics enabled, or the dashboard renders empty.
+for needle in 'host_metrics: true' 'name: mlflow' 'name: lgtm'; do
+    if grep -qF "$needle" "$OTEL_CFG"; then
+        note "OK   ${needle}"
     else
-        note "MISS ${key} absent from ${ENV_FILE}"
+        note "MISS '${needle}' absent from ${OTEL_CFG}"
         fail=1
     fi
 done
