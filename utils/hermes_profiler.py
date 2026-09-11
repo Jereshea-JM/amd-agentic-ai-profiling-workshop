@@ -1598,8 +1598,8 @@ def build_session_waterfall_figure(traces, cpu_df, gpu_df, tool_df=None) -> go.F
 # Four metrics derived from the span tree the dashboard already downloads at
 # Load: agent steps, time-to-first-tool, context growth per step, and tool
 # failure rate. Nothing here needs new instrumentation or a re-run -- it is
-# arithmetic over telemetry the patched hermes-otel plugin already emits, so it
-# also works on sessions recorded before these metrics existed.
+# arithmetic over telemetry the hermes-otel plugin already emits, so it also
+# works on sessions recorded before these metrics existed.
 #
 # These build on the span helpers above (_clean_attr / _span_attrs /
 # _trace_spans) rather than re-implementing them.
@@ -1728,9 +1728,9 @@ def _tool_outcome(span):
     """Outcome label for one tool span.
 
     hermes.tool.outcome is set per call by the plugin and is authoritative. When
-    absent -- an unpatched plugin, or another framework -- fall back to the same
-    rules the plugin's extract_tool_result_status applies to the raw payload, so
-    both paths agree on what counts as a failure.
+    absent -- an older plugin version, or another framework -- fall back to the
+    same rules the plugin's extract_tool_result_status applies to the raw
+    payload, so both paths agree on what counts as a failure.
     """
     attrs = span.get("attrs", {})
     outcome = attrs.get("hermes.tool.outcome")
@@ -2571,7 +2571,10 @@ def show_session_overview(session_id=None, ip="127.0.0.1", port="5004",
 
     fig = session_overview_figure(session_id, ip=ip, port=port, prom_url=prom_url,
                                   verbose=False)
-    fig.show()
+    try:
+        fig.show(renderer="png")
+    except Exception:
+        fig.show()
     display(Markdown(session_detail_links(session_id, ip=ip, port=port,
                                           dashboard_port=dashboard_port, host=host,
                                           proxy_base=proxy_base)))
@@ -3026,7 +3029,7 @@ if _running_under_streamlit():
         st.subheader("Context & tools")
         st.caption(
             "Derived from this session's span trees. Nothing here needs new "
-            "instrumentation -- it is arithmetic over telemetry the patched "
+            "instrumentation -- it is arithmetic over telemetry the "
             "hermes-otel plugin already emits."
         )
 

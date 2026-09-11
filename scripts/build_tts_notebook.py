@@ -3,8 +3,8 @@
 Regenerate tts.ipynb for the AMD Agentic AI Profiling Workshop.
 
 The notebook is generated from this script so it stays reproducible and diffable:
-  * Backend-driving code cells (the `!hermes ...` calls and the dashboard-link
-    helper) are reused verbatim from the source notebooks via orig() / orig_exec().
+  * Every cell's source is a literal in this file, so the script is
+    self-contained: it reads no other notebook.
   * The matplotlib chart cell is rewritten here with AMD branding.
   * Images are embedded as inline base64 data URIs, each with alt text and a caption.
 
@@ -19,28 +19,6 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 NB_PATH = os.path.join(ROOT, "tts.ipynb")
 DIAGRAMS = os.path.join(ROOT, "assets", "diagrams")
 OUTPUTS = os.path.join(ROOT, "assets", "outputs")
-
-# Source notebook for cells reused unchanged via orig().
-SOURCE_NB = os.path.join(HERE, "tts_original.ipynb")
-with open(SOURCE_NB, encoding="utf-8") as f:
-    ORIG = json.load(f)
-
-
-def orig(idx):
-    """Return the ORIGINAL notebook cell source (list form), unchanged."""
-    return ORIG["cells"][idx]["source"]
-
-
-# Source notebook for cells taken from the executed run, reused via orig_exec().
-EXEC_SNAPSHOT = os.path.join(HERE, "tts_exec_source.ipynb")
-with open(EXEC_SNAPSHOT, encoding="utf-8") as f:
-    ORIG_EXEC = json.load(f)
-
-
-def orig_exec(idx):
-    """Return a cell source from the executed workshop notebook, unchanged."""
-    return ORIG_EXEC["cells"][idx]["source"]
-
 
 # ---- cell builders ----------------------------------------------------------
 _cells = []
@@ -81,9 +59,7 @@ def img(name, alt, caption, width="88%", subdir="diagrams"):
 
 # Overview cells shown after each profiling run. The Step 2 cell exposes the
 # link-base dropdown and sets HERMES_PROXY_BASE; the kokoro cells reuse it.
-_OVERVIEW_EDGE = '''# Overview graph + two "detailed view" links, with a dropdown to choose where the
-# links point. Reuses hermes_profiler.py (its Streamlit UI is guarded, so importing
-# it here runs only its functions).
+_OVERVIEW = '''# This cell shows an overview tab alone; for a detailed view, click on the links provided when running this cell.
 import importlib, sys, os, logging
 sys.path.insert(0, os.path.abspath("utils"))
 logging.disable(logging.WARNING)          # mute Streamlit's import-time warnings
@@ -91,24 +67,9 @@ import hermes_profiler
 importlib.reload(hermes_profiler)          # pick up edits without a kernel restart
 logging.disable(logging.NOTSET)
 
-# Pick the link base in the dropdown below (default: AMD hosted proxy). Choose
-# "Local - 127.0.0.1" for direct links, or "Custom" to type your own base
-# ("" = 127.0.0.1, "10.0.0.5" = that host, "https://my-proxy" = a proxy). Your
-# choice is saved to HERMES_PROXY_BASE, so the sequential and batched Kokoro
-# approaches shown in the upcoming cells reuse it.
-SESSION_ID = None   # a run id, or None to auto-fetch the latest session
-hermes_profiler.overview_selector(SESSION_ID)'''
+SESSION_ID = None   # a run ID, or None to auto-fetch the latest session
+hermes_profiler.show_session_overview(SESSION_ID)'''
 
-_OVERVIEW_RUN = '''# Overview graph + two "detailed view" links for the run above (its own session).
-# Reuses the HERMES_PROXY_BASE you set in the Step 2 cell (run that cell first).
-import importlib, sys, os, logging
-sys.path.insert(0, os.path.abspath("utils"))
-logging.disable(logging.WARNING)
-import hermes_profiler
-importlib.reload(hermes_profiler)
-logging.disable(logging.NOTSET)
-
-hermes_profiler.show_session_overview()   # None -> newest session (the run above)'''
 
 
 # =============================================================================
@@ -320,7 +281,7 @@ it to `input_text.txt`, which is then passed to the TTS tool.
 )
 # The input-passage prompt (~8,450 characters). A longer passage makes the
 # batching improvement later in the notebook more visible.
-code(orig_exec(11))
+code('''!hermes chat --yolo --oneshot -q "Write ONE single continuous paragraph of nearly about 1,000 words (roughly 8000 characters) on the topic of AMD GPUs. It must be a single block of flowing prose: do NOT number the sentences, do NOT put each sentence on its own line, and do NOT use any line breaks, headings, bullet points, lists, quotes, code, or special symbols. Use normal sentence punctuation (periods and commas) so it reads naturally for text-to-speech. Write the whole passage as one block with no newline characters. Save it to 'input_text.txt' in the current directory, overwriting existing content, using your write/file tool. Do not read any other file."''')
 
 md(
 """> **Make it your own.** Feel free to pick a different topic for the passage, and
@@ -346,7 +307,7 @@ it.
 # is deliberate: leaving the agent to work out how is what produces the repeated
 # tool calls the "Edge TTS observations" section below discusses, which is the
 # behaviour this step exists to demonstrate.
-code(orig_exec(14))
+code('''!hermes chat --yolo --oneshot -q "Convert the entire text in input_text.txt to audio and save it in output_audio.mp3"''')
 
 # ---- 7. Step 2: Profiling ---------------------------------------------------
 md(
@@ -378,8 +339,7 @@ high-level overview the dashboard gives you.
 """
 )
 
-md(
-"""### Launching the profiling dashboard
+md('''### Launching the profiling dashboard
 
 To make the MLflow data easier to read, we built a custom Streamlit dashboard on
 port `8501`, started for you by `utils/helper.sh`. The cell below resolves your
@@ -398,59 +358,19 @@ server address and gives you a direct link.
    tool-breakdown table sits below the chart.
 2. **CPU / GPU separate.** Shows the CPU and GPU graphs individually, with an
    option to view the raw `.csv` files the Overview charts are plotted from.
-3. **Traces.** Provides a direct MLflow link for each turn in the session.
-4. **Analysis.** Feeds the MLflow traces plus each tool's execution time to the
+3. **Context & tools.** Charts how the agent's context grows step by step across the session, plus a per-turn breakdown and every tool    outcome, including failures.
+4. **Traces.** Provides a direct MLflow link for each turn in the session.
+5. **Analysis.** Feeds the MLflow traces plus each tool's execution time to the
    local `hermes` CLI and reports how the agent could be improved. Depending on
    the length of the traces this can take around five minutes.
-"""
-)
+''')
 # This cell prints both the localhost link (for the SSH-port-forward and
 # container paths, where only localhost resolves) and the server-IP link (for an
 # attendee hitting a remote box directly), and labels which is which.
-code(
-'''import socket
-from IPython.display import display, Markdown
-
-# The port the telemetry dashboard is running on (started by utils/helper.sh).
-DASHBOARD_PORT = 8501
-
-
-def get_host_ip():
-    """Best-effort outbound interface IP for this machine.
-
-    Opens a UDP socket toward a public address (no packets are actually sent)
-    purely to ask the OS which local interface it would route through.
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return None
-
-
-system_ip = get_host_ip()
-
-local_link = f"http://localhost:{DASHBOARD_PORT}/"
-display(Markdown(
-    f"**[Open the dashboard (same machine / SSH port-forward)]({local_link})**"
-))
-print(f"localhost URL : {local_link}")
-
-if system_ip:
-    remote_link = f"http://{system_ip}:{DASHBOARD_PORT}/"
-    display(Markdown(
-        f"**[Open the dashboard (remote machine, direct)]({remote_link})**"
-    ))
-    print(f"server-IP URL : {remote_link}")
-else:
-    print("server-IP URL : could not detect this machine's outbound IP; "
-          "use the localhost link or your known server address.")
-'''
-)
-code(_OVERVIEW_EDGE)
+code('''# NOTE: Skip this cell if you are using the default AMD hosted-notebook proxy.
+# If you are running locally or using a custom proxy, uncomment and set the appropriate base below:
+# os.environ["HERMES_PROXY_BASE"] = ""  # Use "" for local 127.0.0.1 links, or "https://your-custom-proxy"''')
+code(_OVERVIEW)
 
 # ---- 8. Step 3: Analyzing the logs -----------------------------------------
 md(
@@ -481,15 +401,13 @@ Once the run loads, explore what the dashboard shows for this execution:
 """
 )
 
-img("overview.png",
-    "The AMD Agent Telemetry dashboard Overview tab for a Hermes session. A span "
-    "waterfall shows the agent, LLM and API spans plus the text_to_speech tool "
-    "span highlighted in orange as the longest at 24.44 seconds, and a CPU/GPU "
-    "utilization time series below tracks hardware use across the run.",
-    "The Overview tab of the telemetry dashboard. The orange text_to_speech span "
-    "is the longest single step, and the utilization chart shows the GPU is "
-    "mostly idle while it runs. That gap is exactly the bottleneck we will fix.",
-    width="96%", subdir="outputs/hermes_web_ui/edge")
+md('''<div align="center">
+
+![The AMD Agent Telemetry dashboard Overview tab for a Hermes session. A span waterfall shows the agent, LLM and API spans plus the text_to_speech tool span highlighted in orange as the longest at 24.44 seconds, and a CPU/GPU utilization time series below tracks hardware use across the run.](./assets/images/dashboard/dashboard_overview.png)
+
+<sub>*The Overview tab of the telemetry dashboard. The orange text_to_speech span is the longest single step, and the utilization chart shows the GPU is mostly idle while it runs. That gap is exactly the bottleneck we will fix.*</sub>
+
+</div>''')
 
 md(
 """<details>
@@ -639,8 +557,8 @@ The tool is defined in `custom_tools/kokoro_tts_tool.py` and backed by
 `utils/kokoro_server.py`. Let's run it on our input and profile how it performs.
 """
 )
-code(orig_exec(26))
-code(_OVERVIEW_RUN)
+code('''!hermes chat --yolo --oneshot -q "Use the kokoro_tts tool and pass the file path 'input_text.txt' as the text_file parameter to convert the text to speech. Do not read the file yourself"''')
+code(_OVERVIEW)
 
 md(
 """### How `kokoro_tts` works, and why the first run is slow
@@ -697,8 +615,8 @@ md(
 compare.
 """
 )
-code(orig_exec(32))
-code(_OVERVIEW_RUN)
+code('''!hermes chat --yolo --oneshot -q "Use the kokoro_tts tool with the mode parameter set to 'batched', and pass the file path 'input_text.txt' as the text_file parameter. Do not read the file yourself"''')
+code(_OVERVIEW)
 
 md(
 """Load this run in the dashboard the same way as before: click **Fetch**, select
@@ -774,21 +692,18 @@ sequential-to-batched optimization show up in a single view.
 )
 
 # AMD-branded matplotlib chart (pure presentation, rewritten from orig cell 26).
-code(
-r"""import os
+code(r'''%matplotlib inline
+import os
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 # --- Tool execution time (seconds) for each approach ---
 # Default values; replace them with the execution seconds from your own runs,
 # taken from each tool's output line and the profiling dashboard.
-edge_time = 24.4      # Edge TTS (cloud) - note: truncates long text (~5 min cap)
-seq_time = 106.1      # Kokoro, sequential mode (local, unoptimized)
-batched_time = 9.7    # Kokoro, batched mode (local, optimized)
+edge_time = 11.09      # Edge TTS (cloud) - note: truncates long text (~5 min cap)
+seq_time = 67.2      # Kokoro, sequential mode (local, unoptimized)
+batched_time = 5.02    # Kokoro, batched mode (local, optimized)
 
-# --- AMD look and feel -------------------------------------------------------
-# Arial-metric font (Liberation Sans) so the chart matches the AMD web family,
-# with a graceful fallback to whatever sans-serif is installed.
 for _f in ("Arial", "Liberation Sans", "DejaVu Sans"):
     if any(_f in f.name for f in font_manager.fontManager.ttflist):
         plt.rcParams["font.family"] = _f
@@ -846,8 +761,7 @@ plt.savefig("outputs/tts_execution_comparison.png", dpi=150, bbox_inches="tight"
 plt.show()
 
 print(f"Edge: {edge_time:.1f}s | Sequential: {seq_time:.1f}s | "
-      f"Batched: {batched_time:.1f}s")"""
-)
+      f"Batched: {batched_time:.1f}s")''')
 
 # ---- 13. Try it on your own -------------------------------------------------
 md(
@@ -986,14 +900,27 @@ it.
 # =============================================================================
 for i, c in enumerate(_cells):
     c["id"] = f"cell-{i:02d}"
+_cells = [{k: c[k] for k in sorted(c)} for c in _cells]
 
 nb = {
     "cells": _cells,
     "metadata": {
+        # Exactly what Jupyter writes back for this kernel, so a rebuild does not
+        # show up as a diff after the notebook has merely been opened and saved.
         "kernelspec": {
-            "display_name": "Python 3", "language": "python", "name": "python3"
+            "display_name": "Python 3 (ipykernel)",
+            "language": "python",
+            "name": "python3",
         },
-        "language_info": {"name": "python", "version": "3.12"},
+        "language_info": {
+            "codemirror_mode": {"name": "ipython", "version": 3},
+            "file_extension": ".py",
+            "mimetype": "text/x-python",
+            "name": "python",
+            "nbconvert_exporter": "python",
+            "pygments_lexer": "ipython3",
+            "version": "3.12.3",
+        },
     },
     "nbformat": 4,
     "nbformat_minor": 5,

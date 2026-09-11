@@ -45,7 +45,7 @@ Run the agent, **Fetch** the run in the dashboard, inspect the spans and GPU usa
 
 ## The optimization at a glance
 
-The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mostly idle. The workshop adds a **batched** mode that groups sentences into a single GPU forward pass.
+The default TTS uses Edge TTS, which has some limitations. We therefore use a local TTS model. However, it processes one sentence at a time, leaving the MI300X mostly idle. The workshop introduces a **batched mode** that processes multiple sentences together in a single GPU pass, improving GPU utilization and performance.
 
 <p align="center">
   <img src="assets/diagrams/04_journey.png" alt="Three approaches compared: cloud Edge TTS baseline, local Kokoro sequential baseline, and local Kokoro batched optimized" width="92%">
@@ -243,4 +243,4 @@ The generator reuses the workshop's backend-driving code cells verbatim, so edit
 
 **Authors:** Shailen Sobhee, Sabira Shaik, Jereshea John Mary
 
-Built for AMD developer enablement on AMD Instinct&trade; GPUs. Powered by [Hermes Agent](https://hermes-agent.nousresearch.com) (Nous Research), [MLflow](https://mlflow.org), and [Kokoro TTS](https://github.com/hexgrad/kokoro).
+Built for AMD developer enablement on AMD Instinct&trade; GPUs. Powered by [Hermes Agent](https://hermes-agent.nousresearch.com) (Nous Research), [MLflow](https://mlflow.org), [hermes-otel](https://github.com/briancaffey/hermes-otel), [docker-otel-lgtm](https://github.com/grafana/docker-otel-lgtm) and [Kokoro TTS](https://github.com/hexgrad/kokoro) 
