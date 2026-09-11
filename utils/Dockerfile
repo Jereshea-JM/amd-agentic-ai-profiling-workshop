@@ -4,10 +4,11 @@
 # All-in-one workshop image for AMD Instinct MI300X.
 #
 # Everything runs INSIDE this single container: vLLM (Muse-Glimmer-30B), the
-# Hermes agent with patched OpenTelemetry profiling, the Kokoro TTS server,
-# MLflow, the Streamlit telemetry dashboard, and JupyterLab. There is no nested
-# Docker, unlike utils/helper.sh which orchestrates sibling containers on a bare
-# host. See utils/docker-entrypoint.sh for the in-container service manager.
+# Hermes agent with the hermes-otel OpenTelemetry plugin, the Kokoro TTS server,
+# MLflow, Grafana otel-lgtm, the Streamlit telemetry dashboard, and JupyterLab.
+# There is no nested Docker, unlike utils/helper.sh which orchestrates sibling
+# containers on a bare host. See utils/docker-entrypoint.sh for the in-container
+# service manager.
 #
 # BUILD (from the repo root):
 #   docker build -f utils/Dockerfile -t amd-agentic-ai-profiling:mi300x .
@@ -34,7 +35,13 @@
 # here, so its payload is copied in and started by the entrypoint. It receives
 # the plugin's OTLP metrics on :4318 and serves them from Prometheus on :9090,
 # which the dashboard queries.
+#
+# COPY --from only copies files, not the image's own ENV vars. otel-lgtm's
+# run-*.sh scripts require several *_VERSION vars (set via ENV in its own
+# Dockerfile) or they abort with "unbound variable", so those are captured here
+# and sourced by the entrypoint before starting it.
 FROM grafana/otel-lgtm:latest AS lgtm
+RUN env | grep -E '_VERSION=' > /otel-lgtm.env
 
 FROM vllm/vllm-openai-rocm:v0.28.0
 
@@ -78,6 +85,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Grafana otel-lgtm payload (OTel collector + Prometheus + Grafana), started by
 # the entrypoint to receive OTLP metrics and serve Prometheus on :9090.
 COPY --from=lgtm /otel-lgtm /otel-lgtm
+COPY --from=lgtm /otel-lgtm.env /otel-lgtm/lgtm.env
 
 # -----------------------------------------------------------------------------
 # 2. Kokoro TTS, dashboard, MLflow and JupyterLab dependencies
@@ -91,7 +99,7 @@ RUN python3 -m pip install --no-cache-dir \
         opentelemetry-exporter-otlp-proto-http==1.42.1 \
         psutil requests \
         jupyterlab==4.5.7 numpy==2.4.6 'plotly>=5.18' 'pandas>=2.0' \
-        matplotlib ipywidgets \
+        matplotlib ipywidgets kaleido \
     && python3 -m pip install --no-cache-dir --upgrade "mlflow>=3.0.0" fastapi uvicorn pydantic \
     && python3 -c "import kokoro, soundfile, streamlit, mlflow, jupyterlab; print('workshop deps OK')"
 

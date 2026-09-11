@@ -163,8 +163,22 @@ start_services() {
     # queries. utils/helper.sh runs the same grafana/otel-lgtm image as a sibling
     # container; here its payload (copied at build time into ${LGTM_DIR}) is
     # started as a local process.
+    #
+    # The bundled OTel Collector's own self-telemetry metrics default to :8888,
+    # which collides with JupyterLab (also :8888) since everything here shares
+    # one network namespace. We don't use the collector's self-telemetry, so
+    # disable it instead of relocating Jupyter.
     log "Starting Grafana otel-lgtm (metrics backend) on :${PROM_PORT}..."
-    ( cd "${LGTM_DIR}" && exec ./run-all.sh ) > "${LOG_DIR}/lgtm.log" 2>&1 &
+    (
+        if [ -f "${LGTM_DIR}/lgtm.env" ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . "${LGTM_DIR}/lgtm.env"
+            set +a
+        fi
+        export OTELCOL_EXTRA_ARGS="--set=service::telemetry::metrics::level=none ${OTELCOL_EXTRA_ARGS:-}"
+        cd "${LGTM_DIR}" && exec ./run-all.sh
+    ) > "${LOG_DIR}/lgtm.log" 2>&1 &
     LGTM_PID=$!
     PIDS+=("${LGTM_PID}")
     wait_for "http://localhost:${PROM_PORT}/-/ready" "Grafana otel-lgtm (Prometheus)" \
@@ -181,10 +195,14 @@ start_services() {
     python3 -m vllm.entrypoints.openai.api_server \
         --model "${HERMES_MODEL}" \
         --served-model-name "${HERMES_MODEL}" \
+        --tensor-parallel-size 1 \
+        --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+        --enable-auto-tool-choice \
         --tool-call-parser muse_glimmer \
         --reasoning-parser muse_glimmer \
-        --enable-auto-tool-choice \
-        --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+        --attention-backend ROCM_AITER_FA \
+        --generation-config auto \
+        --enable-prefix-caching \
         --port "${VLLM_HERMES_PORT}" \
         --host 0.0.0.0 > "${LOG_DIR}/vllm.log" 2>&1 &
     VLLM_PID=$!
@@ -296,10 +314,10 @@ PYPROBE
     log "==================================================================="
     log " All services are ready."
     log "==================================================================="
-    log "  JupyterLab (start here) : http://<host>:${JUPYTER_PORT}/lab/tree/tts.ipynb"
+    log "  JupyterLab (start here) : $(service_url "${JUPYTER_PORT}")lab/tree/tts.ipynb"
     log "  Telemetry dashboard     : $(service_url "${DASHBOARD_PORT}")"
     log "  MLflow UI               : $(service_url "${MLFLOW_PORT}")"
-    log "  vLLM OpenAI API         : http://<host>:${VLLM_HERMES_PORT}/v1"
+    log "  vLLM OpenAI API         : $(service_url "${VLLM_HERMES_PORT}")v1"
     log "  (container IP: ${ip:-unknown}; link base HERMES_PROXY_BASE=\"${HERMES_PROXY_BASE}\"; logs in ${LOG_DIR})"
     if [ -z "${JUPYTER_TOKEN}" ]; then
         log "  JupyterLab has no token. Set -e JUPYTER_TOKEN=... to require one."
