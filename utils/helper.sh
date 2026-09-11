@@ -938,7 +938,7 @@ echo "  Kokoro TTS (API):     $(service_url "$KOKORO_PORT")"
 echo "  MLflow tracking:      $(service_url 5004)"
 echo "  Grafana (CPU/GPU):    $(service_url 3000)"
 echo "  Telemetry dashboard:  $(service_url 8501)"
-echo "  (browser link base: HERMES_PROXY_BASE=\"$HERMES_PROXY_BASE\" — set \"\" for 127.0.0.1, or a host/IP)"
+echo "  (browser link base: HERMES_PROXY_BASE=\"$HERMES_PROXY_BASE\" - set \"\" for 127.0.0.1, or a host/IP)"
 echo "========================================================================="
 echo "[INFO] Holding the session open. Press Ctrl+C to stop all services and exit."
 

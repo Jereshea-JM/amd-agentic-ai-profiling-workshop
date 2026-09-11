@@ -20,7 +20,7 @@
 
 ## Overview
 
-This is a hands-on, beginner-friendly workshop on **observability-driven optimization** of AI agents. You run a real [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart), capture its telemetry — execution **traces** in MLflow and CPU/GPU **metrics** in Grafana `otel-lgtm` — read a purpose-built dashboard to spot the slowest step, optimize that one tool, and prove the speed-up with hardware metrics from an AMD Instinct&trade; MI300X GPU.
+This is a hands-on, beginner-friendly workshop on **observability-driven optimization** of AI agents. You run a real [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart), capture its telemetry (execution **traces** in MLflow and CPU/GPU **metrics** in Grafana `otel-lgtm`), read a purpose-built dashboard to spot the slowest step, optimize that one tool, and prove the speed-up with hardware metrics from an AMD Instinct&trade; MI300X GPU.
 
 Text-to-speech (TTS) is only the example. The real subject is a **repeatable profiling loop** you can point at any agent task.
 

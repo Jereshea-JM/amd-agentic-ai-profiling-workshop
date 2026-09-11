@@ -1213,13 +1213,13 @@ def _build_fileref_prompt(tool_csv_path: str, traces_path=None) -> str:
         "on its own line, then insert a BLANK LINE, then write your narrative explanation as a separate "
         "paragraph. The blank line is required so the explanation renders on a new line (a single line break "
         "is not enough in Markdown). Do NOT use a bullet list for these four metrics. Format each exactly like:\n\n"
-        "**Success Rate: <pct>%** — computed as `(Successful Root Spans / Total Completed Root Spans) * 100`\n\n"
+        "**Success Rate: <pct>%**, computed as `(Successful Root Spans / Total Completed Root Spans) * 100`\n\n"
         "<explanation paragraph on its own line>\n\n"
-        "**Tool Selection Accuracy: <pct>%** — computed as `(Valid Schema Calls Without Retries / Total Tool Calls) * 100`\n\n"
+        "**Tool Selection Accuracy: <pct>%**, computed as `(Valid Schema Calls Without Retries / Total Tool Calls) * 100`\n\n"
         "<explanation paragraph on its own line>\n\n"
-        "**Autonomy Score: <pct>%** — computed as `(Autonomous Steps / [Autonomous Steps + Human Interventions]) * 100`\n\n"
+        "**Autonomy Score: <pct>%**, computed as `(Autonomous Steps / [Autonomous Steps + Human Interventions]) * 100`\n\n"
         "<explanation paragraph on its own line>\n\n"
-        "**Recovery Rate: <pct>%** — computed as `(Errors Followed by Successful Path Correction / Total Errors Encountered) * 100`\n\n"
+        "**Recovery Rate: <pct>%**, computed as `(Errors Followed by Successful Path Correction / Total Errors Encountered) * 100`\n\n"
         "<explanation paragraph on its own line>\n\n"
         "**Per-Query Breakdown**\n"
         "A compact table mapping each query to its total tool time, dominant tool, and outcome, followed by a brief note.\n\n"
@@ -2539,7 +2539,7 @@ def session_detail_links(session_id=None, ip="127.0.0.1", port="5004",
     return (
         f"**Detailed views for session `{session_id}`:**\n\n"
         f"1. [Open the telemetry dashboard (Streamlit, port {dashboard_port})]({dash_url}) "
-        f"— then click **Fetch → Load** and select this session.\n"
+        f"then click **Fetch → Load** and select this session.\n"
         f"2. [Open the MLflow trace view (port {port})]({mlflow_url})\n\n"
         f"<sub>Links use {where}.</sub>"
     )
@@ -2606,7 +2606,7 @@ def overview_selector(session_id=None, ip="127.0.0.1", port="5004", prom_url=Non
     try:
         import ipywidgets as W
     except Exception:
-        print("(ipywidgets not installed — showing the overview with the current "
+        print("(ipywidgets not installed; showing the overview with the current "
               "HERMES_PROXY_BASE; `pip install ipywidgets` to get the dropdown.)")
         return show_session_overview(session_id, ip=ip, port=port, prom_url=prom_url,
                                      dashboard_port=dashboard_port)
@@ -2829,7 +2829,7 @@ if _running_under_streamlit():
             try:
                 _stats = save_session_cpu_gpu(local_dir, prom_url, full_traces)
                 if not full_traces:
-                    st.warning("No traces to derive turn windows from — CPU/GPU will be empty.")
+                    st.warning("No traces to derive turn windows from, so CPU/GPU will be empty.")
                 elif _stats["cpu_hermes_points"] == 0 and _stats["gpu_points"] == 0:
                     st.warning(
                         "No CPU/GPU samples found for this session's turn windows in "

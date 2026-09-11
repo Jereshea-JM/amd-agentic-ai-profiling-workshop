@@ -693,6 +693,7 @@ sequential-to-batched optimization show up in a single view.
 
 # AMD-branded matplotlib chart (pure presentation, rewritten from orig cell 26).
 code(r'''%matplotlib inline
+
 import os
 import matplotlib.pyplot as plt
 from matplotlib import font_manager

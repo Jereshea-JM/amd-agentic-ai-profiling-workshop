@@ -45,7 +45,7 @@ workshop assets.
 
 ## Quick start
 
-Everything runs inside one self-contained image — no separate metrics container
+Everything runs inside one self-contained image, no separate metrics container
 is needed, since Grafana `otel-lgtm` runs inside it.
 
 ```bash
