@@ -4,10 +4,11 @@
 # All-in-one workshop image for AMD Instinct MI300X.
 #
 # Everything runs INSIDE this single container: vLLM (Muse-Glimmer-30B), the
-# Hermes agent with patched OpenTelemetry profiling, the Kokoro TTS server,
-# MLflow, the Streamlit telemetry dashboard, and JupyterLab. There is no nested
-# Docker, unlike utils/helper.sh which orchestrates sibling containers on a bare
-# host. See utils/docker-entrypoint.sh for the in-container service manager.
+# Hermes agent with the hermes-otel OpenTelemetry plugin, the Kokoro TTS server,
+# MLflow, Grafana otel-lgtm, the Streamlit telemetry dashboard, and JupyterLab.
+# There is no nested Docker, unlike utils/helper.sh which orchestrates sibling
+# containers on a bare host. See utils/docker-entrypoint.sh for the in-container
+# service manager.
 #
 # BUILD (from the repo root):
 #   docker build -f utils/Dockerfile -t amd-agentic-ai-profiling:mi300x .
@@ -24,19 +25,25 @@
 # Hugging Face cache as shown so the download is paid only once per host.
 # =============================================================================
 
-# The ROCm vLLM nightly already provides Python 3.12, PyTorch 2.12 with HIP 7.2,
-# and a working vLLM install, so the Kokoro TTS server reuses that same PyTorch
-# rather than installing a second multi-gigabyte copy.
-# The AMD Device Metrics Exporter is pulled in as a build stage so the GPU
-# metrics source ships INSIDE this image. Previously the container scraped
-# http://172.17.0.1:5050/metrics, i.e. an exporter the user had to be running
-# on the Docker host: if it was absent the profiling dashboard drew a flat 0%
-# GPU line with no error, which is the single most confusing failure in the
-# workshop. Only /home/amd is copied; `server` is statically linked and
-# `gpuagent` resolves libamd_smi through LD_PRELOAD from the same subtree.
-FROM rocm/device-metrics-exporter:v1.5.0 AS exporter
+# The ROCm vLLM release image provides Python 3.12, PyTorch with HIP, and a
+# working vLLM install (including Muse-Glimmer-30B support), so the Kokoro TTS
+# server reuses that same PyTorch rather than installing a second multi-gigabyte
+# copy.
+# The Grafana otel-lgtm metrics backend is pulled in as a build stage so it ships
+# inside this image and runs as a local process. utils/helper.sh runs the same
+# `grafana/otel-lgtm` image as a sibling container; there is no nested Docker
+# here, so its payload is copied in and started by the entrypoint. It receives
+# the plugin's OTLP metrics on :4318 and serves them from Prometheus on :9090,
+# which the dashboard queries.
+#
+# COPY --from only copies files, not the image's own ENV vars. otel-lgtm's
+# run-*.sh scripts require several *_VERSION vars (set via ENV in its own
+# Dockerfile) or they abort with "unbound variable", so those are captured here
+# and sourced by the entrypoint before starting it.
+FROM grafana/otel-lgtm:latest AS lgtm
+RUN env | grep -E '_VERSION=' > /otel-lgtm.env
 
-FROM vllm/vllm-openai-rocm:nightly
+FROM vllm/vllm-openai-rocm:v0.28.0
 
 LABEL org.opencontainers.image.title="AMD Agentic AI Profiling Workshop"
 LABEL org.opencontainers.image.description="Profile and optimize an AI agent on AMD Instinct MI300X: Hermes Agent, MLflow telemetry, Kokoro TTS, JupyterLab."
@@ -49,70 +56,55 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/root/.local/bin:${PATH}" \
     HF_HOME=/root/.cache/huggingface \
     WORKSHOP_DIR=/workshop \
+    HERMES_PROFILING_CACHE_DIR=/workshop/profiling_cache \
     HERMES_GPU=0 \
     VLLM_HERMES_PORT=8001 \
     KOKORO_PORT=8092 \
     MLFLOW_PORT=5004 \
     DASHBOARD_PORT=8501 \
     JUPYTER_PORT=8888 \
-    HERMES_MODEL=meta-models/Muse-Glimmer-30B
+    HERMES_MODEL=meta-models/Muse-Glimmer-30B \
+    HERMES_PROXY_BASE=https://notebooks.amd.com
+
+# HERMES_PROXY_BASE is the base for the notebook's "detailed view" links and the
+# URLs the entrypoint prints. It is inherited by the JupyterLab kernels the
+# entrypoint launches, so the notebook picks it up automatically. Default is the
+# AMD hosted-notebook proxy; override at run time for other environments, e.g.:
+#   docker run -e HERMES_PROXY_BASE="" ...            # direct http://127.0.0.1:<port>/
+#   docker run -e HERMES_PROXY_BASE="10.0.0.5" ...    # direct http://10.0.0.5:<port>/
+#   docker run -e HERMES_PROXY_BASE="https://my-proxy" ...
 
 # -----------------------------------------------------------------------------
 # 1. OS packages
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl rsync ca-certificates procps lsof espeak-ng libsndfile1 \
+        git curl ca-certificates procps lsof espeak-ng libsndfile1 \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-# Device Metrics Exporter payload (bin/gpuagent, bin/server, lib/libamd_smi).
-COPY --from=exporter /home/amd /root/amd-dme
+# Grafana otel-lgtm payload (OTel collector + Prometheus + Grafana), started by
+# the entrypoint to receive OTLP metrics and serve Prometheus on :9090.
+COPY --from=lgtm /otel-lgtm /otel-lgtm
+COPY --from=lgtm /otel-lgtm.env /otel-lgtm/lgtm.env
 
 # -----------------------------------------------------------------------------
-# 2. Muse-Glimmer support: overlay vLLM PR #51655
-# -----------------------------------------------------------------------------
-# Muse-Glimmer-30B is not in a released vLLM yet. PR #51655 is a Python-only
-# change, so the .py files are overlaid onto the installed package with no
-# kernel rebuild. This mirrors what utils/helper.sh does on a bare host, but is
-# baked into the image so attendees never wait for it.
-RUN git clone --filter=blob:none --no-checkout \
-        https://github.com/vllm-project/vllm.git /tmp/vllm-src \
-    && git -C /tmp/vllm-src fetch --depth=1 origin pull/51655/head:muse \
-    && git -C /tmp/vllm-src checkout muse \
-    # Resolve the INSTALLED package from outside the source tree. Running
-    # python3 while cwd is /tmp/vllm-src makes Python import the local source
-    # checkout instead of site-packages, which makes the overlay copy the tree
-    # onto itself and leaves a half-broken vllm that aborts on import.
-    && cd /root \
-    && VLLM_PKG="$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -1)" \
-    && case "${VLLM_PKG}" in \
-         /tmp/*|"") echo "Refusing to overlay onto '${VLLM_PKG}'" >&2; exit 1 ;; \
-       esac \
-    && echo "Overlaying PR #51655 onto ${VLLM_PKG}" \
-    && rsync -a --include='*/' --include='*.py' --exclude='*' \
-        /tmp/vllm-src/vllm/ "${VLLM_PKG}/" \
-    && rm -rf /tmp/vllm-src \
-    # Fail the BUILD (not the workshop) if the parsers did not register.
-    && python3 -c "from vllm.tool_parsers import ToolParserManager; assert ToolParserManager.get_tool_parser('muse_glimmer'); print('tool parser OK')" \
-    && python3 -c "from vllm.reasoning import ReasoningParserManager; assert ReasoningParserManager.get_reasoning_parser('muse_glimmer'); print('reasoning parser OK')"
-
-# -----------------------------------------------------------------------------
-# 3. Kokoro TTS, dashboard, MLflow and JupyterLab dependencies
+# 2. Kokoro TTS, dashboard, MLflow and JupyterLab dependencies
 # -----------------------------------------------------------------------------
 # Installed into the image's own Python so Kokoro reuses the ROCm PyTorch that
-# is already present.
+# is already present. Tested with mlflow 3.16.0.
 RUN python3 -m pip install --no-cache-dir \
         kokoro soundfile fastapi 'uvicorn[standard]' \
-        'streamlit>=1.30' mlflow==3.13.0 \
+        'streamlit>=1.30' mlflow \
         opentelemetry-sdk==1.42.1 opentelemetry-api==1.42.1 \
         opentelemetry-exporter-otlp-proto-http==1.42.1 \
-        pyrsmi==1.1.0 psutil requests cryptography \
-        jupyterlab==4.5.7 'numpy>=2' 'plotly>=5.18' 'pandas>=2.0' \
-        matplotlib ipywidgets \
+        psutil requests \
+        jupyterlab==4.5.7 numpy==2.4.6 'plotly>=5.18' 'pandas>=2.0' \
+        matplotlib ipywidgets kaleido \
+    && python3 -m pip install --no-cache-dir --upgrade "mlflow>=3.0.0" fastapi uvicorn pydantic \
     && python3 -c "import kokoro, soundfile, streamlit, mlflow, jupyterlab; print('workshop deps OK')"
 
 # -----------------------------------------------------------------------------
-# 4. Hermes Agent
+# 3. Hermes Agent
 # -----------------------------------------------------------------------------
 RUN curl -fsSL \
         https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
@@ -124,23 +116,20 @@ RUN curl -fsSL \
     && hermes --version
 
 # -----------------------------------------------------------------------------
-# 5. hermes-otel plugin with the advanced profiling patch
+# 4. hermes-otel plugin
 # -----------------------------------------------------------------------------
-# The stock plugin records which tool ran and when. The patch adds the per-span
-# CPU and GPU utilization that the whole workshop is built around, so if it
-# fails to apply the build must fail loudly rather than ship a dead feature.
-COPY utils/hermes_advanced_profiling.patch /tmp/hermes_advanced_profiling.patch
+# Install the hermes-otel plugin (per-span CPU/GPU profiling) into the image
+# Python and the Hermes venv, since the plugin runs inside Hermes. Checks out the
+# latest release tag. Tested on hermes-otel-v1.3.0.
 RUN git clone https://github.com/briancaffey/hermes-otel.git \
         /root/.hermes/plugins/hermes_otel \
     && cd /root/.hermes/plugins/hermes_otel \
-    && git fetch origin --tags --depth=1 \
-    && git checkout hermes-otel-v0.10.0 \
-    && git apply --verbose /tmp/hermes_advanced_profiling.patch \
-    && rm /tmp/hermes_advanced_profiling.patch \
+    && HERMES_OTEL_VERSION="$(git tag -l 'hermes-otel-v*' | sort -V | tail -1)" \
+    && echo "Using latest hermes-otel release: ${HERMES_OTEL_VERSION:-<none, default branch>}" \
+    && if [ -n "${HERMES_OTEL_VERSION}" ]; then git checkout -q "${HERMES_OTEL_VERSION}"; fi \
     && python3 -m pip install --no-cache-dir -e . \
-    # The plugin executes inside Hermes' own venv, so its dependencies must be
-    # installed there too. The venv location depends on where the installer put
-    # Hermes, so discover it instead of hardcoding a path.
+    # Install the plugin's dependencies into the Hermes venv as well. Discover
+    # the venv location rather than hardcoding it.
     && HERMES_VENV_PY="$( \
          for c in /usr/local/lib/hermes-agent/venv/bin/python \
                   /root/.hermes/hermes-agent/venv/bin/python; do \
@@ -154,11 +143,10 @@ RUN git clone https://github.com/briancaffey/hermes-otel.git \
     && "${HERMES_VENV_PY}" -m pip install --no-cache-dir -q \
         opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
         opentelemetry-exporter-otlp-proto-http==1.42.1 \
-        pyrsmi==1.1.0 amdsmi==7.0.2 mlflow==3.13.0 \
-        psutil requests cryptography
+        amdsmi psutil requests
 
 # -----------------------------------------------------------------------------
-# 6. Workshop content
+# 5. Workshop content
 # -----------------------------------------------------------------------------
 WORKDIR /workshop
 COPY tts.ipynb tts_executed.ipynb README.md ./
@@ -166,10 +154,8 @@ COPY assets/ ./assets/
 COPY custom_tools/ ./custom_tools/
 COPY utils/ ./utils/
 
-# The kokoro_tts tool imports `from tools.registry import ...`, a Hermes
-# internal module, so it only resolves when it lives inside the Hermes tools
-# package itself. Copying it to ~/.hermes/tools/ looks plausible but leaves the
-# tool unimportable and the agent silently loops without ever calling it.
+# The kokoro_tts tool imports `from tools.registry import ...`, a Hermes internal
+# module, so it must live inside the Hermes tools package to be importable.
 RUN HERMES_TOOLS_DIR="$(dirname "$(readlink -f "$(command -v hermes)")")/../tools" \
     && HERMES_TOOLS_DIR="$( [ -d /usr/local/lib/hermes-agent/tools ] \
          && echo /usr/local/lib/hermes-agent/tools \
@@ -190,7 +176,7 @@ print('kokoro_tts registered OK')" \
                 /root/.config/miopen/miopen-lockfiles
 
 # -----------------------------------------------------------------------------
-# 7. Preconfigure Hermes and the profiling plugin
+# 6. Preconfigure Hermes and the profiling plugin
 # -----------------------------------------------------------------------------
 # Baked in so the container starts already pointing at the local vLLM server.
 RUN hermes config set model.provider custom \
@@ -204,57 +190,51 @@ RUN hermes config set model.provider custom \
     && hermes config set tool_output.max_line_length 5000 \
     && hermes plugins enable hermes_otel --allow-tool-override
 
+# hermes-otel plugin config, identical to the one utils/helper.sh writes: traces
+# go to MLflow, CPU/GPU metrics to Grafana otel-lgtm, sampled every 100 ms.
 RUN printf '%s\n' \
     'enabled: true' \
     'force_flush_on_session_end: true' \
+    'capture_previews: true' \
+    'capture_full_prompts: false' \
+    'capture_full_responses: false' \
+    'host_metrics: true' \
+    'host_metrics_gpu: amd' \
+    'host_metrics_interval_ms: 100' \
+    'flush_interval_ms: 100' \
     'backends:' \
     '  - type: otlp' \
+    '    name: mlflow' \
     "    endpoint: http://127.0.0.1:${MLFLOW_PORT}/v1/traces" \
-    '    protocol: http/protobuf' \
-    '    timeout: 10' \
+    '    metrics: false' \
+    '    logs: false' \
     '    headers:' \
     '      x-mlflow-experiment-id: "0"' \
+    '  - type: otlp' \
+    '    name: lgtm' \
+    '    endpoint: http://127.0.0.1:4318/v1/traces' \
+    '    traces: false' \
+    '    metrics: true' \
+    '    logs: false' \
     > /root/.hermes/plugins/hermes_otel/config.yaml
 
 # MLflow 3.x OTLP ingestion rejects spans that carry no experiment header with
-# HTTP 422, and the exporter only reports that on stderr, so the sole visible
-# symptom is an empty Traces tab. The header above is what makes traces land.
-
-# Every var helper.sh appends to ~/.hermes/.env must be mirrored here. Omitting
-# HERMES_TOOL_PROFILING silently disables the CPU/GPU poller: no timeline CSVs
-# are written and every MLflow run ends up with zero artifacts, while still
-# logging vLLM metrics, so the run looks healthy.
-RUN printf '%s\n' \
-    "MLFLOW_TRACKING_URI=http://127.0.0.1:${MLFLOW_PORT}" \
-    "HERMES_PROFILING_OUTPUT_DIR=${WORKSHOP_DIR}/outputs" \
-    "HERMES_GPU_EXPORTER_URL=http://localhost:5000/metrics" \
-    "KOKORO_SERVER_URL=http://localhost:${KOKORO_PORT}" \
-    'MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false' \
-    'MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL=1' \
-    'MLFLOW_EXPERIMENT_NAME=Default' \
-    'MLFLOW_RUN_NAME=Hermes_Profiling' \
-    'MLFLOW_KEEP_RUN_ACTIVE=false' \
-    'MLFLOW_LOGGING_LEVEL=ERROR' \
-    'MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT=1' \
-    'MLFLOW_DISABLE_TELEMETRY=true' \
-    'HERMES_TOOL_PROFILING=1' \
-    'HERMES_PROFILING_DEBUG=0' \
-    'HERMES_CPU_DEBUG=0' \
-    >> /root/.hermes/.env
+# HTTP 422, so the x-mlflow-experiment-id header above is what makes traces land.
+# The plugin needs nothing from ~/.hermes/.env (it reads config.yaml above),
+# matching utils/helper.sh, so no .env is written.
 
 # -----------------------------------------------------------------------------
-# 8. Entrypoint
+# 7. Entrypoint
 # -----------------------------------------------------------------------------
 COPY utils/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Parity guard. The bare-host installer and this Dockerfile configure the same
-# agent twice and drift silently, so assert the telemetry wiring at build time
-# rather than discovering a dead dashboard on a live GPU host.
+# Build-time check that asserts the telemetry wiring, so a misconfigured image
+# fails the build rather than at run time.
 COPY utils/img-check.sh /usr/local/bin/img-check.sh
 RUN chmod +x /usr/local/bin/img-check.sh && /usr/local/bin/img-check.sh
 
-EXPOSE 8888 8501 5004 8001 8092
+EXPOSE 8888 8501 5004 8001 8092 9090 3000
 
 # JupyterLab is the workshop's front door; the rest come up behind it.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20m --retries=3 \

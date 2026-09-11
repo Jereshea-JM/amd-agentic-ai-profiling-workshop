@@ -45,3 +45,9 @@ Thumbs.db
 mlruns/
 wandb/
 *.log
+
+# Workshop runtime artifacts
+profiling_cache/
+mlflow.db
+/outputs/
+/input_text.txt

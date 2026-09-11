@@ -16,20 +16,21 @@ nested Docker and no host setup beyond the GPU devices.
 | :--- | :--- | :--- |
 | JupyterLab | `8888` | The workshop front door. Open `tts.ipynb`. |
 | Telemetry dashboard (Streamlit) | `8501` | Spans, CPU/GPU timeline, tool breakdown. |
-| MLflow tracking server | `5004` | Traces and hardware metrics. |
+| MLflow tracking server | `5004` | The agent's execution traces. |
+| Grafana `otel-lgtm` | `9090` / `3000` | CPU/GPU metrics (Prometheus on 9090, queried by the dashboard; Grafana UI on 3000). |
 | vLLM (Muse-Glimmer-30B) | `8001` | The agent's model, OpenAI-compatible API. |
 | Kokoro TTS server | `8092` | Local TTS on the MI300X. |
 
 Also baked in: the Hermes Agent (preconfigured to use the local vLLM), the
-`hermes-otel` plugin with the advanced profiling patch applied, the custom
-`kokoro_tts` tool, the notebooks, and all workshop assets.
+`hermes-otel` plugin, the custom `kokoro_tts` tool, the notebooks, and all
+workshop assets.
 
 > **How this differs from `utils/helper.sh`.** On a bare host, `helper.sh`
-> launches vLLM and the metrics exporter as *sibling Docker containers*. That
+> launches vLLM and Grafana `otel-lgtm` as *sibling Docker containers*. That
 > cannot work unchanged inside an image without mounting the host Docker socket,
 > so the container uses `utils/docker-entrypoint.sh` instead, which starts the
-> same services as local processes and reaches the GPU directly. Both paths
-> produce the same workshop.
+> same services (including `otel-lgtm`) as local processes and reaches the GPU
+> directly. Both paths produce the same workshop.
 
 ---
 
@@ -44,21 +45,10 @@ Also baked in: the Hermes Agent (preconfigured to use the local vLLM), the
 
 ## Quick start
 
-The workshop needs two containers: the AMD GPU metrics exporter, and the
-workshop image itself. Start the exporter first.
+Everything runs inside one self-contained image — no separate metrics container
+is needed, since Grafana `otel-lgtm` runs inside it.
 
 ```bash
-# 1. GPU metrics exporter. The telemetry dashboard's GPU series comes from here,
-#    so without it gpu_timeline.csv is written with an all-zero GPU column and
-#    the dashboard shows a flat 0% line with no error anywhere.
-#    Note the port map: the exporter listens on 5000 inside the container.
-docker run -d --name device-metrics-exporter \
-  --device=/dev/kfd --device=/dev/dri \
-  --security-opt seccomp=unconfined --group-add video \
-  -p 5050:5000 \
-  rocm/device-metrics-exporter:v1.5.0
-
-# 2. The workshop container.
 docker run -d --name amd-agentic-ai-profiling \
   --device=/dev/kfd --device=/dev/dri \
   --security-opt seccomp=unconfined --group-add video \
@@ -68,17 +58,8 @@ docker run -d --name amd-agentic-ai-profiling \
   shailensobhee1/amd-agentic-ai-profiling:mi300x
 ```
 
-Verify the exporter is actually serving before you rely on the GPU charts:
-
-```bash
-curl -s http://localhost:5050/metrics | grep -m1 gpu_gfx_activity
-```
-
-On an MI300X **VF** (SR-IOV) `gpu_gfx_activity` is coarse and reads either 0 or
-100 with no intermediate values, so a square-wave GPU curve is expected and
-real. To confirm the signal is live rather than stuck, poll it while idle: it
-must read 0. The `power_w` column is continuous and is the better evidence of
-actual load.
+To use direct `localhost` links in the notebook instead of the AMD proxy, add
+`-e HERMES_PROXY_BASE=""`. To reach the Grafana metrics UI, also map `-p 3000:3000`.
 
 Then watch it come up:
 
@@ -153,9 +134,10 @@ From the repository root:
 docker build -f utils/Dockerfile -t amd-agentic-ai-profiling:mi300x .
 ```
 
-The build asserts that the Muse-Glimmer tool and reasoning parsers register
-after the vLLM PR #51655 overlay, and that the profiling patch applies, so a
-broken image fails at build time rather than during the workshop.
+The build runs `utils/img-check.sh`, which asserts the telemetry wiring (the
+`.env` keys, the OTLP experiment header, and that the dashboard's assets and
+theme resolve), so a broken image fails at build time rather than during the
+workshop.
 
 ---
 

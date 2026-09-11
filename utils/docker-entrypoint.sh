@@ -5,13 +5,14 @@
 # The in-container equivalent of utils/helper.sh.
 #
 # Difference from helper.sh: helper.sh runs on a bare host and launches vLLM and
-# the metrics exporter as SIBLING Docker containers. Inside this image there is
-# no nested Docker, so every service is started here as a local process and the
-# GPU is reached directly through the container's own /dev/kfd and /dev/dri.
+# Grafana otel-lgtm as SIBLING Docker containers. Inside this image there is no
+# nested Docker, so every service is started here as a local process and the GPU
+# is reached directly through the container's own /dev/kfd and /dev/dri.
 #
 # Services, in start order:
+#   0. Grafana otel-lgtm        :9090   CPU/GPU metrics backend (Prometheus)
 #   1. vLLM (Muse-Glimmer-30B)  :8001   the agent's model
-#   2. MLflow tracking server   :5004   records traces and hardware metrics
+#   2. MLflow tracking server   :5004   records the execution traces
 #   3. Kokoro TTS server        :8092   local TTS on the MI300X
 #   4. Streamlit dashboard      :8501   telemetry overview
 #   5. JupyterLab               :8888   the workshop front door
@@ -29,11 +30,18 @@ LOG_DIR="${WORKSHOP_DIR}/logs"
 VLLM_HERMES_PORT="${VLLM_HERMES_PORT:-8001}"
 KOKORO_PORT="${KOKORO_PORT:-8092}"
 MLFLOW_PORT="${MLFLOW_PORT:-5004}"
-# Device Metrics Exporter payload, copied from rocm/device-metrics-exporter by
-# the Dockerfile. Overridable so a host-run exporter can still be used instead.
-DME_DIR="${DME_DIR:-/root/amd-dme}"
+# Grafana otel-lgtm payload, copied from the grafana/otel-lgtm image by the
+# Dockerfile. Receives OTLP metrics on :4318 and serves Prometheus on :9090.
+LGTM_DIR="${LGTM_DIR:-/otel-lgtm}"
+PROM_PORT="${PROM_PORT:-9090}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8501}"
 JUPYTER_PORT="${JUPYTER_PORT:-8888}"
+# Base for the browser links printed below. Inherited by the JupyterLab kernels
+# started here, so the notebook's "detailed view" links use it too. The image
+# bakes the default (see Dockerfile ENV); `docker run -e HERMES_PROXY_BASE=...`
+# overrides it. Interpreted the same three ways as helper.sh / hermes_profiler.py:
+# "https://host" (has "://") -> proxy; "" -> 127.0.0.1; "10.0.0.5" -> that host.
+HERMES_PROXY_BASE="${HERMES_PROXY_BASE-https://notebooks.amd.com}"
 HERMES_MODEL="${HERMES_MODEL:-meta-models/Muse-Glimmer-30B}"
 HERMES_GPU="${HERMES_GPU:-0}"
 # vLLM must download about 60 GB on a cold cache, so the default wait is long.
@@ -59,6 +67,19 @@ fail() {
     exit 1
 }
 
+# Browser URL for a service PORT from HERMES_PROXY_BASE (see the var above).
+# Matches helper.sh's service_url and hermes_profiler.session_detail_links.
+service_url() {
+    local port="$1" base="${HERMES_PROXY_BASE:-}"
+    if [ -z "$base" ]; then
+        echo "http://127.0.0.1:${port}/"
+    elif [[ "$base" == *"://"* ]]; then
+        echo "${base%/}/$(hostname)/proxy/${port}/"
+    else
+        echo "http://${base}:${port}/"
+    fi
+}
+
 PIDS=()
 cleanup() {
     log "Shutting down services..."
@@ -79,11 +100,10 @@ wait_for() {
     local waited=0 code
     log "Waiting for ${name} (${url}, timeout ${timeout}s)..."
     while [ "${waited}" -lt "${timeout}" ]; do
-        # NOTE: no `|| echo 000` here. curl already prints 000 via -w when it
-        # cannot connect, so the fallback CONCATENATED a second 000 and produced
-        # "000000". The any=1 branch below tests `code != "000"`, so "000000"
-        # slipped through and a service was reported up when nothing answered.
-        # Observed live 2026-08-21: "Metrics exporter is up (HTTP 000000) after 0s."
+        # curl already emits 000 via -w on a connection failure, so no
+        # `|| echo 000` fallback is used: appending one would produce "000000",
+        # which the any=1 check below (code != "000") would treat as a live
+        # service.
         code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null)"
         code="${code:-000}"
         if [ "${any}" = "1" ] && [ "${code}" != "000" ]; then
@@ -123,9 +143,7 @@ start_services() {
     amd-smi static 2>/dev/null | grep -m2 MARKET_NAME || log "  (amd-smi unavailable)"
 
     # Report VRAM already held by other processes. vLLM sizes its allocation
-    # against FREE memory, so a busy GPU is the usual cause of a startup
-    # failure, and a cryptic ValueError deep in the engine is a poor way to
-    # discover that.
+    # against free memory, so a busy GPU is a common cause of startup failure.
     if command -v amd-smi >/dev/null 2>&1; then
         local used_vram free_vram
         used_vram="$(amd-smi metric -m 2>/dev/null | grep -m1 'USED_VRAM' | awk '{print $2}')"
@@ -139,25 +157,32 @@ start_services() {
         fi
     fi
 
-    # --- 0. AMD Device Metrics Exporter (embedded GPU metrics source) --------
-    # The profiling poller scrapes HERMES_GPU_EXPORTER_URL for GPU utilization.
-    # The exporter binaries were copied from rocm/device-metrics-exporter at
-    # build time into /root/amd-dme, so no exporter needs to be running on the
-    # Docker host. This mirrors the vendor entrypoint exactly: gpuagent reads
-    # the GPU behind a unix socket with libamd_smi preloaded, then after a 10s
-    # warm-up `server` publishes Prometheus metrics on :5000.
-    log "Starting AMD Device Metrics Exporter on :5000..."
+    # --- 0. Grafana otel-lgtm (metrics backend) ------------------------------
+    # The hermes-otel plugin sends CPU/GPU metrics over OTLP to :4318; otel-lgtm
+    # receives them and serves them from Prometheus on :9090, which the dashboard
+    # queries. utils/helper.sh runs the same grafana/otel-lgtm image as a sibling
+    # container; here its payload (copied at build time into ${LGTM_DIR}) is
+    # started as a local process.
+    #
+    # The bundled OTel Collector's own self-telemetry metrics default to :8888,
+    # which collides with JupyterLab (also :8888) since everything here shares
+    # one network namespace. We don't use the collector's self-telemetry, so
+    # disable it instead of relocating Jupyter.
+    log "Starting Grafana otel-lgtm (metrics backend) on :${PROM_PORT}..."
     (
-        LD_PRELOAD="${DME_DIR}/lib/libamd_smi.so.26" \
-            "${DME_DIR}/bin/gpuagent" -s /var/run/gpuagent.sock &
-        sleep 10
-        exec "${DME_DIR}/bin/server"
-    ) > "${LOG_DIR}/exporter.log" 2>&1 &
-    EXPORTER_PID=$!
-    PIDS+=("${EXPORTER_PID}")
-    # any=1: /metrics answers 200, but accept any HTTP response as "listening".
-    wait_for "http://localhost:5000/metrics" "Metrics exporter" 120 \
-             "${LOG_DIR}/exporter.log" 1 "${EXPORTER_PID}"
+        if [ -f "${LGTM_DIR}/lgtm.env" ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . "${LGTM_DIR}/lgtm.env"
+            set +a
+        fi
+        export OTELCOL_EXTRA_ARGS="--set=service::telemetry::metrics::level=none ${OTELCOL_EXTRA_ARGS:-}"
+        cd "${LGTM_DIR}" && exec ./run-all.sh
+    ) > "${LOG_DIR}/lgtm.log" 2>&1 &
+    LGTM_PID=$!
+    PIDS+=("${LGTM_PID}")
+    wait_for "http://localhost:${PROM_PORT}/-/ready" "Grafana otel-lgtm (Prometheus)" \
+             180 "${LOG_DIR}/lgtm.log" 0 "${LGTM_PID}"
 
     # --- 1. vLLM -------------------------------------------------------------
     log "Starting vLLM (${HERMES_MODEL}) on port ${VLLM_HERMES_PORT}..."
@@ -170,10 +195,14 @@ start_services() {
     python3 -m vllm.entrypoints.openai.api_server \
         --model "${HERMES_MODEL}" \
         --served-model-name "${HERMES_MODEL}" \
+        --tensor-parallel-size 1 \
+        --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+        --enable-auto-tool-choice \
         --tool-call-parser muse_glimmer \
         --reasoning-parser muse_glimmer \
-        --enable-auto-tool-choice \
-        --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+        --attention-backend ROCM_AITER_FA \
+        --generation-config auto \
+        --enable-prefix-caching \
         --port "${VLLM_HERMES_PORT}" \
         --host 0.0.0.0 > "${LOG_DIR}/vllm.log" 2>&1 &
     VLLM_PID=$!
@@ -185,8 +214,6 @@ start_services() {
         --host 0.0.0.0 \
         --port "${MLFLOW_PORT}" \
         --backend-store-uri "sqlite:///${WORKSHOP_DIR}/mlflow.db" \
-        --serve-artifacts \
-        --artifacts-destination "${WORKSHOP_DIR}/mlflow_artifacts" \
         > "${LOG_DIR}/mlflow.log" 2>&1 &
     PIDS+=($!)
     wait_for "http://localhost:${MLFLOW_PORT}/health" "MLflow" 300 "${LOG_DIR}/mlflow.log"
@@ -212,13 +239,10 @@ start_services() {
     wait_for "http://localhost:${DASHBOARD_PORT}/_stcore/health" \
              "Telemetry dashboard" 300 "${LOG_DIR}/dashboard.log"
 
-    # /_stcore/health returning 200 only proves the Streamlit SERVER is alive.
-    # It returns 200 even when the app script raised on import and every visitor
-    # sees a traceback. Verified in-container 2026-08-21: an injected bad import
-    # still answered /_stcore/health with 200 and served a 200 page.
-    #
-    # helper.sh already guards this on the bare-metal path. Do the same here, by
-    # asking the app's OWN interpreter whether every top-level import resolves.
+    # /_stcore/health returning 200 only proves the Streamlit server is alive: it
+    # still returns 200 when the app raised on import and every visitor sees a
+    # traceback. To catch that, ask the app's own interpreter whether every
+    # top-level import resolves, mirroring the check in helper.sh.
     dash_bad="$(python3 - "${UTILS_DIR}/hermes_profiler.py" <<'PYPROBE'
 import ast
 import importlib.util
@@ -290,11 +314,11 @@ PYPROBE
     log "==================================================================="
     log " All services are ready."
     log "==================================================================="
-    log "  JupyterLab (start here) : http://<host>:${JUPYTER_PORT}/lab/tree/tts.ipynb"
-    log "  Telemetry dashboard     : http://<host>:${DASHBOARD_PORT}"
-    log "  MLflow UI               : http://<host>:${MLFLOW_PORT}"
-    log "  vLLM OpenAI API         : http://<host>:${VLLM_HERMES_PORT}/v1"
-    log "  (container IP: ${ip:-unknown}; logs in ${LOG_DIR})"
+    log "  JupyterLab (start here) : $(service_url "${JUPYTER_PORT}")lab/tree/tts.ipynb"
+    log "  Telemetry dashboard     : $(service_url "${DASHBOARD_PORT}")"
+    log "  MLflow UI               : $(service_url "${MLFLOW_PORT}")"
+    log "  vLLM OpenAI API         : $(service_url "${VLLM_HERMES_PORT}")v1"
+    log "  (container IP: ${ip:-unknown}; link base HERMES_PROXY_BASE=\"${HERMES_PROXY_BASE}\"; logs in ${LOG_DIR})"
     if [ -z "${JUPYTER_TOKEN}" ]; then
         log "  JupyterLab has no token. Set -e JUPYTER_TOKEN=... to require one."
     fi

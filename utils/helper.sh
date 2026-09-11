@@ -8,29 +8,26 @@ mkdir -p "$HERMES_WORKSPACE_DIR"
 export TMPDIR="$HOME/tmp"
 mkdir -p "$TMPDIR"
 
-# Path anchoring: this script lives in utils/, so resolve its own siblings
-# (clear_cache.sh, kokoro_server.py, hermes_profiler.py, the profiling patch)
-# relative to the script itself. WORKSPACE_DIR stays the REPO ROOT because that
-# is where the notebook, the env/ venv, input_text.txt and outputs/ live, and it
-# is what the agent's terminal.cwd is pointed at. This makes the script safe to
-# invoke from anywhere, for example `bash utils/helper.sh` from the repo root.
+# This script lives in utils/, so resolve its siblings (clear_cache.sh,
+# kokoro_server.py, hermes_profiler.py, the profiling patch) relative to the
+# script itself. WORKSPACE_DIR is the repo root, where the notebook, the env/
+# venv, input_text.txt and outputs/ live, and where the agent's terminal.cwd
+# points. Resolving paths this way lets the script be invoked from anywhere,
+# e.g. `bash utils/helper.sh` from the repo root.
 UTILS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$UTILS_DIR/.." && pwd)"
 cd "$WORKSPACE_DIR"
 
 export PATH="$HOME/.local/bin:$PATH"
 
-# Upstream tts-aug18 added `source ~/.bashrc` and an unconditional
-# `sudo chown -R $USER:$USER $HOME/.cache/` here. Both are ported, but guarded:
+# Source ~/.bashrc and repair cache ownership, both guarded:
 #   * ~/.bashrc short-circuits on non-interactive shells on Debian/Ubuntu, and
-#     `set -u` inside a user's rc file would kill this script, so it is sourced
-#     defensively and only when it exists.
-#   * The chown fixes a real failure: on a fresh machine an earlier root-run
-#     step can leave $HOME/.cache root-owned, after which the HF download and
-#     the Playwright install both fail with EACCES. It is skipped when the cache
-#     is already owned correctly, so the common path costs nothing and the
-#     script still works where sudo is unavailable (for example in the
-#     container, which already runs as root).
+#     `set -u` inside a user's rc file could terminate this script, so it is
+#     sourced defensively and only when it exists.
+#   * A root-run setup step can leave $HOME/.cache root-owned, causing the HF
+#     download and the Playwright install to fail with EACCES. The chown is
+#     skipped when the cache is already owned correctly, so the common path
+#     costs nothing, and it is only attempted where sudo is available.
 if [ -f "$HOME/.bashrc" ]; then
     # shellcheck disable=SC1090
     source "$HOME/.bashrc" || true
@@ -44,16 +41,40 @@ if [ ! -O "$HOME/.cache" ] && command -v sudo >/dev/null 2>&1; then
 fi
 
 export HF_HOME="$HOME/.cache/huggingface"
-
+sudo chown -R $USER:$USER "$HOME/.cache/huggingface"
 HERMES_GPU="0"   # Muse-Glimmer-30B runs on GPU 0
 
-# vLLM image: built locally from the ROCm nightly with PR #51655 (Muse-Glimmer
-# support) overlaid. Built once below if not already present.
-IMAGE_NAME="vllm-muse-glimmer:rocm"
+# vLLM image: the official ROCm release image, which includes Muse-Glimmer
+# support in v0.28.0.
+IMAGE_NAME="vllm/vllm-openai-rocm:v0.28.0"
 VLLM_HERMES_PORT=8001
-VLLM_DEVICE_METRICS_EXPORTER_PORT=5050
 
 SYSTEM_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}' || ip route get 8.8.8.8 | awk '{print $7; exit}')
+
+# Base for the browser-facing links this script prints (and the same knob the
+# notebook reads for its "detailed view" hyperlinks). Honors a value you export
+# before running this script; defaults to the AMD hosted-notebook proxy.
+# Interpreted three ways, matching hermes_profiler.py:
+#   "https://host" (has "://")  -> proxy:  <base>/<hostname>/proxy/<port>/
+#   ""             (empty)      -> direct: http://127.0.0.1:<port>/
+#   "10.0.0.5"     (bare host)  -> direct: http://10.0.0.5:<port>/
+# NOTE: this export reaches processes started FROM this shell. A JupyterLab
+# kernel started separately will not see it, so for the notebook either export
+# HERMES_PROXY_BASE before launching JupyterLab or pick it in the notebook's
+# dropdown.
+export HERMES_PROXY_BASE="${HERMES_PROXY_BASE-https://notebooks.amd.com}"
+
+# Build a browser URL for a service PORT from HERMES_PROXY_BASE (see above).
+service_url() {
+    local port="$1" base="$HERMES_PROXY_BASE"
+    if [ -z "$base" ]; then
+        echo "http://127.0.0.1:${port}/"
+    elif [[ "$base" == *"://"* ]]; then
+        echo "${base%/}/$(hostname)/proxy/${port}/"
+    else
+        echo "http://${base}:${port}/"
+    fi
+}
 
 # Clear caches before starting.
 bash "$UTILS_DIR/clear_cache.sh"
@@ -96,12 +117,12 @@ cleanup() {
     sudo docker stop hermes_service >/dev/null 2>&1
     sudo docker rm hermes_service >/dev/null 2>&1
 
-    echo "[INFO] Stopping device-metrics-exporter container..."
-    sudo docker stop device-metrics-exporter >/dev/null 2>&1
-    sudo docker rm device-metrics-exporter >/dev/null 2>&1
+    echo "[INFO] Stopping Grafana LGTM container..."
+    sudo docker stop lgtm >/dev/null 2>&1
+    sudo docker rm lgtm >/dev/null 2>&1
 
     echo "[INFO] Removing profiling artifacts cache..."
-    rm -rf "$HOME/profiling_cache" >/dev/null 2>&1
+    rm -rf "${HERMES_PROFILING_CACHE_DIR:-$WORKSPACE_DIR/profiling_cache}" >/dev/null 2>&1
     echo "[INFO] Cleanup complete. Exiting."
     exit "$exit_code"
 }
@@ -159,50 +180,15 @@ wait_for_vllm_readiness() {
 # ===========================================================================
 
 # Remove any leftover containers from a previous run.
-sudo docker rm -f hermes_service device-metrics-exporter >/dev/null 2>&1
+sudo docker rm -f hermes_service >/dev/null 2>&1
 
-# Build the image locally if it is missing: clone the PR, overlay its Python
-# files onto the nightly's installed vLLM (no kernel compile), then commit.
-BASE_IMAGE="vllm/vllm-openai-rocm:nightly"
+# Pull the official release image if it is not already present locally.
 if [ -z "$(sudo docker images -q $IMAGE_NAME)" ]; then
-    echo "[INFO] Image $IMAGE_NAME not found. Building from $BASE_IMAGE + PR #51655..."
-    sudo docker pull "$BASE_IMAGE"
-    sudo docker rm -f muse_build >/dev/null 2>&1
-
-    # Overlay PR #51655's Python files and verify the parsers register before
-    # committing.
-    sudo docker run --name muse_build \
-        --device=/dev/kfd --device=/dev/dri \
-        --security-opt seccomp=unconfined --group-add video --privileged \
-        --entrypoint /bin/bash "$BASE_IMAGE" -c '
-            set -e
-            apt-get update && apt-get install -y git rsync
-            git clone https://github.com/vllm-project/vllm.git /tmp/vllm-src
-            cd /tmp/vllm-src
-            git fetch origin pull/51655/head:muse
-            git checkout muse
-            cd /root
-            VLLM_PKG=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null | tail -1)
-            echo "Overlaying PR #51655 python files onto: $VLLM_PKG"
-            rsync -a --include="*/" --include="*.py" --exclude="*" /tmp/vllm-src/vllm/ "$VLLM_PKG/"
-            python3 -c "from vllm.tool_parsers import ToolParserManager; assert ToolParserManager.get_tool_parser(\"muse_glimmer\"); print(\"tool parser OK\")"
-            python3 -c "from vllm.reasoning import ReasoningParserManager; assert ReasoningParserManager.get_reasoning_parser(\"muse_glimmer\"); print(\"reasoning parser OK\")"
-        '
-    BUILD_RC=$?
-    if [ "$BUILD_RC" -ne 0 ]; then
-        echo "[ERROR] Build of $IMAGE_NAME failed (overlay step). See output above."
-        sudo docker rm -f muse_build >/dev/null 2>&1
-        exit 1
-    fi
-
-    echo "[INFO] Committing patched container to image $IMAGE_NAME..."
-    sudo docker commit muse_build "$IMAGE_NAME"
-    sudo docker rm -f muse_build >/dev/null 2>&1
-    echo "[OK] Built $IMAGE_NAME"
+    echo "[INFO] Image $IMAGE_NAME not found locally. Pulling..."
+    sudo docker pull "$IMAGE_NAME"
 else
-    echo "[OK] Image $IMAGE_NAME found locally. Skipping build."
+    echo "[OK] Image $IMAGE_NAME found locally. Skipping pull."
 fi
-
 
 echo "[INFO] Launching hermes_service (vLLM)..."
 
@@ -242,48 +228,23 @@ if ! wait_for_vllm_readiness $VLLM_HERMES_PORT "hermes_service vLLM engine"; the
     fail "hermes_service vLLM engine" ""
 fi
 
-echo "[INFO] Launching device-metrics-exporter to track GPU usage..."
-sudo docker run -d \
-    --device=/dev/dri \
-    --device=/dev/kfd \
-    -v /sys:/sys:ro \
-    -p $VLLM_DEVICE_METRICS_EXPORTER_PORT:5000 \
-    --name device-metrics-exporter \
-    rocm/device-metrics-exporter:v1.5.0
-
-# The exporter serves Prometheus metrics at /metrics (not /v1/models), so it
-# needs its own readiness check rather than wait_for_vllm_readiness.
-echo "[INFO] Waiting for device-metrics-exporter on port $VLLM_DEVICE_METRICS_EXPORTER_PORT..."
-exporter_ready=0
-for i in $(seq 1 30); do
-    code=$(curl -s -o /dev/null -w "%{http_code}" \
-        "http://localhost:$VLLM_DEVICE_METRICS_EXPORTER_PORT/metrics")
-    code="${code:-000}"
-    if [ "$code" -eq 200 ]; then
-        echo "[OK] device-metrics-exporter is serving metrics."
-        exporter_ready=1
-        break
-    fi
-    sleep 2
-done
-if [ "$exporter_ready" -ne 1 ]; then
-    echo "[WARN] device-metrics-exporter did not respond on /metrics; GPU columns may be empty."
-fi
+# GPU numbers for the profiling patch come from amdsmi queried directly
+# in-process (see hermes_otel's gpu_probe.py / host_metrics.py), not from an
+# external exporter container. amdsmi is installed into the Hermes venv below.
 
 # ===========================================================================
 # Hermes toolchain and MLflow integration
 # ===========================================================================
 echo "[INFO] Installing MLflow and OpenTelemetry dependencies..."
 
-# Bootstrap a usable Python toolchain BEFORE anything tries to pip install.
+# Bootstrap a usable Python toolchain before anything attempts pip install.
 #
-# Several AMD Dev Cloud ROCm images (verified on rocm714-vllm-0.27.1-omni,
-# Ubuntu 24.04, Python 3.12.3) ship with NO pip and NO ensurepip for the system
-# interpreter, and they mark it PEP 668 externally-managed. Every `python3 -m
-# pip` below then dies with "No module named pip". That failure used to surface
-# far downstream as "[FATAL] MLflow server failed to start properly", whose log
-# said only "No module named mlflow", which points at the wrong problem
-# entirely.
+# Some AMD Dev Cloud ROCm images (e.g. rocm714-vllm-0.27.1-omni, Ubuntu 24.04,
+# Python 3.12.3) ship with no pip and no ensurepip for the system interpreter
+# and mark it PEP 668 externally-managed. In that state every `python3 -m pip`
+# below fails with "No module named pip", which surfaces far downstream as a
+# misleading "MLflow server failed to start". Bootstrapping here keeps the
+# failure local and its message accurate.
 ensure_python_toolchain() {
     local need_pip=0 need_venv=0
     python3 -m pip --version  >/dev/null 2>&1 || need_pip=1
@@ -330,9 +291,8 @@ ensure_python_toolchain() {
 ensure_python_toolchain
 
 # PEP 668 marks the system interpreter externally-managed on Ubuntu 24.04, so a
-# plain `pip install` is refused. These are throwaway workshop boxes and the
-# script already owns the system Python, so opt out explicitly rather than
-# letting the install fail.
+# plain `pip install` is refused. These are ephemeral workshop hosts and the
+# script already owns the system Python, so opt out explicitly.
 PIP_SYS_FLAGS=""
 if python3 -c "import sys,sysconfig,os; \
 sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('stdlib'), \
@@ -343,33 +303,32 @@ fi
 
 # Distro-installed Python packages carry no RECORD file, so when pip needs to
 # upgrade one to satisfy a dependency it cannot uninstall it and aborts the
-# WHOLE transaction:
+# whole transaction:
 #
 #   ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
 #          Hint: The package was installed by debian.
 #
-# Verified on rocm714-vllm-0.27.1-omni: mlflow 3.13.0 pulls a newer
-# typing_extensions than the apt-shipped 4.10.0. --ignore-installed on just the
-# offending names lets pip shadow them in site-packages without trying to
-# remove the apt copy. Scoped deliberately: a blanket --ignore-installed would
-# redownload the entire dependency tree.
+# mlflow pulls a newer typing_extensions than the apt-shipped 4.10.0.
+# --ignore-installed on just the offending names lets pip shadow them in
+# site-packages without removing the apt copy. It is scoped deliberately: a
+# blanket --ignore-installed would redownload the entire dependency tree.
 PIP_SHADOW_DEBIAN="--ignore-installed typing_extensions"
 
 # opentelemetry-exporter-otlp-proto-http is required: the hermes-otel plugin
 # ships traces to MLflow over the OTLP/HTTP protobuf endpoint. Without it the
 # plugin loads and prints its banner but exports nothing, so the dashboard sits
-# empty with no error. Added in upstream tts-aug18.
+# empty with no error.
+# Tested with mlflow 3.16.0.
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN \
-  mlflow==3.13.0 opentelemetry-sdk==1.42.1 \
+  mlflow opentelemetry-sdk==1.42.1 \
   opentelemetry-exporter-otlp-proto-http==1.42.1
 
-# Fail HERE with an accurate message rather than 200 lines later as a confusing
-# "MLflow server failed to start" whose log only says "No module named mlflow".
-# Check the OTLP exporter too: without it the plugin exports nothing silently.
+# Verify mlflow and the OTLP exporter imported, so a missing dependency fails
+# here with a clear message rather than later.
 if ! python3 -c "import mlflow" 2>/dev/null; then
     echo "[FATAL] mlflow did not install into $(command -v python3)."
     echo "        Re-run without -q to see the error:"
-    echo "        python3 -m pip install $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN mlflow==3.13.0"
+    echo "        python3 -m pip install $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN mlflow"
     exit 1
 fi
 if ! python3 -c "from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter" 2>/dev/null; then
@@ -380,17 +339,14 @@ fi
 echo "[OK] MLflow $(python3 -c 'import mlflow; print(mlflow.__version__)') and the OTLP exporter are installed."
 
 echo "[INFO] Launching MLflow server on port 5004..."
-# --serve-artifacts / --artifacts-destination: without a configured artifact
-# store MLflow records the RUN but cannot serve its artifacts, so the dashboard
-# and the Traces view come up with missing detail. Keep --allowed-hosts "*",
-# which the dashboard needs when it is reached over the server IP rather than
-# localhost.
+# --allowed-hosts "*" lets the dashboard reach the server over the server IP, not
+# only localhost. No artifact store is configured: the OTLP flow records traces,
+# not MLflow runs with artifacts.
+pip install --upgrade "mlflow>=3.0.0" fastapi uvicorn pydantic
 python3 -m mlflow server \
   --host 0.0.0.0 \
   --port 5004 \
   --backend-store-uri sqlite:///mlflow.db \
-  --serve-artifacts \
-  --artifacts-destination ./mlflow_artifacts \
   --allowed-hosts "*" > mlflow_server.log 2>&1 &
 
 MLFLOW_PID=$!
@@ -417,6 +373,50 @@ if [ "$mlflow_ready" -ne 1 ]; then
 fi
 
 # ===========================================================================
+# Grafana LGTM (CPU/GPU metrics backend for hermes-otel)
+# ===========================================================================
+# hermes-otel exports CPU/GPU as OTel metrics, not files - MLflow only records
+# traces, so a metrics-capable OTLP backend is needed separately. LGTM bundles
+# an OTLP receiver (traces+metrics+logs) in front of an embedded Mimir/
+# Prometheus store, all in one container - matches the "lgtm" backend already
+# written into config.yaml below (endpoint :4318, metrics: true).
+echo "[INFO] Launching Grafana LGTM (CPU/GPU metrics backend)..."
+sudo docker rm -f lgtm >/dev/null 2>&1
+
+# Pull the image if it is not already present locally.
+if [ -z "$(sudo docker images -q grafana/otel-lgtm)" ]; then
+    echo "[INFO] Image grafana/otel-lgtm not found locally. Pulling..."
+    sudo docker pull grafana/otel-lgtm
+else
+    echo "[OK] Image grafana/otel-lgtm found locally. Skipping pull."
+fi
+
+sudo docker run -d --name lgtm \
+    -p 3000:3000 -p 4317:4317 -p 4318:4318 -p 9090:9090 \
+    grafana/otel-lgtm
+
+echo "[INFO] Waiting for Grafana (LGTM) /api/health on port 3000..."
+lgtm_ready=0
+for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000/api/health")
+    code="${code:-000}"
+    if [ "$code" -eq 200 ]; then
+        echo "[OK] Grafana LGTM is up."
+        lgtm_ready=1
+        break
+    fi
+    # Fail fast if the container already exited.
+    if ! sudo docker inspect -f '{{.State.Running}}' lgtm 2>/dev/null | grep -q true; then
+        break
+    fi
+    sleep 2
+done
+if [ "$lgtm_ready" -ne 1 ]; then
+    fail "Grafana LGTM" ""
+fi
+echo "[INFO] Grafana UI at $(service_url 3000) (metrics also queryable at :9090)"
+
+# ===========================================================================
 # Hermes Installation & Configuration
 # ===========================================================================
 sudo chown -R $(whoami):$(whoami) "$HOME/.hermes"
@@ -424,9 +424,9 @@ if ! command -v hermes &> /dev/null && [ ! -f "$HOME/.local/bin/hermes" ]; then
     echo "[INFO] Installing Hermes agent..."
     # The Hermes installer needs npm for its Node-based TUI. On a bare image
     # npm is absent and the install completes with a broken front end, so it is
-    # provisioned first. Ported from upstream tts-aug18, made conditional so a
-    # machine that already has npm (and the container image) does not pay for an
-    # apt round-trip, and a failure here does not abort the whole setup.
+    # provisioned first, conditionally: a machine that already has npm (and the
+    # container image) does not pay for an apt round-trip, and a failure here
+    # does not abort the whole setup.
     if ! command -v npm >/dev/null 2>&1; then
         echo "[INFO] npm not found; installing it for the Hermes front end..."
         sudo apt-get update -qq && sudo apt-get install -y -qq npm \
@@ -440,7 +440,7 @@ fi
 
 # Second chown, after the installer has run: the install script can create
 # files under $HOME/.hermes as root when invoked through sudo, which then makes
-# every later `hermes config set` fail on permissions. Ported from tts-aug18.
+# every later `hermes config set` fail on permissions.
 sudo chown -R $(whoami):$(whoami) "$HOME/.hermes"
 
 echo "[INFO] Applying local backend configuration..."
@@ -448,8 +448,6 @@ hermes config set model.provider custom
 hermes config set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
 hermes config set model.default "$HERMES_MODEL"
 hermes config set compression.enabled false
-# 16384, raised from 8192: the workshop passage is now ~8,450 characters, and
-# at 8192 the agent's replies were being truncated mid-run.
 hermes config set model.max_tokens 16384
 hermes config set terminal.cwd "$WORKSPACE_DIR"
 hermes config set tool_output.max_bytes 150000
@@ -459,31 +457,20 @@ hermes config set tool_output.max_line_length 5000
 # ===========================================================================
 # Playwright and browser dependencies (browser-driving Hermes tools)
 # ===========================================================================
-# Ported from upstream tts-aug18. Two corrections were needed:
-#   * Upstream installs only the pip package and never runs `playwright
-#     install`, so the browser binary is missing and any browser tool fails at
-#     first use, after the script has already printed "installed successfully".
-#     The Chromium download is done here so the success message is earned.
-#   * Upstream reports [OK] unconditionally. Here the message is emitted only
-#     after a real post-install import check.
+# Two things worth calling out here:
+#   * Installing only the pip package without running `playwright install`
+#     leaves the browser binary missing, so any browser tool fails at first
+#     use. The Chromium download is done here so the success message is earned.
+#   * The [OK] message is emitted only after a post-install import check, not
+#     unconditionally.
 # Locate the Hermes venv rather than assuming a path.
 #
 # The Hermes installer links the binary into /usr/local/bin and installs the
-# code to /usr/local/lib/hermes-agent, NOT $HOME/.hermes/hermes-agent. On a
+# code to /usr/local/lib/hermes-agent, not $HOME/.hermes/hermes-agent. On a
 # root install (the workshop path) $HOME/.hermes/hermes-agent/venv does not
-# exist at all.
-#
-# Verified on a clean MI300X run of merged main on 2026-08-20: the hardcoded
-# path caused FIVE consecutive silent failures, all buried at log line ~2472
-# while setup still printed "[OK] Setup complete":
-#
-#   utils/helper.sh: line 538: /root/.hermes/hermes-agent/venv/bin/python: No such file or directory
-#   ... lines 549, 552, 553, 558 identical
-#
-# The consequence was invisible: mlflow, opentelemetry-sdk and the hermes_otel
-# plugin were never installed into the venv Hermes actually runs, so the agent
-# emitted no traces, MLflow held 0 runs and 0 traces, no profiling CSVs were
-# written, and the telemetry dashboard rendered empty with no error anywhere.
+# exist at all, so a hardcoded path would install telemetry into a venv Hermes
+# never runs, leaving the agent emitting no traces and the dashboard empty with
+# no error.
 #
 # Resolve the venv from the `hermes` launcher itself, which is authoritative,
 # and fall back to the known install locations.
@@ -541,31 +528,26 @@ else
 fi
 
 # ===========================================================================
-# Hermes OpenTelemetry Plugin & Patch Setup
+# Hermes OpenTelemetry Plugin Setup
 # ===========================================================================
+# The per-span / per-turn CPU and GPU profiling this workshop relies on is
+# provided by the hermes-otel plugin (host_metrics.py, gpu_probe.py and the
+# host_metrics / host_metrics_gpu / host_metrics_interval_ms / flush_interval_ms
+# config keys).
 echo "[INFO] Installing Hermes OpenTelemetry plugin..."
 
 rm -rf "$HOME/.hermes/plugins/hermes_otel"
 mkdir -p "$HOME/.hermes/plugins"
+# Install the hermes-otel plugin from its latest release tag.
+# Tested on hermes-otel-v1.3.0.
 git clone https://github.com/briancaffey/hermes-otel.git "$HOME/.hermes/plugins/hermes_otel"
-
 cd "$HOME/.hermes/plugins/hermes_otel"
-git fetch origin --tags --depth=1
-git checkout hermes-otel-v0.10.0
-
-# Apply the advanced profiling patch once while inside the plugin directory
-echo "[INFO] Applying advanced profiling patch..."
-PATCH_FILE="$UTILS_DIR/hermes_advanced_profiling.patch"
-
-if [ ! -f "$PATCH_FILE" ]; then
-    echo "[ERROR] Patch file not found at $PATCH_FILE; profiling not installed."
-elif git apply --check "$PATCH_FILE" >/dev/null 2>&1; then
-    git apply "$PATCH_FILE"
-    echo "[OK] Advanced profiling patch applied."
-elif git apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
-    echo "[INFO] Patch already applied. Skipping."
+HERMES_OTEL_VERSION="$(git tag -l 'hermes-otel-v*' | sort -V | tail -1)"
+if [ -n "$HERMES_OTEL_VERSION" ]; then
+    echo "[INFO] Using latest hermes-otel release: $HERMES_OTEL_VERSION"
+    git checkout -q "$HERMES_OTEL_VERSION"
 else
-    echo "[WARN] Patch did not apply cleanly (wrong plugin version or conflict)."
+    echo "[WARN] No hermes-otel release tag found; staying on the default branch."
 fi
 
 # Install the plugin package in editable mode using standard python/pip.
@@ -574,8 +556,7 @@ fi
 echo "[INFO] Installing plugin package in editable mode..."
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN -e .
 
-# An editable install that silently no-ops leaves the agent running with no
-# telemetry plugin and no error, so assert the package actually imports.
+# Assert the plugin package actually imports after the editable install.
 if ! python3 -c "import hermes_otel" 2>/dev/null; then
     echo "[WARN] hermes_otel is not importable from $(command -v python3) after the editable install."
     echo "       Telemetry may not be exported. Check the pip output above."
@@ -587,6 +568,13 @@ cd "$WORKSPACE_DIR"
 cat << 'EOF' > "$HOME/.hermes/plugins/hermes_otel/config.yaml"
 enabled: true
 force_flush_on_session_end: true
+capture_previews: true
+capture_full_prompts: false
+capture_full_responses: false
+host_metrics: true
+host_metrics_gpu: amd
+host_metrics_interval_ms: 100
+flush_interval_ms: 100
 backends:
   - type: otlp
     name: mlflow
@@ -595,6 +583,12 @@ backends:
     logs: false
     headers:
       x-mlflow-experiment-id: "0"
+  - type: otlp
+    name: lgtm
+    endpoint: http://127.0.0.1:4318/v1/traces
+    traces: false
+    metrics: true
+    logs: false
 EOF
 
 hermes plugins enable hermes_otel --allow-tool-override
@@ -609,11 +603,11 @@ if [ -z "$HERMES_VENV_PY" ] || [ ! -x "$HERMES_VENV_PY" ]; then
     exit 1
 fi
 
-# The Hermes venv is created by `uv` and ships WITHOUT pip (verified on a clean
-# MI300X run 2026-08-20: pyvenv.cfg shows `uv = 0.12.5`, and every
-# `-m pip install` failed with "No module named pip"). Bootstrap it, and do NOT
-# swallow the result: if pip cannot be installed here, none of the telemetry
-# packages below land and the dashboard ends up empty with no visible error.
+# The Hermes venv is created by `uv` and ships without pip, so every
+# `-m pip install` into it fails with "No module named pip". Bootstrap pip
+# first, and do not swallow the result: if pip cannot be installed here, none
+# of the telemetry packages below land and the dashboard ends up empty with no
+# visible error.
 if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
     echo "[INFO] Hermes venv has no pip (uv-created); bootstrapping..."
     "$HERMES_VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
@@ -626,13 +620,13 @@ if ! "$HERMES_VENV_PY" -m pip --version >/dev/null 2>&1; then
     exit 1
 fi
 echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)"
-# Dependencies for the patched hermes-otel plugin, inside the Hermes venv.
-# Upstream tts-aug18 trimmed pyrsmi, amdsmi and cryptography from this line and
-# the trim is correct: nothing in this repo imports them. The patched plugin
-# gets GPU numbers by scraping the AMD Device Metrics Exporter over HTTP
-# (`requests`), not through amdsmi/pyrsmi bindings, and its CPU numbers come
-# from `psutil`. Carrying the extra wheels only risked pip resolving a
-# conflicting transitive dependency into the Hermes venv.
+# Dependencies for the hermes-otel plugin, inside the Hermes venv. GPU numbers
+# come from amdsmi queried in-process (gpu_probe.py / host_metrics.py) and CPU
+# numbers from psutil.
+#
+# amdsmi is intentionally left unpinned: it ships with the ROCm stack and
+# should match whatever ROCm version is already on this host rather than a
+# hardcoded version here.
 #
 # psutil is installed with --no-deps deliberately: it is a leaf dependency and
 # this keeps pip from touching anything else already resolved in the venv.
@@ -640,7 +634,8 @@ echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)
   opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
   opentelemetry-exporter-otlp-proto-http==1.42.1
 "$HERMES_VENV_PY" -m pip install -q --no-deps psutil
-"$HERMES_VENV_PY" -m pip install -q mlflow==3.13.0 requests
+"$HERMES_VENV_PY" -m pip install -q amdsmi
+"$HERMES_VENV_PY" -m pip install -q requests
 
 # The plugin package itself must also be importable from the Hermes venv, not
 # just from the system interpreter, or the agent loads no telemetry backend.
@@ -656,50 +651,34 @@ import sys
 missing = []
 for mod in ("opentelemetry.sdk",
             "opentelemetry.exporter.otlp.proto.http.trace_exporter",
-            "psutil", "requests", "mlflow", "hermes_otel"):
+            "psutil", "amdsmi", "requests", "hermes_otel"):
     try:
         __import__(mod)
     except Exception as exc:            # noqa: BLE001
         missing.append(f"{mod} ({exc.__class__.__name__})")
 if missing:
-    # Deliberately FATAL, not a warning. This used to sys.exit(0), so the run
-    # continued to "[OK] Setup complete" while the agent emitted no traces at
-    # all and the dashboard sat empty with nothing in any log to explain it.
+    # Deliberately FATAL, not a warning: a missing dependency here means the
+    # agent emits no traces and the dashboard renders empty with nothing in any
+    # log to explain it, so stop rather than continuing to "[OK] Setup complete".
     print("[FATAL] Hermes venv is missing: " + ", ".join(missing))
     print("[FATAL] The agent would emit no telemetry and the profiling")
     print("        dashboard would render empty. Refusing to continue.")
     sys.exit(1)
 print("[OK] Hermes venv telemetry dependencies import cleanly.")
 PYCHECK
-# This script does NOT use `set -e`, so the heredoc's exit status must be
-# checked explicitly. Without this the exit 1 above is discarded and the run
-# continues to "[OK] Setup complete" with no telemetry, which is the exact
-# failure being fixed.
+# This script does not use `set -e`, so the heredoc's exit status must be
+# checked explicitly. Without this check the exit 1 above is discarded and the
+# run continues to "[OK] Setup complete" with no telemetry installed.
 if [ $? -ne 0 ]; then
     echo "[FATAL] Aborting: Hermes telemetry dependencies are not installed."
     exit 1
 fi
-echo "[INFO] MLflow tracking available at http://${SYSTEM_IP}:5004/"
+echo "[INFO] MLflow tracking available at $(service_url 5004)"
 
-cat << 'EOF' >> "$HOME/.hermes/.env"
-# MLflow and vLLM observability configuration
-MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false
-MLFLOW_SYSTEM_METRICS_SAMPLING_INTERVAL=1
-MLFLOW_TRACKING_URI=http://127.0.0.1:5004
-MLFLOW_EXPERIMENT_NAME=Default
-VLLM_HERMES_PORT=8001
-MLFLOW_RUN_NAME=Hermes_Profiling
-MLFLOW_KEEP_RUN_ACTIVE=false
-MLFLOW_LOGGING_LEVEL=ERROR
-MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT=1
-HERMES_TOOL_PROFILING=1
-HERMES_GPU_EXPORTER_URL=http://localhost:5050/metrics
-HERMES_PROFILING_DEBUG=0
-MLFLOW_DISABLE_TELEMETRY=true
-HERMES_CPU_DEBUG=0
-EOF
-
-echo "HERMES_PROFILING_OUTPUT_DIR=${WORKSPACE_DIR}/outputs" >> "$HOME/.hermes/.env"
+# The hermes-otel plugin needs nothing from ~/.hermes/.env: CPU/GPU flow as OTel
+# metrics into Grafana LGTM (see config.yaml above, which sets the endpoint
+# directly), and traces carry their own session/turn metadata, so no MLflow run
+# or env-driven CSV output is involved.
 
 # ===========================================================================
 # Kokoro TTS server
@@ -718,17 +697,16 @@ echo "[INFO] Installing kokoro, soundfile, fastapi, uvicorn, streamlit..."
 # Install the dashboard's dependencies from utils/requirements.txt rather than
 # naming streamlit alone.
 #
-# Verified on a clean MI300X run 2026-08-20: installing only streamlit meant
-# plotly was never present, so utils/hermes_profiler.py died on
-# `import plotly.graph_objects` and the dashboard rendered a bare
-# ModuleNotFoundError traceback. Setup still printed "[OK] Streamlit dashboard
-# is up." because /_stcore/health returns 200 for a crashed app: the Streamlit
-# server is alive, the script inside it is not.
+# Installing only streamlit leaves plotly absent, so utils/hermes_profiler.py
+# fails on `import plotly.graph_objects` and the dashboard renders a bare
+# ModuleNotFoundError traceback. A health check alone would still report the
+# dashboard up, because /_stcore/health returns 200 for a crashed app: the
+# Streamlit server is alive even when the script inside it is not.
 if [ -f "$UTILS_DIR/requirements.txt" ]; then
     "$KOKORO_ENV/bin/pip" install -q -r "$UTILS_DIR/requirements.txt"
 else
     echo "[WARN] $UTILS_DIR/requirements.txt not found; installing known deps."
-    "$KOKORO_ENV/bin/pip" install -q 'streamlit>=1.30' 'plotly>=5.18' 'pandas>=2.0' mlflow==3.13.0
+    "$KOKORO_ENV/bin/pip" install -q 'streamlit>=1.30' 'plotly>=5.18' 'pandas>=2.0' mlflow
 fi
 
 # Assert every module the dashboard imports at top level actually resolves.
@@ -758,20 +736,20 @@ mkdir -p "$HOME/.config/miopen/miopen-lockfiles"
 # ---------------------------------------------------------------------------
 # MIOpen JIT headers
 # ---------------------------------------------------------------------------
-# Kokoro's text encoder runs an LSTM, and MIOpen compiles that kernel at RUNTIME
-# with HIPRTC. That compile needs ROCm HEADERS on disk, not just the runtime
-# libraries. Several AMD Dev Cloud ROCm images ship the libraries but omit the
-# header trees, and the failure is deeply misleading:
+# Kokoro's text encoder runs an LSTM, and MIOpen compiles that kernel at runtime
+# with HIPRTC. That compile needs ROCm headers on disk, not just the runtime
+# libraries. Some AMD Dev Cloud ROCm images ship the libraries but omit the
+# header trees, and the resulting failure is misleading:
 #
 #   RuntimeError: miopenStatusUnknownError        (inside _VF.lstm)
 #
-# with no mention of a missing file. Everything else passes, verified on this
-# image: torch.cuda.is_available() True, a 512x512 matmul fine, and a plain
-# torch.nn.LSTM on GPU fine. Only the JIT-compiled kernel fails, so it looks
-# like a Kokoro bug rather than a missing header.
+# with no mention of a missing file. Other GPU operations still succeed
+# (torch.cuda.is_available(), a matmul, a plain torch.nn.LSTM on GPU), so only
+# the JIT-compiled kernel fails and it presents as a Kokoro bug rather than a
+# missing header.
 #
 # The ROCm docker images already on these hosts carry the full header tree, so
-# extract from one instead of needing an apt repo (Dev Cloud images have no
+# extract from one instead of relying on an apt repo (Dev Cloud images have no
 # ROCm apt source configured, making `apt-get install rocrand-dev` a silent
 # no-op). A stopped container is enough; no GPU and no run required.
 ensure_miopen_jit_headers() {
@@ -783,7 +761,7 @@ ensure_miopen_jit_headers() {
 
     echo "[INFO] MIOpen JIT headers missing; extracting from a local ROCm image..."
     local src=""
-    for cand in "$IMAGE_NAME" "$BASE_IMAGE" "rocm:latest"; do
+    for cand in "$IMAGE_NAME" "rocm:latest"; do
         [ -n "$cand" ] || continue
         if sudo docker image inspect "$cand" >/dev/null 2>&1; then
             src="$cand"
@@ -850,12 +828,12 @@ fi
 # other machines.
 DASHBOARD_APP="$UTILS_DIR/hermes_profiler.py"
 if [ -f "$DASHBOARD_APP" ]; then
-    # Streamlit is installed INTO the Kokoro venv ($KOKORO_ENV), not system-wide,
-    # so a bare `streamlit` only resolves if that venv happens to be on PATH.
-    # On a clean host it is not, and the launch dies with
-    # "streamlit: command not found" inside the redirected log, surfacing 30
-    # seconds later as "[FATAL] Streamlit telemetry dashboard failed to start".
-    # Prefer the venv binary and fall back to whatever is on PATH.
+    # Streamlit is installed into the Kokoro venv ($KOKORO_ENV), not system-wide,
+    # so a bare `streamlit` only resolves if that venv is on PATH. On a clean
+    # host it is not, and the launch dies with "streamlit: command not found"
+    # inside the redirected log, surfacing later as a "[FATAL] Streamlit
+    # telemetry dashboard failed to start". Prefer the venv binary and fall
+    # back to whatever is on PATH.
     STREAMLIT_BIN="$KOKORO_ENV/bin/streamlit"
     if [ ! -x "$STREAMLIT_BIN" ]; then
         STREAMLIT_BIN="$(command -v streamlit 2>/dev/null)"
@@ -900,10 +878,10 @@ if [ -f "$DASHBOARD_APP" ]; then
         fail "Streamlit telemetry dashboard" "$WORKSPACE_DIR/streamlit_dashboard.log"
     fi
 
-    # /_stcore/health returning 200 only proves the Streamlit SERVER is alive.
+    # /_stcore/health returning 200 only proves the Streamlit server is alive.
     # It returns 200 even when the app script raised on import and every visitor
-    # sees a traceback. Verified 2026-08-20: a missing plotly produced a
-    # ModuleNotFoundError page while this loop still printed [OK].
+    # sees a traceback (for example a missing plotly producing a
+    # ModuleNotFoundError page).
     #
     # Parse the app's own top-level imports and confirm each one resolves in the
     # interpreter Streamlit runs under. That is what the health endpoint cannot
@@ -955,10 +933,12 @@ fi
 
 echo -e "\n========================================================================="
 echo "[OK] Setup complete."
-echo "  vLLM endpoint:        http://${SYSTEM_IP}:$VLLM_HERMES_PORT"
-echo "  Kokoro TTS server:    http://${SYSTEM_IP}:$KOKORO_PORT"
-echo "  MLflow tracking:      http://${SYSTEM_IP}:5004"
-echo "  Telemetry dashboard:  http://${SYSTEM_IP}:8501"
+echo "  vLLM endpoint (API):  $(service_url "$VLLM_HERMES_PORT")v1"
+echo "  Kokoro TTS (API):     $(service_url "$KOKORO_PORT")"
+echo "  MLflow tracking:      $(service_url 5004)"
+echo "  Grafana (CPU/GPU):    $(service_url 3000)"
+echo "  Telemetry dashboard:  $(service_url 8501)"
+echo "  (browser link base: HERMES_PROXY_BASE=\"$HERMES_PROXY_BASE\" — set \"\" for 127.0.0.1, or a host/IP)"
 echo "========================================================================="
 echo "[INFO] Holding the session open. Press Ctrl+C to stop all services and exit."
 

@@ -63,7 +63,7 @@ LANG = "a"
 DEFAULT_VOICE = "af_heart"
 DEFAULT_SPEED = 1.0
 DEFAULT_MODE = "sequential"
-DEFAULT_BATCH_SIZE = 16
+DEFAULT_BATCH_SIZE = 24
 DEFAULT_SPLIT_PATTERN = r"\n+|(?<=[.?!]) +"
 SAMPLE_RATE = 24000
 PORT = int(os.environ.get("KOKORO_PORT", "8092"))

@@ -35,7 +35,7 @@ log = logging.getLogger("kokoro_tts")
 SERVER_URL = "http://localhost:8092"
 DEFAULT_VOICE = "af_heart"
 DEFAULT_SPEED = 1.0
-DEFAULT_BATCH_SIZE = 16
+DEFAULT_BATCH_SIZE = 24
 DEFAULT_MODE = "sequential"
 MODES = ("sequential", "batched")
 _DEBUG_LOG = Path.home() / ".hermes" / "kokoro_tts_calls.log"
@@ -254,7 +254,8 @@ KOKORO_TTS_SCHEMA = {
                 "type": "integer",
                 "description": (
                     "Sentences per GPU forward when mode='batched'. "
-                    "Default 16 (sweet spot 16-24). Ignored for sequential."
+                    f"Default: {DEFAULT_BATCH_SIZE}. "
+                    "Ignored for sequential."
                 ),
             },
             "output_path": {

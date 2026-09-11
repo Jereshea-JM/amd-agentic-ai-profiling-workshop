@@ -20,7 +20,7 @@
 
 ## Overview
 
-This is a hands-on, beginner-friendly workshop on **observability-driven optimization** of AI agents. You run a real [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart), capture its telemetry with MLflow, read a purpose-built dashboard to spot the slowest step, optimize that one tool, and prove the speed-up with hardware metrics from an AMD Instinct&trade; MI300X GPU.
+This is a hands-on, beginner-friendly workshop on **observability-driven optimization** of AI agents. You run a real [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart), capture its telemetry — execution **traces** in MLflow and CPU/GPU **metrics** in Grafana `otel-lgtm` — read a purpose-built dashboard to spot the slowest step, optimize that one tool, and prove the speed-up with hardware metrics from an AMD Instinct&trade; MI300X GPU.
 
 Text-to-speech (TTS) is only the example. The real subject is a **repeatable profiling loop** you can point at any agent task.
 
@@ -45,7 +45,7 @@ Run the agent, **Fetch** the run in the dashboard, inspect the spans and GPU usa
 
 ## The optimization at a glance
 
-The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mostly idle. The workshop adds a **batched** mode that groups sentences into a single GPU forward pass.
+The default TTS uses Edge TTS, which has some limitations. We therefore use a local TTS model. However, it processes one sentence at a time, leaving the MI300X mostly idle. The workshop introduces a **batched mode** that processes multiple sentences together in a single GPU pass, improving GPU utilization and performance.
 
 <p align="center">
   <img src="assets/diagrams/04_journey.png" alt="Three approaches compared: cloud Edge TTS baseline, local Kokoro sequential baseline, and local Kokoro batched optimized" width="92%">
@@ -62,7 +62,6 @@ The default TTS tool feeds the GPU one sentence at a time, leaving the MI300X mo
 | `utils/helper.sh` | One-shot launcher for the full backend (agent, telemetry, dashboard, Kokoro server). |
 | `utils/kokoro_server.py` | The local Kokoro TTS server (FastAPI + Uvicorn), including the batched inference path. |
 | `utils/hermes_profiler.py` | The Streamlit telemetry dashboard. |
-| `utils/hermes_advanced_profiling.patch` | Extends hermes-otel to record CPU/GPU usage per span. |
 | `utils/requirements.txt` | Python dependencies for the notebook and dashboard. |
 | `utils/clear_cache.sh` | Clears the GPU kernel cache for cold-run benchmarks. |
 | `custom_tools/kokoro_tts_tool.py` | The custom `kokoro_tts` tool added to Hermes. |
@@ -87,7 +86,7 @@ Verify your GPUs are visible before you start:
 amd-smi
 ```
 
-> **Model note.** The agent is powered by **Muse-Glimmer-30B**, served with vLLM on the MI300X. On the first run, `utils/helper.sh` overlays the vLLM code from [PR #51655](https://github.com/vllm-project/vllm/pull/51655) onto AMD's `vllm/vllm-openai-rocm:nightly` image and commits it locally as `vllm-muse-glimmer:rocm`. This build happens automatically and only once.
+> **Model note.** The agent is powered by **Muse-Glimmer-30B**, served with vLLM on the MI300X using AMD's prebuilt `vllm/vllm-openai-rocm:v0.28.0` release image, which includes Muse-Glimmer-30B support.
 
 ---
 
@@ -105,9 +104,15 @@ docker run -d --name amd-agentic-ai-profiling \
   --security-opt seccomp=unconfined --group-add video \
   --ipc=host --shm-size 16G \
   -p 8888:8888 -p 8501:8501 -p 5004:5004 \
+  -e HERMES_PROXY_BASE="" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   shailensobhee1/amd-agentic-ai-profiling:mi300x
 ```
+
+> **Set `HERMES_PROXY_BASE`.** It controls the base of the notebook's "detailed view" links (the telemetry dashboard and MLflow). The container inherits the value you pass with `-e`, so set it to match where you open the notebook from:
+> - `-e HERMES_PROXY_BASE=""` &rarr; direct `http://127.0.0.1:<port>/` links (use with the `-p` maps above; shown in the command)
+> - `-e HERMES_PROXY_BASE="https://<your-proxy>"` &rarr; your own reverse proxy, as `https://<your-proxy>/<hostname>/proxy/<port>/`
+> - omit it &rarr; the AMD hosted-notebook proxy `https://notebooks.amd.com/<hostname>/proxy/<port>/`
 
 Watch it start with `docker logs -f amd-agentic-ai-profiling`. When it prints
 `All services are ready`, open `http://<host>:8888/lab/tree/tts.ipynb`.
@@ -142,11 +147,17 @@ python -m pip install -r utils/requirements.txt
 
 ### 4. Start the backend (leave this terminal open)
 
-In a **separate terminal**, launch the full stack. This one script starts the agent model, the patched telemetry, MLflow, the Kokoro TTS server, and the dashboard.
+In a **separate terminal**, set `HERMES_PROXY_BASE` and launch the full stack. This one script starts the agent model, the hermes-otel telemetry plugin, MLflow, Grafana `otel-lgtm`, the Kokoro TTS server, and the dashboard:
 
 ```bash
+export HERMES_PROXY_BASE=""
 bash utils/helper.sh
 ```
+
+> **Set `HERMES_PROXY_BASE`.** It controls the base of the service links `helper.sh` prints and the notebook's "detailed view" links (the telemetry dashboard and MLflow):
+> - `HERMES_PROXY_BASE=""` &rarr; direct `http://127.0.0.1:<port>/` links (shown above)
+> - `HERMES_PROXY_BASE="https://<your-proxy>"` &rarr; your own reverse proxy, as `https://<your-proxy>/<hostname>/proxy/<port>/`
+> - unset &rarr; the AMD hosted-notebook proxy `https://notebooks.amd.com/<hostname>/proxy/<port>/`
 
 > Leave that terminal running for the whole workshop. It keeps the services alive; closing it shuts the backend down. When it finishes starting, it prints the service URLs you will use in the notebook.
 
@@ -157,7 +168,7 @@ jupyter lab --ip=0.0.0.0 --port=8888 --no-browser
 ```
 
 Open **`tts.ipynb`** and work through it top to bottom. Everything from here on
-happens inside the notebook.
+happens inside the notebook. Pick the link base from the dropdown in the notebook's Step 2 cell (defaults to the value you set in step 4, if this is the same terminal).
 
 <details>
 <summary><b>Optional: force JupyterLab dark theme</b></summary>
@@ -178,17 +189,17 @@ echo '{"@jupyterlab/apputils-extension:themes": {"theme": "JupyterLab Dark"}}' >
 ## What `utils/helper.sh` starts
 
 <p align="center">
-  <img src="assets/diagrams/02_architecture.png" alt="Architecture: the Hermes Agent runtime calls the Kokoro TTS server on the MI300X; hermes-otel instruments the run and records to MLflow; the Streamlit dashboard reads MLflow to show one clear view" width="94%">
+  <img src="assets/diagrams/02_architecture.png" alt="Architecture: the Hermes Agent runtime calls the Kokoro TTS server on the MI300X; hermes-otel sends execution traces to MLflow and CPU/GPU metrics to Grafana otel-lgtm; the Streamlit dashboard reads traces from MLflow and metrics from otel-lgtm to show one clear view" width="94%">
 </p>
 
 | Service | Port | Role |
 | :--- | :--- | :--- |
 | Hermes backend (vLLM &middot; Muse-Glimmer-30B) | `8001` | The agent's model that plans and picks tools. |
-| Hermes OTel (patched) | n/a | Emits OpenTelemetry traces plus per-span CPU/GPU usage, sampled every 0.1s. |
-| MLflow tracking server | `5004` | Records every run with timings and hardware metrics. |
+| Hermes OTel | n/a | Sends execution traces to MLflow and CPU/GPU metrics to Grafana `otel-lgtm`. `helper.sh` sets a 100 ms sampling interval (`psutil` for CPU, `amdsmi` for GPU). |
+| MLflow tracking server | `5004` | Stores the execution traces the dashboard visualizes. |
+| Grafana `otel-lgtm` | `4318` / `9090` | Receives the CPU/GPU metrics over OTLP and stores them (Prometheus), which the dashboard queries. |
 | Telemetry dashboard (Streamlit) | `8501` | A clean overview of each run: spans, CPU/GPU timeline, tool breakdown. |
 | Kokoro TTS server | `8092` | The local, self-hosted TTS engine used in the optimization step. |
-| AMD Device Metrics Exporter | `5050` | Supplies GPU utilization to the telemetry. |
 
 ---
 
@@ -232,4 +243,4 @@ The generator reuses the workshop's backend-driving code cells verbatim, so edit
 
 **Authors:** Shailen Sobhee, Sabira Shaik, Jereshea John Mary
 
-Built for AMD developer enablement on AMD Instinct&trade; GPUs. Powered by [Hermes Agent](https://hermes-agent.nousresearch.com) (Nous Research), [MLflow](https://mlflow.org), and [Kokoro TTS](https://github.com/hexgrad/kokoro).
+Built for AMD developer enablement on AMD Instinct&trade; GPUs. Powered by [Hermes Agent](https://hermes-agent.nousresearch.com) (Nous Research), [MLflow](https://mlflow.org), [hermes-otel](https://github.com/briancaffey/hermes-otel), [docker-otel-lgtm](https://github.com/grafana/docker-otel-lgtm) and [Kokoro TTS](https://github.com/hexgrad/kokoro) 

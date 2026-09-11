@@ -162,7 +162,7 @@ def d_architecture():
     # Telemetry pipe
     b.append(card(480, 96, 380, 120, "#EAF2FB", BLUE))
     b.append(text(670, 124, "Telemetry", size=16, weight="bold", fill=BLUE))
-    b.append(text(670, 150, "hermes-otel (patched)", size=15, weight="bold", fill=INK))
+    b.append(text(670, 150, "hermes-otel", size=15, weight="bold", fill=INK))
     b.append(text(670, 172, "OTel spans + psutil CPU%", size=13, fill=SUBINK))
     b.append(text(670, 196, "+ AMD GPU metrics, every 0.1s", size=12.5, fill=SUBINK))
     b.append(text(450, 146, "instruments", size=10, fill=SUBINK, anchor="middle"))
@@ -181,7 +181,7 @@ def d_architecture():
     b.append(card(480, 240, 380, 96, PANEL, INK))
     b.append(text(670, 268, "MLflow tracking server", size=15, weight="bold", fill=INK))
     b.append(text(670, 292, "records every run :5004", size=13, fill=SUBINK))
-    b.append(text(670, 314, "timings + hardware metrics", size=12.5, fill=SUBINK))
+    b.append(text(670, 314, "execution traces", size=12.5, fill=SUBINK))
     b.append(text(730, 232, "records to", size=11, fill=SUBINK, anchor="start"))
     b.append(line(670, 216, 670, 240, color=INK))
 
