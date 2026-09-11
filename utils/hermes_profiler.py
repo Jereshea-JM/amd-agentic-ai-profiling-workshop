@@ -3029,7 +3029,7 @@ if _running_under_streamlit():
         st.subheader("Context & tools")
         st.caption(
             "Derived from this session's span trees. Nothing here needs new "
-            "instrumentation -- it is arithmetic over telemetry the "
+            "instrumentation, it is arithmetic over telemetry the "
             "hermes-otel plugin already emits."
         )
 
@@ -3143,7 +3143,7 @@ if _running_under_streamlit():
                         + across +
                         "Hover any point for the turn it belongs to, its step "
                         "within that turn, the exact token delta, and the tool that "
-                        "call requested -- the rise to the next point is that "
+                        "call requested, the rise to the next point is that "
                         "tool's result landing in the prompt. The y-intercept is "
                         "fixed overhead paid on every call (system prompt plus tool "
                         "schemas); the slope is context the agent accumulates as it "
@@ -3234,16 +3234,16 @@ if _running_under_streamlit():
 
             with st.expander("What these four metrics mean", expanded=False):
                 st.markdown(
-                    "- **Agent steps** -- LLM round trips before a terminal answer. "
+                    "- **Agent steps**: LLM round trips before a terminal answer. "
                     "In a serial agent this is the dominant latency term, because "
                     "each step costs a full request plus its generated tokens.\n"
-                    "- **Time to first tool** -- how long the agent thinks before "
+                    "- **Time to first tool**: how long the agent thinks before "
                     "acting. High is not automatically bad; it also describes a "
                     "turn where the model produced the answer itself.\n"
-                    "- **Context growth per step** -- slope of input tokens across "
+                    "- **Context growth per step**: slope of input tokens across "
                     "steps. Cheap in latency when prefix caching is working, but it "
                     "sets KV-cache pressure and token cost.\n"
-                    "- **Tool failure rate** -- failed calls over total, pooled "
+                    "- **Tool failure rate**: failed calls over total, pooled "
                     "across turns. Read alongside *wall time in failed calls*: a "
                     "20% failure rate costing 0.2s is a correctness annoyance, "
                     "while one costing 40s is a latency bug."
