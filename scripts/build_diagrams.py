@@ -146,54 +146,66 @@ def d_pipeline():
 # 2. ARCHITECTURE  (what helper.sh brings up)
 # =============================================================================
 def d_architecture():
-    W, H = 900, 470
+    W, H = 960, 560
     b = [text(W/2, 40, "What one command starts for you", size=22, weight="bold")]
     b.append(text(W/2, 64,
                   "bash helper.sh: the full observability backend, no manual setup",
                   size=14, fill=SUBINK, family=FONT))
 
-    # Compute / agent brain
+    # Agent brain (top-left)
     b.append(card(40, 96, 380, 120, "#FDECEC", AMD_RED))
     b.append(text(230, 124, "Agent runtime", size=16, weight="bold", fill=AMD_RED))
     b.append(text(230, 150, "Hermes Agent", size=15, weight="bold", fill=INK))
     b.append(text(230, 172, "vLLM \u00b7 Muse-Glimmer-30B", size=13, fill=SUBINK))
     b.append(text(230, 196, "plans, reasons, picks and calls tools", size=12.5, fill=SUBINK))
 
-    # Telemetry pipe
-    b.append(card(480, 96, 380, 120, "#EAF2FB", BLUE))
-    b.append(text(670, 124, "Telemetry", size=16, weight="bold", fill=BLUE))
-    b.append(text(670, 150, "hermes-otel", size=15, weight="bold", fill=INK))
-    b.append(text(670, 172, "OTel spans + psutil CPU%", size=13, fill=SUBINK))
-    b.append(text(670, 196, "+ AMD GPU metrics, every 0.1s", size=12.5, fill=SUBINK))
-    b.append(text(450, 146, "instruments", size=10, fill=SUBINK, anchor="middle"))
-    b.append(line(420, 156, 480, 156, color=INK))
+    # Telemetry plugin (top-right)
+    b.append(card(540, 96, 380, 120, "#EAF2FB", BLUE))
+    b.append(text(730, 124, "Telemetry", size=16, weight="bold", fill=BLUE))
+    b.append(text(730, 150, "hermes-otel", size=15, weight="bold", fill=INK))
+    b.append(text(730, 172, "OTel spans + CPU% (psutil)", size=13, fill=SUBINK))
+    b.append(text(730, 196, "+ AMD GPU metrics (amdsmi), every 0.1s", size=12, fill=SUBINK))
+    # agent -> otel
+    b.append(text(480, 146, "instruments", size=10, fill=SUBINK, anchor="middle"))
+    b.append(line(420, 156, 540, 156, color=INK))
 
-    # Kokoro server (right of agent, feeds work)
-    b.append(card(40, 240, 380, 96, "#E9F7F8", TEAL))
-    b.append(text(230, 268, "Kokoro TTS server", size=15, weight="bold", fill=TEAL))
-    b.append(text(230, 292, "FastAPI + Uvicorn on MI300X", size=13, fill=SUBINK))
-    b.append(text(230, 314, "model stays resident in GPU memory", size=12.5, fill=SUBINK))
-    # agent calls Kokoro as a tool
-    b.append(line(230, 216, 230, 240, color=INK))
-    b.append(text(292, 232, "calls as a tool", size=11, fill=SUBINK, anchor="start"))
+    # Kokoro server (under agent, called as a tool)
+    b.append(card(40, 250, 380, 96, "#E9F7F8", TEAL))
+    b.append(text(230, 278, "Kokoro TTS server", size=15, weight="bold", fill=TEAL))
+    b.append(text(230, 302, "FastAPI + Uvicorn on MI300X", size=13, fill=SUBINK))
+    b.append(text(230, 324, "model stays resident in GPU memory", size=12.5, fill=SUBINK))
+    b.append(line(230, 216, 230, 250, color=INK))
+    b.append(text(292, 242, "calls as a tool", size=11, fill=SUBINK, anchor="start"))
 
-    # MLflow
-    b.append(card(480, 240, 380, 96, PANEL, INK))
-    b.append(text(670, 268, "MLflow tracking server", size=15, weight="bold", fill=INK))
-    b.append(text(670, 292, "records every run :5004", size=13, fill=SUBINK))
-    b.append(text(670, 314, "execution traces", size=12.5, fill=SUBINK))
-    b.append(text(730, 232, "records to", size=11, fill=SUBINK, anchor="start"))
-    b.append(line(670, 216, 670, 240, color=INK))
+    # hermes-otel fans out to TWO backends: traces -> MLflow, metrics -> Grafana LGTM.
+    # MLflow (traces)
+    b.append(card(540, 250, 182, 96, PANEL, INK))
+    b.append(text(631, 277, "MLflow", size=15, weight="bold", fill=INK))
+    b.append(text(631, 299, "traces :5004", size=12.5, fill=SUBINK))
+    b.append(text(631, 319, "spans + timings", size=12, fill=SUBINK))
+    b.append(line(631, 216, 631, 250, color=INK))
+    b.append(text(600, 238, "traces", size=10.5, fill=SUBINK, anchor="end"))
+    # Grafana LGTM (CPU/GPU metrics)
+    b.append(card(738, 250, 182, 96, "#FEF3E6", ORANGE))
+    b.append(text(829, 275, "Grafana LGTM", size=14, weight="bold", fill=ORANGE))
+    b.append(text(829, 296, "OTLP metrics :4318", size=12, fill=SUBINK))
+    b.append(text(829, 315, "one container:", size=11.5, fill=SUBINK))
+    b.append(text(829, 332, "Prometheus :9090 \u00b7 UI :3000", size=11, fill=SUBINK))
+    b.append(line(829, 216, 829, 250, color=INK))
+    b.append(text(860, 238, "metrics", size=10.5, fill=SUBINK, anchor="start"))
 
-    # Dashboard (bottom, spanning)
-    b.append(card(220, 372, 460, 78, "#FDECEC", AMD_RED))
-    b.append(text(450, 400, "Telemetry dashboard  \u00b7  Streamlit :8501",
+    # Dashboard (bottom, spanning) reads spans from MLflow and CPU/GPU from LGTM's Prometheus.
+    b.append(card(260, 442, 440, 82, "#FDECEC", AMD_RED))
+    b.append(text(480, 470, "Telemetry dashboard  \u00b7  Streamlit :8501",
                   size=16, weight="bold", fill=AMD_RED))
-    b.append(text(450, 426, "one clear view of the run: spans, CPU/GPU timeline, tool breakdown",
+    b.append(text(480, 496, "one view of the run: spans, CPU/GPU timeline, tool breakdown",
                   size=13, fill=SUBINK))
-    # MLflow -> dashboard (the dashboard reads MLflow)
-    b.append(line(600, 336, 480, 372, color=INK))
-    b.append(line(230, 336, 400, 372, color=INK, dash="5 4"))
+    # MLflow -> dashboard (spans)
+    b.append(line(600, 346, 500, 442, color=INK))
+    b.append(text(520, 400, "spans", size=10.5, fill=SUBINK, anchor="end"))
+    # LGTM Prometheus -> dashboard (CPU/GPU)
+    b.append(line(829, 346, 640, 442, color=INK, dash="5 4"))
+    b.append(text(770, 400, "CPU / GPU :9090", size=10.5, fill=SUBINK, anchor="start"))
     save("02_architecture", svg(W, H, "".join(b)))
 
 
