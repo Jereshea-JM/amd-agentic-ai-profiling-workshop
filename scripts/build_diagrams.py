@@ -204,7 +204,7 @@ def d_architecture():
     b.append(line(600, 346, 500, 442, color=INK))
     b.append(text(520, 400, "spans", size=10.5, fill=SUBINK, anchor="end"))
     # LGTM Prometheus -> dashboard (CPU/GPU)
-    b.append(line(829, 346, 640, 442, color=INK, dash="5 4"))
+    b.append(line(829, 346, 640, 442, color=INK))
     b.append(text(770, 400, "CPU / GPU :9090", size=10.5, fill=SUBINK, anchor="start"))
     save("02_architecture", svg(W, H, "".join(b)))
 
