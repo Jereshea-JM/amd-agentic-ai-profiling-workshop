@@ -79,7 +79,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates procps lsof espeak-ng libsndfile1 \
-        ripgrep \
+        ripgrep tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Grafana otel-lgtm payload (OTel collector + Prometheus + Grafana), started by
@@ -95,8 +95,8 @@ COPY --from=lgtm /otel-lgtm.env /otel-lgtm/lgtm.env
 RUN python3 -m pip install --no-cache-dir \
         kokoro soundfile fastapi 'uvicorn[standard]' \
         'streamlit>=1.30' mlflow \
-        opentelemetry-sdk==1.42.1 opentelemetry-api==1.42.1 \
-        opentelemetry-exporter-otlp-proto-http==1.42.1 \
+        opentelemetry-sdk==1.44.0 opentelemetry-api==1.44.0 \
+        opentelemetry-exporter-otlp-proto-http==1.44.0 \
         psutil requests \
         jupyterlab==4.5.7 numpy==2.4.6 'plotly>=5.18' 'pandas>=2.0' \
         matplotlib ipywidgets kaleido \
@@ -141,8 +141,8 @@ RUN git clone https://github.com/briancaffey/hermes-otel.git \
     && echo "Hermes venv python: ${HERMES_VENV_PY}" \
     && "${HERMES_VENV_PY}" -m ensurepip --upgrade \
     && "${HERMES_VENV_PY}" -m pip install --no-cache-dir -q \
-        opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
-        opentelemetry-exporter-otlp-proto-http==1.42.1 \
+        opentelemetry-api==1.44.0 opentelemetry-sdk==1.44.0 \
+        opentelemetry-exporter-otlp-proto-http==1.44.0 \
         amdsmi psutil requests
 
 # -----------------------------------------------------------------------------
@@ -154,26 +154,12 @@ COPY assets/ ./assets/
 COPY custom_tools/ ./custom_tools/
 COPY utils/ ./utils/
 
-# The kokoro_tts tool imports `from tools.registry import ...`, a Hermes internal
-# module, so it must live inside the Hermes tools package to be importable.
-RUN HERMES_TOOLS_DIR="$(dirname "$(readlink -f "$(command -v hermes)")")/../tools" \
-    && HERMES_TOOLS_DIR="$( [ -d /usr/local/lib/hermes-agent/tools ] \
-         && echo /usr/local/lib/hermes-agent/tools \
-         || echo "${HERMES_TOOLS_DIR}" )" \
-    && if [ ! -d "${HERMES_TOOLS_DIR}" ]; then \
-         echo "ERROR: could not locate the Hermes tools package" >&2; exit 1; \
-       fi \
-    && cp /workshop/custom_tools/kokoro_tts_tool.py "${HERMES_TOOLS_DIR}/" \
-    && echo "Installed kokoro_tts_tool.py into ${HERMES_TOOLS_DIR}" \
-    # Prove the tool actually registers, rather than trusting the file copy.
-    && cd /usr/local/lib/hermes-agent \
-    && venv/bin/python -c "\
-from tools.registry import registry; import tools.kokoro_tts_tool; \
-names = getattr(registry, 'tools', None) or getattr(registry, '_tools', {}); \
-assert 'kokoro_tts' in names, f'kokoro_tts not registered, found {list(names)}'; \
-print('kokoro_tts registered OK')" \
-    && mkdir -p /workshop/outputs /root/.hermes/workspace \
-                /root/.config/miopen/miopen-lockfiles
+# kokoro_tts_tool.py is intentionally NOT installed into Hermes here. The
+# notebook's own cell installs it, matching the bare-host workflow, so the
+# Step 1 (Edge TTS baseline) is not skewed by having kokoro_tts already
+# registered and preferred before the notebook reaches that point.
+RUN mkdir -p /workshop/outputs /root/.hermes/workspace \
+             /root/.config/miopen/miopen-lockfiles
 
 # -----------------------------------------------------------------------------
 # 6. Preconfigure Hermes and the profiling plugin
@@ -240,5 +226,8 @@ EXPOSE 8888 8501 5004 8001 8092 9090 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20m --retries=3 \
     CMD curl -fsS "http://localhost:${JUPYTER_PORT}/api" >/dev/null || exit 1
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# tini as PID 1 reaps orphaned/zombie descendants and forwards signals
+# correctly - a plain bash script as PID 1 does neither. General Docker
+# best practice for a multi-process container like this one.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve"]

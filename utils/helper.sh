@@ -320,8 +320,8 @@ PIP_SHADOW_DEBIAN="--ignore-installed typing_extensions"
 # empty with no error.
 # Tested with mlflow 3.16.0.
 python3 -m pip install -q $PIP_SYS_FLAGS $PIP_SHADOW_DEBIAN \
-  mlflow opentelemetry-sdk==1.42.1 \
-  opentelemetry-exporter-otlp-proto-http==1.42.1
+  mlflow opentelemetry-sdk==1.44.0 \
+  opentelemetry-exporter-otlp-proto-http==1.44.0
 
 # Verify mlflow and the OTLP exporter imported, so a missing dependency fails
 # here with a clear message rather than later.
@@ -631,8 +631,8 @@ echo "[OK] Hermes venv pip: $("$HERMES_VENV_PY" -m pip --version 2>&1 | head -1)
 # psutil is installed with --no-deps deliberately: it is a leaf dependency and
 # this keeps pip from touching anything else already resolved in the venv.
 "$HERMES_VENV_PY" -m pip install -q \
-  opentelemetry-api==1.42.1 opentelemetry-sdk==1.42.1 \
-  opentelemetry-exporter-otlp-proto-http==1.42.1
+  opentelemetry-api==1.44.0 opentelemetry-sdk==1.44.0 \
+  opentelemetry-exporter-otlp-proto-http==1.44.0
 "$HERMES_VENV_PY" -m pip install -q --no-deps psutil
 "$HERMES_VENV_PY" -m pip install -q amdsmi
 "$HERMES_VENV_PY" -m pip install -q requests
