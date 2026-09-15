@@ -77,16 +77,20 @@ def _img_data_uri(relpath):
 
 # Overview cells shown after each profiling run. The Step 2 cell exposes the
 # link-base dropdown and sets HERMES_PROXY_BASE; the kokoro cells reuse it.
-_OVERVIEW = '''# This cell shows an overview tab alone; for a detailed view, click on the links provided when running this cell.
-import importlib, sys, os, logging
+_OVERVIEW = '''import importlib, sys, os, logging, warnings
+
 sys.path.insert(0, os.path.abspath("utils"))
-logging.disable(logging.WARNING)          # mute Streamlit's import-time warnings
+
+logging.disable(logging.WARNING)   # mute Streamlit's "missing ScriptRunContext" etc.
+warnings.filterwarnings("ignore")  # mute plotly/mlflow UserWarning/FutureWarning etc.
+
 import hermes_profiler
 importlib.reload(hermes_profiler)          # pick up edits without a kernel restart
-logging.disable(logging.NOTSET)
 
 SESSION_ID = None   # a run ID, or None to auto-fetch the latest session
-hermes_profiler.show_session_overview(SESSION_ID)'''
+hermes_profiler.show_session_overview(SESSION_ID)
+
+logging.disable(logging.NOTSET)'''
 
 
 
@@ -106,7 +110,7 @@ md(
 
 <p align="center">
 <b>An observability-driven optimization workshop</b><br>
-<sub>Hermes Agent &middot; MLflow telemetry &middot; AMD Instinct&trade; MI300X &middot; ROCm&trade;</sub>
+<sub>Hermes Agent &middot; MLflow &amp; Grafana otel-lgtm telemetry &middot; AMD Instinct&trade; MI300X &middot; ROCm&trade;</sub>
 </p>
 """
 + ("""
@@ -185,7 +189,7 @@ This tutorial was developed and tested with the setup below.
 ### Hardware
 **AMD Instinct&trade; MI300X GPU (192 GB VRAM).** This tutorial was tested on a
 single MI300X, which comfortably hosts both the Muse-Glimmer-30B model and the
-Kokoro TTS model at once. Use an AMD Instinct GPU with ROCm support that meets the
+Kokoro TTS model at once. Use an AMD Instinct&trade; GPU with ROCm support that meets the
 official requirements.
 
 ### Software
@@ -410,8 +414,10 @@ md(
 **Watch the Hermes output cell** and you will notice logs similar to this:
 
 ```text
-[hermes-otel] mlflow at http://127.0.0.1:5004/v1/traces (traces only)
-[hermes-otel] Live dashboard store active
+[hermes-otel] ✓ mlflow at http://127.0.0.1:5004/v1/traces (traces only)
+[hermes-otel] ✓ lgtm at http://127.0.0.1:4318/v1/traces (query only)
+[hermes-otel] ✓ Live dashboard store active
+[hermes-otel] ✓ Host metrics sampler on (every 100 ms, gpu=amd)
 [hermes-otel] Registered 13 hooks
 ```
 
@@ -442,17 +448,17 @@ server address and gives you a direct link.
 > `ssh -L 8501:localhost:8501`). Use the **server-IP** link when you are hitting a
 > remote machine directly and port `8501` is reachable from your network.
 
-**The dashboard has four tabs:**
+**The dashboard has five tabs:**
 
-1. **Overview.** Plots the span waterfall for the agent's flow alongside CPU and
+1. **Overview:** Plots the span waterfall for the agent's flow alongside CPU and
    GPU utilization at each span. A toggle switches between the standalone CPU/GPU
    timeline (the default) and the full-session waterfall correlated with it. A
    tool-breakdown table sits below the chart.
-2. **CPU / GPU separate.** Shows the CPU and GPU graphs individually, with an
+2. **CPU / GPU separate:** Shows the CPU and GPU graphs individually, with an
    option to view the raw `.csv` files the Overview charts are plotted from.
-3. **Context & tools.** Charts how the agent's context grows step by step across the session, plus a per-turn breakdown and every tool    outcome, including failures.
-4. **Traces.** Provides a direct MLflow link for each turn in the session.
-5. **Analysis.** Feeds the MLflow traces plus each tool's execution time to the
+3. **Context & tools:** Charts how the agent's context grows step by step across the session, plus a per-turn breakdown and every tool    outcome, including failures.
+4. **Traces:** Provides a direct MLflow link for each turn in the session.
+5. **Analysis:** Feeds the MLflow traces plus each tool's execution time to the
    local `hermes` CLI and reports how the agent could be improved. Depending on
    the length of the traces this can take around five minutes.
 ''')
@@ -795,9 +801,9 @@ from matplotlib import font_manager
 # --- Tool execution time (seconds) for each approach ---
 # Default values; replace them with the execution seconds from your own runs,
 # taken from each tool's output line and the profiling dashboard.
-edge_time = 11.09      # Edge TTS (cloud) - note: truncates long text (~5 min cap)
-seq_time = 67.2      # Kokoro, sequential mode (local, unoptimized)
-batched_time = 5.02    # Kokoro, batched mode (local, optimized)
+edge_time = 12.32      # Edge TTS (cloud) - note: truncates long text (~5 min cap)
+seq_time = 120.6      # Kokoro, sequential mode (local, unoptimized)
+batched_time = 9.62    # Kokoro, batched mode (local, optimized)
 
 for _f in ("Arial", "Liberation Sans", "DejaVu Sans"):
     if any(_f in f.name for f in font_manager.fontManager.ttflist):
