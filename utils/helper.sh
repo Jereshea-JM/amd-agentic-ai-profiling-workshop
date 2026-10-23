@@ -156,6 +156,12 @@ fail() {
     cleanup 1
 }
 
+# Report a failed setup step and stop, tearing down anything already started.
+abort() {
+    echo -e "\n[FATAL] $*" >&2
+    cleanup 1
+}
+
 # Declared up front so cleanup can reference them safely even if Ctrl+C arrives
 # before the corresponding server is started.
 MLFLOW_PID=""
@@ -165,10 +171,15 @@ STREAMLIT_PID=""
 # Catch Ctrl+C and termination so containers are always cleaned up.
 trap cleanup INT TERM
 
+# The first run downloads the model weights (about 60 GB), which can take well
+# over 10 minutes, so the default timeout is an hour. Override it with
+# VLLM_TIMEOUT=<seconds>.
+VLLM_TIMEOUT="${VLLM_TIMEOUT:-3600}"
+
 wait_for_vllm_readiness() {
     local port=$1
     local service_name=$2
-    local timeout=600
+    local timeout=$VLLM_TIMEOUT
     local counter=0
 
     echo "[INFO] Waiting for $service_name to load weights and start its API on port $port..."
@@ -181,10 +192,20 @@ wait_for_vllm_readiness() {
             return 0
         fi
 
+        # Stop waiting as soon as the container exits (for example a crash while
+        # loading the model) instead of polling a dead server until the timeout.
+        if ! sudo docker inspect -f '{{.State.Running}}' hermes_service 2>/dev/null | grep -q true; then
+            echo "[ERROR] The hermes_service container exited before $service_name became ready."
+            return 1
+        fi
+
         sleep 5
         counter=$((counter + 5))
+        if [ $((counter % 60)) -eq 0 ]; then
+            echo "[INFO] Still waiting for $service_name... ${counter}s"
+        fi
         if [ $counter -ge $timeout ]; then
-            echo "[ERROR] Timeout waiting for $service_name to respond."
+            echo "[ERROR] Timeout waiting for $service_name to respond after ${timeout}s."
             return 1
         fi
     done
@@ -200,7 +221,7 @@ sudo docker rm -f hermes_service >/dev/null 2>&1
 # Pull the official release image if it is not already present locally.
 if [ -z "$(sudo docker images -q $IMAGE_NAME)" ]; then
     echo "[INFO] Image $IMAGE_NAME not found locally. Pulling..."
-    sudo docker pull "$IMAGE_NAME"
+    sudo docker pull "$IMAGE_NAME" || abort "Could not pull the vLLM image $IMAGE_NAME."
 else
     echo "[OK] Image $IMAGE_NAME found locally. Skipping pull."
 fi
@@ -233,7 +254,8 @@ sudo docker run -d \
         --attention-backend ROCM_AITER_FA \
         --generation-config auto \
         --enable-prefix-caching \
-        --host 0.0.0.0"
+        --host 0.0.0.0" \
+    || abort "Could not start the hermes_service (vLLM) container."
 
 echo "[INFO] Verifying container runtimes..."
 if ! wait_for_vllm_readiness $VLLM_HERMES_PORT "hermes_service vLLM engine"; then
@@ -357,7 +379,8 @@ echo "[INFO] Launching MLflow server on port 5004..."
 # --allowed-hosts "*" lets the dashboard reach the server over the server IP, not
 # only localhost. No artifact store is configured: the OTLP flow records traces,
 # not MLflow runs with artifacts.
-pip install --upgrade "mlflow>=3.0.0" fastapi uvicorn pydantic
+pip install --upgrade "mlflow>=3.0.0" fastapi uvicorn pydantic \
+    || echo "[WARN] Upgrading mlflow, fastapi, uvicorn and pydantic failed; continuing with the installed versions."
 python3 -m mlflow server \
   --host 0.0.0.0 \
   --port 5004 \
@@ -401,14 +424,15 @@ sudo docker rm -f lgtm >/dev/null 2>&1
 # Pull the image if it is not already present locally.
 if [ -z "$(sudo docker images -q grafana/otel-lgtm)" ]; then
     echo "[INFO] Image grafana/otel-lgtm not found locally. Pulling..."
-    sudo docker pull grafana/otel-lgtm
+    sudo docker pull grafana/otel-lgtm || abort "Could not pull the grafana/otel-lgtm image."
 else
     echo "[OK] Image grafana/otel-lgtm found locally. Skipping pull."
 fi
 
 sudo docker run -d --name lgtm \
     -p 3000:3000 -p 4317:4317 -p 4318:4318 -p 9090:9090 \
-    grafana/otel-lgtm
+    grafana/otel-lgtm \
+    || abort "Could not start the Grafana LGTM container."
 
 # The dashboard reads the metrics from the Prometheus store on :9090, so that is
 # what has to be serving before setup continues. Grafana's own /api/health on
@@ -451,7 +475,15 @@ if ! command -v hermes &> /dev/null && [ ! -f "$HOME/.local/bin/hermes" ]; then
         sudo apt-get update -qq && sudo apt-get install -y -qq npm \
             || echo "[WARN] npm install failed; the Hermes TUI may be degraded."
     fi
-    curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup
+    # Download the installer first so a failed download is reported instead of
+    # piping an empty script into bash.
+    curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
+        -o "$TMPDIR/hermes_install.sh" \
+        || abort "Could not download the Hermes installer."
+    bash "$TMPDIR/hermes_install.sh" --skip-setup || abort "The Hermes installer failed."
+    rm -f "$TMPDIR/hermes_install.sh"
+    command -v hermes >/dev/null 2>&1 \
+        || abort "The Hermes installer finished, but the hermes command was not found on PATH."
     echo "[OK] Hermes agent installed."
 else
     echo "[INFO] Hermes agent already available. Skipping."
@@ -462,20 +494,41 @@ fi
 # every later `hermes config set` fail on permissions.
 sudo chown -R $(whoami):$(whoami) "$HOME/.hermes"
 
+# Edge TTS is Hermes' default text-to-speech provider, but its package is not
+# part of the default install. Hermes installs it on first use, and only
+# processes started after that can load it, so the first TTS request would fail
+# (see NousResearch/hermes-agent#122097). Install it up front instead. This
+# rebuilds Hermes' Python environment, so it must run before the telemetry
+# packages are installed into that environment.
+echo "[INFO] Installing Edge TTS support for Hermes..."
+if ! hermes pm install --extra edge-tts; then
+    echo "[FATAL] Could not install Edge TTS support (hermes pm install --extra edge-tts)."
+    exit 1
+fi
+echo "[OK] Edge TTS support installed."
+
 echo "[INFO] Applying local backend configuration..."
-hermes config set model.provider custom
-hermes config set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
-hermes config set model.default "$HERMES_MODEL"
-hermes config set compression.enabled false
-hermes config set model.max_tokens 16384
-hermes config set terminal.cwd "$WORKSPACE_DIR"
-hermes config set tool_output.max_bytes 150000
-hermes config set tool_output.max_lines 5000
-hermes config set tool_output.max_line_length 5000
+hermes_set() {
+    hermes config set "$1" "$2" || abort "Could not set the Hermes config value $1."
+}
+hermes_set model.provider custom
+hermes_set model.base_url "http://localhost:$VLLM_HERMES_PORT/v1"
+hermes_set model.default "$HERMES_MODEL"
+hermes_set compression.enabled false
+hermes_set model.max_tokens 16384
+hermes_set terminal.cwd "$WORKSPACE_DIR"
+hermes_set tool_output.max_bytes 150000
+hermes_set tool_output.max_lines 5000
+hermes_set tool_output.max_line_length 5000
 # Keep the model's reasoning out of the agent's output. The notebook cells are
 # read as a transcript of what the agent did, and the reasoning stream buries
 # the tool calls and timings the workshop is about.
-hermes config set display.show_reasoning false
+hermes_set display.show_reasoning false
+# Hermes hides tools outside its built-in core set (such as the custom kokoro_tts
+# tool) behind a tool_search / tool_call bridge, and rejects a direct call by
+# name. Turn the bridge off so every tool, including kokoro_tts, can be called
+# directly. Hermes reads false as "off".
+hermes_set tools.tool_search.enabled false
 
 # ===========================================================================
 # Playwright and browser dependencies (browser-driving Hermes tools)
@@ -508,6 +561,27 @@ find_hermes_venv_py() {
             echo "$py"
             return 0
         fi
+    fi
+    # Newer Hermes releases keep the venv under $HERMES_HOME/installs/<key>/ and
+    # record its path in that install's facts.json. Use the most recent record.
+    py="$(python3 - "${HERMES_HOME:-$HOME/.hermes}" <<'PY' 2>/dev/null || true
+import glob, json, os, sys
+records = glob.glob(os.path.join(sys.argv[1], "installs", "*", "facts.json"))
+for facts in sorted(records, key=os.path.getmtime, reverse=True):
+    try:
+        with open(facts) as f:
+            env = json.load(f)["packages"]["venv"]["environment"]
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+    python = os.path.join(env, "bin", "python")
+    if os.access(python, os.X_OK):
+        print(python)
+        break
+PY
+)"
+    if [ -n "$py" ]; then
+        echo "$py"
+        return 0
     fi
     for cand in \
         /usr/local/lib/hermes-agent/venv/bin/python \
@@ -563,12 +637,14 @@ rm -rf "$HOME/.hermes/plugins/hermes_otel"
 mkdir -p "$HOME/.hermes/plugins"
 # Install the hermes-otel plugin from its latest release tag.
 # Tested on hermes-otel-v1.3.0.
-git clone https://github.com/briancaffey/hermes-otel.git "$HOME/.hermes/plugins/hermes_otel"
-cd "$HOME/.hermes/plugins/hermes_otel"
+git clone https://github.com/briancaffey/hermes-otel.git "$HOME/.hermes/plugins/hermes_otel" \
+    || abort "Could not clone the hermes-otel plugin."
+cd "$HOME/.hermes/plugins/hermes_otel" || abort "The hermes-otel plugin directory is missing after cloning."
 HERMES_OTEL_VERSION="$(git tag -l 'hermes-otel-v*' | sort -V | tail -1)"
 if [ -n "$HERMES_OTEL_VERSION" ]; then
     echo "[INFO] Using latest hermes-otel release: $HERMES_OTEL_VERSION"
-    git checkout -q "$HERMES_OTEL_VERSION"
+    git checkout -q "$HERMES_OTEL_VERSION" \
+        || abort "Could not check out hermes-otel $HERMES_OTEL_VERSION."
 else
     echo "[WARN] No hermes-otel release tag found; staying on the default branch."
 fi
@@ -614,7 +690,8 @@ backends:
     logs: false
 EOF
 
-hermes plugins enable hermes_otel --allow-tool-override
+hermes plugins enable hermes_otel --allow-tool-override \
+    || abort "Could not enable the hermes_otel plugin."
 
 # Everything below MUST go into the venv Hermes actually runs. Using a
 # hardcoded $HOME path here silently installed nothing on a root install and
@@ -711,11 +788,13 @@ echo "[INFO] MLflow tracking available at $(service_url 5004)"
 echo "[INFO] Setting up the shared Python environment ($APP_ENV)..."
 if [ ! -d "$APP_ENV" ]; then
     echo "[INFO] Creating Python venv at $APP_ENV..."
-    python3 -m venv "$APP_ENV"
+    python3 -m venv "$APP_ENV" || abort "Could not create the Python venv at $APP_ENV."
 fi
-"$APP_ENV/bin/python" -m pip install -q --upgrade pip
+"$APP_ENV/bin/python" -m pip install -q --upgrade pip \
+    || echo "[WARN] Could not upgrade pip in $APP_ENV; continuing with the installed version."
 echo "[INFO] Installing PyTorch (ROCm 7.2)..."
-"$APP_ENV/bin/pip" install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+"$APP_ENV/bin/pip" install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2 \
+    || abort "Could not install PyTorch (ROCm 7.2) into $APP_ENV."
 
 
 # Install the dashboard's dependencies from utils/requirements.txt rather than
